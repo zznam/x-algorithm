@@ -41,13 +41,14 @@ COMPUTED_BOOL_FEATURE_NAMES: frozenset[str] = frozenset({"isStalePost14d"})
 
 AUTHOR_NSFW_BIT = 2
 
-WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
-
 
 class BoolFeature(enum.IntEnum):
     isStalePost14d = 0
     isAuthorFollowedByViewerSeq = 1
     isAuthorFollowingViewerSeq = 2
+
+
+WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
 
 
 class FloatFeature(enum.IntEnum):
@@ -80,6 +81,7 @@ ADS_PRODUCT_KEY_HASH_BIAS_2 = 393_342_739
 ADS_PRODUCT_KEY_HASH_MODULUS = 2_147_483_647
 
 STALE_POST_14D_TTL_SEC = 1_213_200
+STALE_POST_30D_TTL_SEC = 2_595_600
 
 
 CATEGORICAL_FEATURES: list[str] = [f.name for f in CategoricalFeature]
@@ -154,7 +156,14 @@ OPTIONAL_COLUMNS: list[str] = [
     "sample_source",
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
+    "auxValueContentViewRatioSeq",
+    "auxValueContentViewValidSeq",
+    "auxValueContentViewBaselineMeanUsdSeq",
+    "auxValueAddToCartRatioSeq",
+    "auxValueAddToCartValidSeq",
+    "auxValueAddToCartBaselineMeanUsdSeq",
     "conversionKeepBits",
+    "conversionEligibleTypesSeq",
     "conversionDelayMsSeq",
     "conversionDelayMsSeq_KEY",
     "conversionDelayMsSeq_PURCHASE",
@@ -167,6 +176,16 @@ OPTIONAL_COLUMNS: list[str] = [
     "webConvTrackingIntegrationSeq",
     "exactPhraseSeq",
     "matchedWordFractionSeq",
+    "lexicalTextSeq",
+    "lexicalQuerySeq",
+    "lexicalAuthorSeq",
+    "validPageRecord",
+    "servedSlotSeq",
+    "weightedScoreSeq",
+    "finalScoreSeq",
+    "rewardRerankSlotProbSeq",
+    "pageDecodeSlotProbSeq",
+    "servedTimeMsSeq",
 ]
 
 

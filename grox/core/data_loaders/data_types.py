@@ -40,6 +40,8 @@ class User(BaseModel):
     affiliated_business: AffiliatedBusiness | None = None
     recent_posts: list["Post"] | None = None
     profile_image: "Image | None" = None
+    profile_banner: "Image | None" = None
+    blocked_count: int | None = None
 
     @classmethod
     def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> "User":
@@ -90,6 +92,10 @@ class User(BaseModel):
             profile_image=Image(url=author_metadata.profileImageUrl)
             if getattr(author_metadata, "profileImageUrl", None)
             else None,
+            profile_banner=Image(url=author_metadata.profileBannerImageUrl)
+            if getattr(author_metadata, "profileBannerImageUrl", None)
+            else None,
+            blocked_count=getattr(author_metadata, "blockedCount", None),
         )
 
 
@@ -232,6 +238,7 @@ class Video(BaseModel):
     convo_video: ConvoVideo | None = None
     crop_seconds: float | None = None
     key_frames_ranking: RankingQuery | None = None
+    motion_reveal: bool = False
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":
@@ -708,6 +715,7 @@ class Post(BaseModel):
     list_metadata: ListMetadata | None = None
     chat_group_metadata: ChatGroupMetadata | None = None
     space_metadata: SpaceMetadata | None = None
+    mentioned_users: list[User] | None = None
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -858,6 +866,11 @@ class Post(BaseModel):
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
             space_metadata=space_metadata,
+            mentioned_users=[
+                User.from_thrift_model(m) for m in post_metadata.mentionedUsersMetadata
+            ]
+            if post_metadata.mentionedUsersMetadata
+            else None,
         )
 
     @classmethod

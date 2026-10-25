@@ -58,6 +58,10 @@ fn apply(score: Option<f64>, weight: f64) -> f64 {
     score.unwrap_or(0.0) * weight
 }
 
+fn product(probability: Option<f64>, conditional_value: Option<f64>) -> Option<f64> {
+    Some(probability? * conditional_value?)
+}
+
 pub fn fuse_heads(weights: &ValueModelWeights, candidate: &CandidateScoringInputs) -> f64 {
     offset_score(compute_weighted_score(weights, candidate), weights)
 }
@@ -78,11 +82,12 @@ pub fn compute_weighted_score(
     } else {
         0.0
     };
-    let post_unexplored_weight = if candidate.in_network == Some(true) {
-        weights.post_unexplored
-    } else {
-        0.0
-    };
+    let post_unexplored_weight =
+        if weights.post_unexplored_include_out_of_network || candidate.in_network == Some(true) {
+            weights.post_unexplored
+        } else {
+            0.0
+        };
 
     [
         apply(scores.favorite_score, weights.favorite),
@@ -106,6 +111,21 @@ pub fn compute_weighted_score(
         apply(scores.quoted_vqv_score, quoted_vqv_weight),
         apply(scores.dwell_time, weights.cont_dwell_time),
         apply(scores.click_dwell_time, weights.cont_click_dwell_time),
+        apply(
+            product(scores.video_open_score, scores.home_video_continuation_secs),
+            weights.video_continuation,
+        ),
+        apply(
+            product(
+                scores.video_open_score,
+                candidate.user_video_continuation_secs,
+            ),
+            weights.user_video_continuation,
+        ),
+        apply(
+            product(scores.profile_click_score, scores.home_profile_visit_secs),
+            weights.profile_visit_secs,
+        ),
         apply(scores.follow_author_score, weights.follow_author),
         apply(scores.not_interested_score, weights.not_interested),
         apply(scores.block_author_score, weights.block_author),
@@ -113,9 +133,29 @@ pub fn compute_weighted_score(
         apply(scores.report_score, weights.report),
         apply(scores.not_dwelled_score, weights.not_dwelled),
         apply(scores.post_unexplored_score, post_unexplored_weight),
+        apply(scores.react_with_video_score, weights.react_with_video),
     ]
     .iter()
     .sum()
+}
+
+pub fn set_user_video_continuation(candidates: &mut [CandidateScoringInputs]) {
+    let (open_weighted_secs, opens) = candidates
+        .iter()
+        .filter_map(|c| {
+            let scores = &c.phoenix_scores;
+            Some((
+                scores.video_open_score?,
+                scores.home_video_continuation_secs?,
+            ))
+        })
+        .fold((0.0, 0.0), |(secs, opens), (open, continuation)| {
+            (secs + open * continuation, opens + open)
+        });
+    let user_secs = (opens > 0.0).then(|| open_weighted_secs / opens);
+    for c in candidates {
+        c.user_video_continuation_secs = user_secs;
+    }
 }
 
 pub fn offset_score(combined_score: f64, w: &ValueModelWeights) -> f64 {
@@ -310,6 +350,7 @@ mod tests {
             cont_dwell_time: 0.1,
             cont_click_dwell_time: 0.2,
             post_unexplored: 1.5,
+            react_with_video: 2.5,
             report: -100.0,
             not_interested: -10.0,
             bidirectional_follow_reply_weight_boost: 1.0,
@@ -331,6 +372,7 @@ mod tests {
                 dwell_score: Some(0.4),
                 dwell_time: Some(10.0),
                 post_unexplored_score: Some(0.2),
+                react_with_video_score: Some(0.04),
                 ..Default::default()
             },
             author_id: 1,
@@ -383,7 +425,7 @@ mod tests {
         ];
 
         let offset = 0.001;
-        let positive_weight_sum = 2.0 + 4.0 + 1.0 + 0.5 + 3.0 + 1.5;
+        let positive_weight_sum = 2.0 + 4.0 + 1.0 + 0.5 + 3.0 + 1.5 + 2.5;
         let negative_weight_magnitude = 10.0 + 100.0;
         let total_weight_sum = positive_weight_sum + negative_weight_magnitude;
 
@@ -394,6 +436,7 @@ mod tests {
             + boosted_dwell_weight * 0.4
             + 0.1 * 10.0
             + 1.5 * 0.2
+            + 2.5 * 0.04
             + offset;
 
         let weighted_ineligible_video_oon = 2.0 * 0.2 + 0.2 * 5.0 + offset;

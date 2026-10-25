@@ -1,3 +1,4 @@
+use super::build_non_selected;
 use crate::ads::{
     AdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender, SafeGapAdsBlender,
     TimeGapAdsBlender, TimeGapConfig,
@@ -6,11 +7,12 @@ use crate::frames;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     AdsBlenderType, AdsTimeGapClampHi, AdsTimeGapClampLo, AdsTimeGapMinOrganicGap, AdsTimeGapTSec,
-    FEED_SURVEY_POSITION, PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
+    VideoCarouselPosition, FEED_SURVEY_POSITION, PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
 };
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 use xai_home_mixer_proto::{
-    feed_item, FeedItem, FeedSurvey, Frame, Prompt, PushToHomePost, ScoredPost, WhoToFollowModule,
+    feed_item, FeedItem, FeedSurvey, Frame, Prompt, PushToHomePost, ScoredPost,
+    VideoCarouselModule, WhoToFollowModule,
 };
 use xai_recsys_proto::AdIndexInfo;
 
@@ -44,10 +46,12 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             push_to_home,
             frames,
             feed_survey,
+            video_carousel,
         } = partition_feed_items(candidates);
+        let video_carousel = drop_carousel_if_who_to_follow_present(video_carousel, &wtf_modules);
 
         let input_post_count = posts.len();
-        let input_ad_count = ads.len();
+        let input_ads = ads.clone();
 
         let time_gap_blender;
         let blender: &dyn AdsBlender = match query.params.get(AdsBlenderType).as_str() {
@@ -67,10 +71,17 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             }
             _ => &self.partition_organic_blender,
         };
-        let mut blended = blender.blend(posts, ads);
+        let mut drops = Vec::new();
+        let mut blended = blender.blend(posts, ads, &mut drops);
+        query.ad_drops.extend(drops);
 
         insert_prompts(&mut blended, prompts);
         insert_who_to_follow(&mut blended, wtf_modules);
+        insert_video_carousel(
+            &mut blended,
+            video_carousel,
+            query.params.get(VideoCarouselPosition) as usize,
+        );
         pin_push_to_home(&mut blended, push_to_home);
         insert_frames(&mut blended, frames);
         insert_feed_survey(&mut blended, feed_survey);
@@ -79,14 +90,8 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             .iter()
             .filter(|i| matches!(i.item, Some(feed_item::Item::Post(_))))
             .count();
-        let output_ad_count = blended
-            .iter()
-            .filter(|i| matches!(i.item, Some(feed_item::Item::Ad(_))))
-            .count();
-
         let dropped_posts = input_post_count.saturating_sub(output_post_count);
-        let dropped_ads = input_ad_count.saturating_sub(output_ad_count);
-        let non_selected = build_non_selected_placeholders(dropped_posts, dropped_ads);
+        let non_selected = build_non_selected(dropped_posts, input_ads, &blended);
 
         SelectResult {
             selected: blended,
@@ -123,6 +128,31 @@ fn insert_who_to_follow(blended: &mut Vec<FeedItem>, wtf_modules: Vec<WhoToFollo
             item: Some(feed_item::Item::WhoToFollow(wtf)),
         },
     );
+}
+
+fn insert_video_carousel(
+    blended: &mut Vec<FeedItem>,
+    video_carousel: Option<VideoCarouselModule>,
+    position: usize,
+) {
+    let Some(carousel) = video_carousel else {
+        return;
+    };
+    let insert_idx = position.saturating_sub(1).min(blended.len());
+    blended.insert(
+        insert_idx,
+        FeedItem {
+            position: position as i32,
+            item: Some(feed_item::Item::VideoCarousel(carousel)),
+        },
+    );
+}
+
+fn drop_carousel_if_who_to_follow_present(
+    video_carousel: Option<VideoCarouselModule>,
+    wtf_modules: &[WhoToFollowModule],
+) -> Option<VideoCarouselModule> {
+    video_carousel.filter(|_| wtf_modules.is_empty())
 }
 
 fn pin_push_to_home(blended: &mut Vec<FeedItem>, push_to_home: Option<PushToHomePost>) {
@@ -175,23 +205,6 @@ fn insert_feed_survey(blended: &mut Vec<FeedItem>, feed_survey: Option<FeedSurve
     );
 }
 
-fn build_non_selected_placeholders(dropped_posts: usize, dropped_ads: usize) -> Vec<FeedItem> {
-    let mut non_selected = Vec::with_capacity(dropped_posts + dropped_ads);
-    for _ in 0..dropped_posts {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Post(ScoredPost::default())),
-        });
-    }
-    for _ in 0..dropped_ads {
-        non_selected.push(FeedItem {
-            position: 0,
-            item: Some(feed_item::Item::Ad(AdIndexInfo::default())),
-        });
-    }
-    non_selected
-}
-
 struct PartitionedFeedItems {
     posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
@@ -200,6 +213,7 @@ struct PartitionedFeedItems {
     push_to_home: Option<PushToHomePost>,
     frames: Vec<Frame>,
     feed_survey: Option<FeedSurvey>,
+    video_carousel: Option<VideoCarouselModule>,
 }
 
 fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
@@ -210,6 +224,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
     let mut push_to_home = None;
     let mut frames = Vec::new();
     let mut feed_survey = None;
+    let mut video_carousel = None;
     for item in items {
         match item.item {
             Some(feed_item::Item::Post(post)) => posts.push(post),
@@ -219,6 +234,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
             Some(feed_item::Item::PushToHome(pth)) => push_to_home = Some(pth),
             Some(feed_item::Item::Frame(f)) => frames.push(f),
             Some(feed_item::Item::FeedSurvey(s)) => feed_survey = Some(s),
+            Some(feed_item::Item::VideoCarousel(c)) => video_carousel = Some(c),
             None => {}
         }
     }
@@ -230,6 +246,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
         push_to_home,
         frames,
         feed_survey,
+        video_carousel,
     }
 }
 
@@ -373,5 +390,16 @@ mod tests {
             ),
             "the pinned card must not sit below an organic post"
         );
+    }
+
+    #[test]
+    fn the_video_carousel_yields_to_who_to_follow() {
+        let carousel = || Some(VideoCarouselModule::default());
+        assert!(drop_carousel_if_who_to_follow_present(
+            carousel(),
+            &[WhoToFollowModule::default()]
+        )
+        .is_none());
+        assert!(drop_carousel_if_who_to_follow_present(carousel(), &[]).is_some());
     }
 }

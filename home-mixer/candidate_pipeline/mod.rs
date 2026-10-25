@@ -7,7 +7,12 @@ pub mod reverse_chron_posts_pipeline;
 
 use std::sync::Arc;
 
-use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PhoenixPredictionClient;
+use crate::clients::author_brand_safety_client::{
+    AuthorBrandSafetyClient, ProdAuthorBrandSafetyClient,
+};
+use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
+    PhoenixPredictionClient, PhoenixProduct,
+};
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::{
     build_phoenix_xds_prediction_client, build_phoenix_xds_retrieval_client_boxed,
@@ -19,24 +24,24 @@ pub type VmRankerXdsConfig = XdsP2cConfig;
 
 pub(crate) async fn build_phoenix_xds_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixPredictionClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixPredictionClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixPredictionClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_CLIENT
-        .get_or_init(|| build_phoenix_xds_prediction_client(config))
+        .get_or_init(|| build_phoenix_xds_prediction_client(config, PhoenixProduct::Home))
         .await
         .clone()
 }
 
 pub(crate) async fn build_phoenix_xds_retrieval_client(
     config: &PhoenixXdsConfig,
-) -> Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>> {
+) -> Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status> {
     static PHOENIX_XDS_RETRIEVAL_CLIENT: tokio::sync::OnceCell<
-        Option<Arc<dyn PhoenixRetrievalClient + Send + Sync>>,
+        Result<Arc<dyn PhoenixRetrievalClient + Send + Sync>, tonic::Status>,
     > = tokio::sync::OnceCell::const_new();
     PHOENIX_XDS_RETRIEVAL_CLIENT
-        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config))
+        .get_or_init(|| build_phoenix_xds_retrieval_client_boxed(config, PhoenixProduct::Home))
         .await
         .clone()
 }
@@ -91,4 +96,21 @@ async fn build_vm_ranker_xds_client_uncached(
         }
         None => None,
     }
+}
+
+pub(crate) async fn shared_author_brand_safety_client(
+    datacenter: &str,
+) -> Arc<dyn AuthorBrandSafetyClient> {
+    static AUTHOR_BRAND_SAFETY_CLIENT: tokio::sync::OnceCell<Arc<dyn AuthorBrandSafetyClient>> =
+        tokio::sync::OnceCell::const_new();
+    AUTHOR_BRAND_SAFETY_CLIENT
+        .get_or_init(|| async {
+            Arc::new(
+                ProdAuthorBrandSafetyClient::new(datacenter)
+                    .await
+                    .expect("Failed to create AuthorBrandSafety client"),
+            ) as Arc<dyn AuthorBrandSafetyClient>
+        })
+        .await
+        .clone()
 }

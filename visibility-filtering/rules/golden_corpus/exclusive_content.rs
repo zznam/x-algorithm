@@ -1,6 +1,6 @@
-use super::{Role, Row};
+use super::{Role, Row, Subject};
 use crate::hydration::Hydrator;
-use crate::models::{HydratedTweetCandidate, SafetyLabelType};
+use crate::models::{PostCandidate, SafetyLabelType};
 use crate::rules::fixtures::{allow, candidate, dropped, CandidateBuilder};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::FilteredReason;
@@ -9,7 +9,7 @@ pub(super) fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "exclusive",
-            post: exclusive_candidate(candidate()),
+            subject: Subject::Post(exclusive_candidate(candidate())),
             expect: vec![
                 (
                     TimelineHome,
@@ -26,25 +26,34 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "exclusive_super_followed",
-            post: exclusive_candidate(candidate().with_edge(Hydrator::SuperFollowsExclusive)),
+            subject: Subject::Post(exclusive_candidate(
+                candidate().with_edge(Hydrator::SuperFollowsExclusive),
+            )),
             expect: vec![(TimelineHome, Role::NonFollower, allow())],
         },
         Row {
             name: "exclusive_retweet",
-            post: exclusive_candidate(candidate().retweet_of(2)),
-            expect: vec![(
-                TimelineHome,
-                Role::Author,
-                dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
-            )],
+            subject: Subject::Post(exclusive_candidate(candidate().retweet_of(2))),
+            expect: vec![
+                (
+                    TimelineHome,
+                    Role::Author,
+                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    dropped(FilteredReason::ExclusiveTweet, "exclusive_tweet/drop"),
+                ),
+            ],
         },
         Row {
             name: "exclusive_nsfw_high_precision_media",
-            post: exclusive_candidate(
+            subject: Subject::Post(exclusive_candidate(
                 candidate()
                     .with_media()
                     .with_label(SafetyLabelType::NSFW_HIGH_PRECISION),
-            ),
+            )),
             expect: vec![
                 (
                     TimelineHomeHydration,
@@ -66,12 +75,12 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "exclusive_nsfw_high_precision_media_super_followed",
-            post: exclusive_candidate(
+            subject: Subject::Post(exclusive_candidate(
                 candidate()
                     .with_media()
                     .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
                     .with_edge(Hydrator::SuperFollowsExclusive),
-            ),
+            )),
             expect: vec![(
                 TimelineHomeHydration,
                 Role::NonFollower,
@@ -83,11 +92,11 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "exclusive_super_followed_author_blocks_viewer",
-            post: exclusive_candidate(
+            subject: Subject::Post(exclusive_candidate(
                 candidate()
                     .with_edge(Hydrator::SuperFollowsExclusive)
                     .with_edge(Hydrator::BlockedByAuthor),
-            ),
+            )),
             expect: vec![
                 (
                     TimelineHomeHydration,
@@ -102,7 +111,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "exclusive_author_blocks_viewer",
-            post: exclusive_candidate(candidate().with_edge(Hydrator::BlockedByAuthor)),
+            subject: Subject::Post(exclusive_candidate(
+                candidate().with_edge(Hydrator::BlockedByAuthor),
+            )),
             expect: vec![(
                 TimelineHomeHydration,
                 Role::NonFollower,
@@ -112,8 +123,8 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn exclusive_candidate(builder: CandidateBuilder) -> HydratedTweetCandidate {
+fn exclusive_candidate(builder: CandidateBuilder) -> PostCandidate {
     let mut c = builder.build();
-    c.tweet_features.exclusive_conversation_author_id = Some(42);
+    c.post.tweet_features.exclusive_conversation_author_id = Some(42);
     c
 }

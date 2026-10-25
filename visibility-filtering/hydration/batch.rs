@@ -1,34 +1,30 @@
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::slice;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum HydrationError {
-    Timeout,
-    Error,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Hydrated<V> {
     Found(V),
     Partial(V),
     NotFound,
-    Failed(HydrationError),
+    Failed,
+    Unanswered,
 }
 
 impl<V> Hydrated<V> {
     pub(crate) fn value(&self) -> Option<&V> {
         match self {
             Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),
-            Hydrated::NotFound | Hydrated::Failed(_) => None,
+            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,
         }
     }
 
     pub(crate) fn into_value(self) -> Option<V> {
         match self {
             Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),
-            Hydrated::NotFound | Hydrated::Failed(_) => None,
+            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,
         }
     }
 
@@ -42,38 +38,31 @@ impl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {
         match result {
             Ok(Some(value)) => Hydrated::Found(value),
             Ok(None) => Hydrated::NotFound,
-            Err(_) => Hydrated::Failed(HydrationError::Error),
+            Err(_) => Hydrated::Failed,
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct HydrationBatch<K, V> {
-    results: HashMap<K, Hydrated<V>>,
+    results: FxHashMap<K, Hydrated<V>>,
 }
 
 pub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;
 
 impl<K: Eq + Hash, V> HydrationBatch<K, V> {
-    pub(crate) fn empty() -> Self {
-        Self {
-            results: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn from_results<E>(
+    pub(crate) fn from_results<E, S: BuildHasher>(
         expected: impl IntoIterator<Item = K>,
-        mut results: HashMap<K, Result<Option<V>, E>>,
+        mut results: HashMap<K, Result<Option<V>, E>, S>,
     ) -> Self {
         Self::from_expected(expected, |key| {
             results
                 .remove(key)
-                .map(Hydrated::from)
-                .unwrap_or(Hydrated::Failed(HydrationError::Error))
+                .map_or(Hydrated::Unanswered, Hydrated::from)
         })
     }
 
-    pub(crate) fn from_hydrated(results: HashMap<K, Hydrated<V>>) -> Self {
+    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {
         Self { results }
     }
 
@@ -81,7 +70,7 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         expected: impl IntoIterator<Item = K>,
         mut resolve: impl FnMut(&K) -> Hydrated<V>,
     ) -> Self {
-        let mut results = HashMap::new();
+        let mut results = FxHashMap::default();
         for key in expected {
             if let Entry::Vacant(entry) = results.entry(key) {
                 let hydrated = resolve(entry.key());
@@ -91,11 +80,11 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         Self { results }
     }
 
-    pub(crate) fn timed_out(expected: impl IntoIterator<Item = K>) -> Self {
+    pub(crate) fn failed(expected: impl IntoIterator<Item = K>) -> Self {
         Self {
             results: expected
                 .into_iter()
-                .map(|key| (key, Hydrated::Failed(HydrationError::Timeout)))
+                .map(|key| (key, Hydrated::Failed))
                 .collect(),
         }
     }
@@ -104,7 +93,7 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         self.results.get(key)
     }
 
-    pub(crate) fn into_hydrated(self) -> HashMap<K, Hydrated<V>> {
+    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {
         self.results
     }
 
@@ -123,7 +112,8 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
                         Hydrated::Found(value) => Hydrated::Found(f(value)),
                         Hydrated::Partial(value) => Hydrated::Partial(f(value)),
                         Hydrated::NotFound => Hydrated::NotFound,
-                        Hydrated::Failed(e) => Hydrated::Failed(e),
+                        Hydrated::Failed => Hydrated::Failed,
+                        Hydrated::Unanswered => Hydrated::Unanswered,
                     };
                     (key, hydrated)
                 })
@@ -140,7 +130,9 @@ impl<K, V> AsRef<[HydrationBatch<K, V>]> for HydrationBatch<K, V> {
 
 impl<K: Eq + Hash, V> Default for HydrationBatch<K, V> {
     fn default() -> Self {
-        Self::empty()
+        Self {
+            results: FxHashMap::default(),
+        }
     }
 }
 
@@ -153,30 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn found_not_found_and_failed_stay_distinguishable() {
-        let batch = batch(HashMap::from([
-            (1, Ok(Some(7))),
-            (2, Ok(None)),
-            (3, Err("backend unavailable")),
-        ]));
-
-        assert_eq!(batch.get(&1), Some(&7));
-        assert_eq!(batch.hydrated(&2), Some(&Hydrated::NotFound));
-        assert_eq!(
-            batch.hydrated(&3),
-            Some(&Hydrated::Failed(HydrationError::Error))
-        );
-    }
-
-    #[test]
-    fn absent_expected_keys_become_missing() {
+    fn an_expected_key_the_results_leave_out_is_unanswered() {
         let batch: HydrationBatch<u64, u32> =
             HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));
 
-        assert_eq!(
-            batch.hydrated(&2),
-            Some(&Hydrated::Failed(HydrationError::Error))
-        );
+        assert_eq!(batch.hydrated(&2), Some(&Hydrated::Unanswered));
     }
 
     #[test]
@@ -190,6 +163,6 @@ mod tests {
 
         assert_eq!(mapped.get(&1), Some(&70));
         assert_eq!(mapped.hydrated(&2), Some(&Hydrated::NotFound));
-        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed(_))));
+        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed)));
     }
 }

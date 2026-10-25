@@ -1,39 +1,54 @@
 mod author_rules;
+#[cfg(test)]
+mod catalog;
 mod context;
+pub mod engine;
+mod expansion;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod golden_corpus;
-pub mod metrics;
-pub mod registry;
+mod levels;
 mod rule_spec;
+mod safety_level;
 mod tweet_rules;
 
 #[cfg(test)]
-use crate::models::{HydratedTweetCandidate, ViewerFeatures};
+use crate::models::{Placement, PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
 use context::RuleContext;
-pub use registry::{RuleEngine, SafetyLevel};
-#[cfg(test)]
-use rule_spec::Predicate;
+pub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};
+pub(crate) use expansion::Expansion;
+pub(crate) use rule_spec::observed::NoTrace;
+pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
+pub(crate) use rule_spec::RuleId;
+pub use rule_spec::{
+    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
+    CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,
+    PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf,
+    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
+    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
+};
+pub(crate) use safety_level::QuoteEntries;
+pub use safety_level::SafetyLevel;
 
 #[cfg(test)]
 pub(crate) fn test_context<'a>(
     viewer: &'a ViewerFeatures,
-    candidate: &'a HydratedTweetCandidate,
+    candidate: &'a PostCandidate,
+) -> RuleContext<'a> {
+    placed_test_context(viewer, candidate, Placement::Standalone)
+}
+
+#[cfg(test)]
+pub(crate) fn placed_test_context<'a>(
+    viewer: &'a ViewerFeatures,
+    candidate: &'a PostCandidate,
+    placement: Placement,
 ) -> RuleContext<'a> {
     use std::sync::LazyLock;
 
     static COUNTRY_LISTS: LazyLock<CountryLists> = LazyLock::new(CountryLists::starting_at_default);
-    RuleContext::new(viewer, candidate, &COUNTRY_LISTS)
-}
-
-#[cfg(test)]
-fn holds_narrowed(
-    predicate: Predicate,
-    viewer: &ViewerFeatures,
-    candidate: &HydratedTweetCandidate,
-) -> bool {
-    predicate.holds(&test_context(viewer, candidate).hydrated_by(predicate.hydrators()))
+    RuleContext::new(viewer, candidate, placement, &COUNTRY_LISTS)
 }

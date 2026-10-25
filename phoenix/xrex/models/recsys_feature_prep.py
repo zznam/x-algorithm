@@ -2,6 +2,7 @@
 # Copyright 2026 X.AI Corp.
 from __future__ import annotations
 
+import functools
 import math
 import typing
 from typing import Any, Literal, NamedTuple
@@ -9,6 +10,7 @@ from typing import Any, Literal, NamedTuple
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
@@ -20,8 +22,9 @@ from xrex.data.recsys.feature_config import (
     UserCategoricalFeature,
     UserFloatFeature,
 )
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
+from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
+from xrex.models.loss_recsys import cread_log_thresholds
 from xrex.models.recsys_embedding import HashKeys, RecsysEmbeddings
 from xrex.models.recsys_sid import reconstruct_entity_sid
 from xrex.models.scaling import ScaleConfig
@@ -176,6 +179,11 @@ class FeaturePrepConfig(Config):
     enable_timezone: bool = True
     enable_dwell_time: bool = True
     dwell_time_norm_scale: float = 30.0
+    enable_dwell_bucket_table: bool = False
+    dwell_bucket_cap: float = 240.0
+    dwell_bucket_log_min_threshold: float = 2.0
+    dwell_bucket_num_thresholds: int = 30
+    dwell_bucket_thresholds: tuple[float, ...] | None = None
     enable_bridge_prob: bool = False
     enable_click_dwell_time: bool = False
     click_dwell_time_norm_scale: float = 60.0
@@ -220,10 +228,12 @@ class FeaturePrepConfig(Config):
     sid_cross_attn: bool = True
     sid_embedding_mode: Literal["learned", "recon"] = "learned"
     sid_decoder_path: str = ""
+    sid_recon_rows_per_decoder_pass: int = 16384
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
     enable_stale_post: bool = False
+    enable_stale_post_30d: bool = False
 
     @property
     def has_user_features(self) -> bool:
@@ -241,6 +251,17 @@ class FeaturePrepConfig(Config):
     @property
     def post_age_cardinality(self) -> int:
         return POST_AGE_MAX_MINUTES // self.post_age_granularity_mins + 2
+
+    def dwell_bucket_threshold_values(self) -> tuple[float, ...] | None:
+        if not self.enable_dwell_bucket_table:
+            return None
+        if self.dwell_bucket_thresholds is not None:
+            return self.dwell_bucket_thresholds
+        return cread_log_thresholds(
+            norm_scale=self.dwell_bucket_cap,
+            log_min_threshold=self.dwell_bucket_log_min_threshold,
+            num_thresholds=self.dwell_bucket_num_thresholds,
+        )
 
 
 def _feature_scale_spec(
@@ -289,9 +310,21 @@ def _get_proj(
     )
 
 
-def _get_emb_table(name: str, cardinality: int, dim: int, config: FeaturePrepConfig) -> jax.Array:
+def _get_emb_table(
+    name: str,
+    cardinality: int,
+    dim: int,
+    config: FeaturePrepConfig,
+    *,
+    zero_init: bool = False,
+) -> jax.Array:
     _, lr_multiplier = _feature_scale_spec(
         config.scale_config, config.embed_init_scale, config.emb_size, "embedding", dim
+    )
+    init: hk.initializers.Initializer = (
+        hk.initializers.Constant(0.0)
+        if zero_init
+        else hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out")
     )
     return typing.cast(
         jax.Array,
@@ -299,7 +332,7 @@ def _get_emb_table(name: str, cardinality: int, dim: int, config: FeaturePrepCon
             name,
             [cardinality, dim],
             dtype=jnp.float32,
-            init=hk.initializers.VarianceScaling(config.embed_init_scale, mode="fan_out"),
+            init=init,
             pspec=P(),
             lr_multiplier=lr_multiplier,
             rms_clip_axes=(-2, -1),
@@ -325,15 +358,29 @@ def _get_learned_vector(name: str, dim: int, config: FeaturePrepConfig) -> jax.A
 
 
 def _project_hash(embedding: jax.Array, name: str, config: FeaturePrepConfig) -> jax.Array:
-    proj = _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
-    return jnp.dot(embedding.astype(proj.dtype), proj)
+    return _project_hashes(embedding, [name], config)
+
+
+def _project_hashes(
+    embeddings: jax.Array, names: list[str], config: FeaturePrepConfig
+) -> jax.Array:
+    projections = [
+        _get_proj(name, config.emb_table_width, config.emb_size, config, role="hidden_proj")
+        for name in names
+    ]
+    return jnp.dot(embeddings.astype(projections[0].dtype), jnp.concatenate(projections))
 
 
 def _embed_categorical(
-    values: jax.Array, cardinality: int, name: str, config: FeaturePrepConfig
+    values: jax.Array,
+    cardinality: int,
+    name: str,
+    config: FeaturePrepConfig,
+    *,
+    one_hot_dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array:
     table = _get_emb_table(name, cardinality, config.emb_size, config)
-    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality)
+    one_hot = jax.nn.one_hot(jnp.clip(values, 0, cardinality - 1), cardinality, dtype=one_hot_dtype)
     return jnp.dot(one_hot, table)
 
 
@@ -348,6 +395,22 @@ def _embed_scalar_times_vector(
 ) -> jax.Array:
     vec = _get_learned_vector(name, config.emb_size, config)
     return scalar[..., None] * vec
+
+
+DWELL_TIME_DEFAULT_SENTINEL_SEC = 2.0
+
+DWELL_TABLE_PARAM_NAME = "hist_dwell_time_table"
+
+
+def dwell_negative_action_ids() -> tuple[int, ...]:
+    from xai_proto import recsys_pb2
+
+    return (
+        int(recsys_pb2.ActionName.CLIENT_TWEET_REPORT),
+        int(recsys_pb2.ActionName.CLIENT_TWEET_NOT_INTERESTED_IN),
+        int(recsys_pb2.ActionName.CLIENT_TWEET_BLOCK_AUTHOR),
+        int(recsys_pb2.ActionName.CLIENT_TWEET_MUTE_AUTHOR),
+    )
 
 
 def _embed_cyclic(
@@ -538,10 +601,13 @@ def _add_context_features(
     is_training: bool = True,
 ) -> jax.Array:
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
+    embed_categorical_in_fprop_dtype = functools.partial(
+        _embed_categorical, one_hot_dtype=fprop_dtype
+    )
 
     if config.enable_product_surface:
         ps = _cast_jax(batch_seq["product_surface"])
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             ps, config.product_surface_cardinality, f"{prefix}_product_surface_emb", config
         ).astype(fprop_dtype)
 
@@ -551,7 +617,7 @@ def _add_context_features(
         buckets = _compute_post_age_bucket_linear(
             impr_ts, creation_ts, config.post_age_granularity_mins
         )
-        result = result + _embed_categorical(
+        result = result + embed_categorical_in_fprop_dtype(
             buckets, config.post_age_cardinality, f"{prefix}_post_age_emb", config
         ).astype(fprop_dtype)
 
@@ -559,7 +625,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             tz = _cast_jax(cat_features)[:, :, CategoricalFeature.timezoneSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 tz, config.timezone_cardinality, f"{prefix}_timezone_emb", config
             ).astype(fprop_dtype)
 
@@ -603,7 +669,7 @@ def _add_context_features(
                 hour = _dither_hour_forward(
                     hour, config.hour_of_day_dither_fraction, config.hour_of_day_cardinality - 1
                 )
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 hour, config.hour_of_day_cardinality, f"{prefix}_hour_of_day_emb", config
             ).astype(fprop_dtype)
 
@@ -611,7 +677,7 @@ def _add_context_features(
         cat_features = batch_seq.get("categorical_features")
         if cat_features is not None:
             dow = _cast_jax(cat_features)[:, :, CategoricalFeature.localDayOfWeekSeq]
-            result = result + _embed_categorical(
+            result = result + embed_categorical_in_fprop_dtype(
                 dow, config.day_of_week_cardinality, f"{prefix}_day_of_week_emb", config
             ).astype(fprop_dtype)
 
@@ -623,14 +689,14 @@ def _add_context_features(
                 followed = bool_features[:, :, BoolFeature.isAuthorFollowedByViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     followed, 2, f"{prefix}_is_author_followed_by_viewer_emb", config
                 ).astype(fprop_dtype)
             if config.enable_is_author_following_viewer:
                 following = bool_features[:, :, BoolFeature.isAuthorFollowingViewerSeq].astype(
                     jnp.int32
                 )
-                result = result + _embed_categorical(
+                result = result + embed_categorical_in_fprop_dtype(
                     following, 2, f"{prefix}_is_author_following_viewer_emb", config
                 ).astype(fprop_dtype)
 
@@ -668,11 +734,9 @@ def _add_context_features(
         bools = batch_seq.get("bool_features")
         if bools is not None and bools.shape[-1] > BoolFeature.isStalePost14d.value:
             is_stale = _cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(jnp.int32)
-            emb_table = _get_emb_table(
-                f"{prefix}_is_stale_post_14d_emb", 2, config.emb_size, config
-            )
-            one_hot = jax.nn.one_hot(jnp.clip(is_stale, 0, 1), 2)
-            result = result + jnp.dot(one_hot, emb_table).astype(fprop_dtype)
+            result = result + embed_categorical_in_fprop_dtype(
+                is_stale, 2, f"{prefix}_is_stale_post_14d_emb", config
+            ).astype(fprop_dtype)
 
     return result
 
@@ -727,7 +791,9 @@ def _embed_entity_sid_scaled(
         hash_code = jnp.where(is_missing, 0, hash_code)
         all_raw_codes = jnp.concatenate([all_raw_codes, hash_code[..., None]], axis=-1)
 
-    all_onehot = jax.nn.one_hot(all_raw_codes, table_size, dtype=combined_table.dtype)
+    onehot_size = -(-table_size // 8) * 8
+    all_onehot = jax.nn.one_hot(all_raw_codes, onehot_size, dtype=combined_table.dtype)
+    table_3d = jnp.pad(table_3d, ((0, 0), (0, onehot_size - table_size), (0, 0)))
     unigram_embs = jnp.einsum("...lc,lcd->...ld", all_onehot, table_3d)
 
     if sid_cross_attn:
@@ -773,6 +839,8 @@ def _add_sid_features(
     result: jax.Array,
     batch_seq: dict,
     config: FeaturePrepConfig,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> jax.Array:
     if not config.enable_post_sid:
         return result
@@ -800,6 +868,9 @@ def _add_sid_features(
             config.embed_init_scale,
             fprop_dtype,
             "feat_prep_post",
+            mesh=mesh,
+            data_axis=data_axis,
+            rows_per_decoder_pass=config.sid_recon_rows_per_decoder_pass,
         )
         return result + sid_emb.astype(fprop_dtype)
     entity_hashes = _cast_jax(batch_seq["post_hashes"]) if config.sid_hash_level else None
@@ -837,17 +908,48 @@ def _add_history_features(
         action_emb = action_emb * action_mask[..., None]
         result = result + action_emb.astype(fprop_dtype)
 
-    if config.enable_dwell_time:
-        cont_actions = batch["history_seq"].get("continuous_actions")
-        if cont_actions is not None:
-            dwell_raw = _cast_jax(cont_actions)[:, :, 1].astype(jnp.float32)
-            dwell_normalized = (
-                jnp.clip(dwell_raw, 0.0, config.dwell_time_norm_scale)
-                / config.dwell_time_norm_scale
-            )
-            result = result + _embed_scalar_times_vector(
-                dwell_normalized, "hist_dwell_time_vec", config
-            ).astype(fprop_dtype)
+    cont_actions = batch["history_seq"].get("continuous_actions")
+    dwell_bucket_thresholds = config.dwell_bucket_threshold_values()
+    if dwell_bucket_thresholds is not None and cont_actions is not None:
+        dwell_raw = _cast_jax(cont_actions)[:, :, 1].astype(jnp.float32)
+        knots = (0.0, *dwell_bucket_thresholds)
+        num_knots = len(knots)
+        num_rows = num_knots + 2
+        knots_arr = jnp.asarray(knots, dtype=jnp.float32)
+        table = _get_emb_table(
+            DWELL_TABLE_PARAM_NAME, num_rows, config.emb_size, config, zero_init=True
+        )
+        hi = jnp.clip(jnp.searchsorted(knots_arr, dwell_raw, side="left"), 1, num_knots - 1)
+        lo = hi - 1
+        w_hi = jnp.clip((dwell_raw - knots_arr[lo]) / (knots_arr[hi] - knots_arr[lo]), 0.0, 1.0)
+        value_weights = (
+            jax.nn.one_hot(lo, num_rows) * (1.0 - w_hi)[..., None]
+            + jax.nn.one_hot(hi, num_rows) * w_hi[..., None]
+        )
+        has_negative = jnp.zeros_like(dwell_raw, dtype=jnp.bool_)
+        if actions is not None:
+            neg_actions = _cast_jax(actions).astype(jnp.float32)
+            neg_ids = [i for i in dwell_negative_action_ids() if i < neg_actions.shape[-1]]
+            if neg_ids:
+                has_negative = jnp.any(
+                    neg_actions[:, :, jnp.asarray(neg_ids, dtype=jnp.int32)] != 0, axis=-1
+                )
+        sentinel_weights = jax.nn.one_hot(
+            jnp.where(has_negative, num_knots, num_knots + 1), num_rows
+        )
+        is_sentinel = dwell_raw == DWELL_TIME_DEFAULT_SENTINEL_SEC
+        weights = jnp.where(is_sentinel[..., None], sentinel_weights, value_weights)
+        weights = weights * (dwell_raw != 0.0)[..., None].astype(weights.dtype)
+        dwell_emb = jnp.einsum("bsr,rd->bsd", weights.astype(table.dtype), table)
+        result = result + dwell_emb.astype(fprop_dtype)
+    elif config.enable_dwell_time and cont_actions is not None:
+        dwell_raw = _cast_jax(cont_actions)[:, :, 1].astype(jnp.float32)
+        dwell_normalized = (
+            jnp.clip(dwell_raw, 0.0, config.dwell_time_norm_scale) / config.dwell_time_norm_scale
+        )
+        result = result + _embed_scalar_times_vector(
+            dwell_normalized, "hist_dwell_time_vec", config
+        ).astype(fprop_dtype)
 
     if config.enable_bridge_prob:
         from xai_proto import recsys_pb2
@@ -963,19 +1065,13 @@ def _build_seq_tokens(
     result = jnp.zeros((B, S, D), dtype=fprop_dtype)
 
     if config.enable_post_embedding:
-        post_reshaped = post_embeddings.reshape(B, S, num_item_hashes, -1)
-        for i in range(num_item_hashes):
-            h = post_reshaped[:, :, i, :]
-            result = result + _project_hash(h, f"{prefix}_post_hash_{i}_proj", config).astype(
-                fprop_dtype
-            )
+        post_names = [f"{prefix}_post_hash_{i}_proj" for i in range(num_item_hashes)]
+        post_tokens = _project_hashes(post_embeddings.reshape(B, S, -1), post_names, config)
+        result = result + post_tokens.astype(fprop_dtype)
 
-    author_reshaped = author_embeddings.reshape(B, S, num_author_hashes, -1)
-    for i in range(num_author_hashes):
-        h = author_reshaped[:, :, i, :]
-        result = result + _project_hash(h, f"{prefix}_author_hash_{i}_proj", config).astype(
-            fprop_dtype
-        )
+    author_names = [f"{prefix}_author_hash_{i}_proj" for i in range(num_author_hashes)]
+    author_tokens = _project_hashes(author_embeddings.reshape(B, S, -1), author_names, config)
+    result = result + author_tokens.astype(fprop_dtype)
 
     padding_mask = (post_hashes[:, :, 0] != 0).reshape(B, S).astype(jnp.bool_)
 
@@ -1059,6 +1155,10 @@ def build_feature_prep_streams(
     output_vocab_size: int = 64,
     is_training: bool = True,
     include_candidates: bool = True,
+    candidate_token_to_slot: jax.typing.ArrayLike | None = None,
+    candidate_slot_to_token: jax.typing.ArrayLike | None = None,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> FeaturePrepStreams:
     user_tokens: jax.Array | None = None
     user_mask: jax.Array | None = None
@@ -1090,29 +1190,47 @@ def build_feature_prep_streams(
     history_tokens = _add_context_features(
         history_tokens, batch["history_seq"], config, prefix="hist", is_training=is_training
     )
-    history_tokens = _add_sid_features(history_tokens, batch["history_seq"], config)
+    history_tokens = _add_sid_features(
+        history_tokens, batch["history_seq"], config, mesh=mesh, data_axis=data_axis
+    )
     history_tokens = _add_history_features(history_tokens, batch, config, output_vocab_size)
 
     candidate_tokens: jax.Array | None = None
     candidate_mask: jax.Array | None = None
     if include_candidates:
+        candidate_seq = batch["candidate_seq"]
+        candidate_post = recsys_embeddings.candidate_post_embeddings
+        candidate_author = recsys_embeddings.candidate_author_embeddings
+        if candidate_token_to_slot is not None:
+            assert candidate_slot_to_token is not None
+            token_slots = _cast_jax(candidate_token_to_slot)
+            slot_tokens = _cast_jax(candidate_slot_to_token)
+            candidate_seq = _gather_slots(candidate_seq, token_slots, slot_tokens.shape[1])
+            if candidate_post is not None:
+                candidate_post = _gather_slot_embeddings(candidate_post, token_slots, slot_tokens)
+            candidate_author = _gather_slot_embeddings(candidate_author, token_slots, slot_tokens)
         candidate_tokens, candidate_mask = _build_seq_tokens(
-            recsys_embeddings.candidate_post_embeddings,
-            recsys_embeddings.candidate_author_embeddings,
-            _cast_jax(batch["candidate_seq"]["post_hashes"]),
+            candidate_post,
+            candidate_author,
+            _cast_jax(candidate_seq["post_hashes"]),
             config,
             hash_keys,
             prefix="cand",
         )
         candidate_tokens = _add_context_features(
             candidate_tokens,
-            batch["candidate_seq"],
+            candidate_seq,
             config,
             prefix="cand",
             is_training=is_training,
         )
-        candidate_tokens = _add_sid_features(candidate_tokens, batch["candidate_seq"], config)
-        candidate_tokens = _add_candidate_features(candidate_tokens, batch, config)
+        candidate_tokens = _add_sid_features(
+            candidate_tokens, candidate_seq, config, mesh=mesh, data_axis=data_axis
+        )
+        candidate_batch = typing.cast(
+            RecsysFeaturesBatch, {**batch, "candidate_seq": candidate_seq}
+        )
+        candidate_tokens = _add_candidate_features(candidate_tokens, candidate_batch, config)
         candidate_tokens = candidate_tokens * input_scale
 
     user_tokens = user_tokens * input_scale
@@ -1140,6 +1258,43 @@ def _assemble_unpacked(streams: FeaturePrepStreams) -> tuple[jax.Array, jax.Arra
     return tokens, padding_mask, candidate_start_offset
 
 
+def _gather_slots(seq: PostSeq, token_slots: jax.Array, num_slots: int) -> PostSeq:
+    def gather(v):
+        if v is None or v.ndim < 2 or v.shape[1] != num_slots:
+            return v
+        v = _cast_jax(v)
+        index = token_slots.reshape(token_slots.shape + (1,) * (v.ndim - 2))
+        return jnp.take_along_axis(v, index, 1, mode="fill", fill_value=0)
+
+    return typing.cast(PostSeq, {k: gather(v) for k, v in seq.items()})
+
+
+def _gather_slot_embeddings(
+    emb: jax.Array, token_slots: jax.Array, slot_tokens: jax.Array
+) -> jax.Array:
+    num_devices, _, width = emb.shape
+    per_slot = emb.reshape(num_devices, slot_tokens.shape[1], -1)
+    return _gather_rows(per_slot, token_slots, slot_tokens).reshape(num_devices, -1, width)
+
+
+@jax.custom_vjp
+def _gather_rows(sources: jax.Array, rows: jax.Array, inverse: jax.Array) -> jax.Array:
+    return jnp.take_along_axis(sources, rows[:, :, None], axis=1, mode="fill", fill_value=0)
+
+
+def _gather_rows_fwd(sources, rows, inverse):
+    return _gather_rows(sources, rows, inverse), inverse
+
+
+def _gather_rows_bwd(inverse, d_out):
+    batch = jnp.arange(d_out.shape[0])[:, None]
+    d_sources = d_out.at[batch, inverse].get(mode="fill", fill_value=0)
+    return d_sources, None, None
+
+
+_gather_rows.defvjp(_gather_rows_fwd, _gather_rows_bwd)
+
+
 def _assemble_packed(
     streams: FeaturePrepStreams,
     layout: Any,
@@ -1149,6 +1304,21 @@ def _assemble_packed(
 ) -> tuple[jax.Array, jax.Array, None]:
     D = config.emb_size
     padding_mask = _cast_jax(layout.padding_mask)
+    if layout.token_to_source is not None:
+        assert streams.candidate_tokens is not None
+        sources = jnp.concatenate(
+            [
+                streams.user_tokens.reshape(num_devices, -1, D),
+                jnp.where(streams.history_mask[:, :, None], streams.history_tokens, 0),
+                streams.candidate_tokens,
+                jnp.zeros((num_devices, 1, D), streams.user_tokens.dtype),
+            ],
+            axis=1,
+        )
+        tokens = _gather_rows(
+            sources, _cast_jax(layout.token_to_source), _cast_jax(layout.source_to_token)
+        )
+        return tokens, padding_mask, None
     seq_starts = _cast_jax(layout.cu_seqlens[:, :-1])
     device_idx = jnp.arange(num_devices, dtype=jnp.int32)[:, None]
 
@@ -1179,6 +1349,8 @@ def build_feature_prep_inputs(
     output_vocab_size: int = 64,
     is_training: bool = True,
     include_candidates: bool = True,
+    mesh: Mesh | None = None,
+    data_axis: str | tuple[str, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array, int | None]:
     layout = batch.get("packing_layout")
 
@@ -1192,6 +1364,8 @@ def build_feature_prep_inputs(
             output_vocab_size,
             is_training=is_training,
             include_candidates=include_candidates,
+            mesh=mesh,
+            data_axis=data_axis,
         )
         return _assemble_unpacked(streams)
 
@@ -1207,5 +1381,9 @@ def build_feature_prep_inputs(
         output_vocab_size,
         is_training=is_training,
         include_candidates=include_candidates,
+        candidate_token_to_slot=layout.candidate_token_to_slot,
+        candidate_slot_to_token=layout.candidate_slot_to_token,
+        mesh=mesh,
+        data_axis=data_axis,
     )
     return _assemble_packed(streams, layout, num_devices, bs_per_device, config)
