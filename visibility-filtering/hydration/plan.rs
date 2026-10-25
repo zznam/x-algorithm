@@ -1,339 +1,17 @@
 use crate::clients::socialgraph_client::{EdgeDirection, Graph};
-use crate::hydration::{Hydrator, Hydrators};
-use crate::rules::SafetyLevel;
+use crate::hydration::fetcher::{AskedFields, FetcherId};
+use crate::hydration::hydrator::{Edge, Part, RequestRows};
+use crate::hydration::relation::{Relation, Role};
+use crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};
+use crate::rules::{Expansion, SafetyLevel};
 use std::fmt;
+use std::time::Duration;
 use strum::VariantArray;
-use xai_core_entities::entities::ConversationControlArm;
 use xai_core_entities::gizmoduck_client::QueryFields;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
-pub(crate) enum Source {
-    TesPureCore,
-    TesTweet,
-    TesConversationControl,
-    SafetyLabels,
-    GizmoduckViewer,
-    GizmoduckAuthor,
-    Flock,
-    ViewerCountry,
-    Wingman,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Part {
-    Column,
-    Fields(&'static [QueryFields]),
-    Edge(Edge),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, VariantArray)]
-#[repr(u8)]
-pub(super) enum Edge {
-    Follows,
-    Blocks,
-    Mutes,
-    MuteRetweets,
-    BlockedBy,
-    SuperFollows,
-    FollowedBy,
-    SecondDegree,
-}
-
-impl Edge {
-    pub(super) const fn flock(self) -> Option<(Graph, EdgeDirection)> {
-        use EdgeDirection::{Forward, Reverse};
-        match self {
-            Edge::Follows => Some((Graph::Follows, Forward)),
-            Edge::Blocks => Some((Graph::Blocks, Forward)),
-            Edge::Mutes => Some((Graph::Mutes, Forward)),
-            Edge::MuteRetweets => Some((Graph::MuteRetweets, Forward)),
-            Edge::BlockedBy => Some((Graph::Blocks, Reverse)),
-            Edge::SuperFollows => Some((Graph::SuperFollows, Forward)),
-            Edge::FollowedBy => Some((Graph::Follows, Reverse)),
-            Edge::SecondDegree => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum KeyOrigin {
-    RequestTweets,
-    Viewer,
-    PureCoreAuthor,
-    PureCoreRetweeter,
-    PureCoreReplyRoot,
-    ExclusiveConversationAuthor,
-    ConversationRoot(&'static [ConversationControlArm]),
-    ViewerForCoAllowedList,
-    MyNetworkRootNotFollowingViewer,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct NodeSpec {
-    pub(super) source: Source,
-    pub(super) part: Part,
-    pub(super) key: KeyOrigin,
-    pub(super) label: (&'static str, &'static str),
-}
-
-impl KeyOrigin {
-    const fn input(self) -> Option<Hydrator> {
-        match self {
-            KeyOrigin::RequestTweets | KeyOrigin::Viewer => None,
-            KeyOrigin::PureCoreAuthor
-            | KeyOrigin::PureCoreRetweeter
-            | KeyOrigin::PureCoreReplyRoot => Some(Hydrator::PureCore),
-            KeyOrigin::ExclusiveConversationAuthor => Some(Hydrator::Tweet),
-            KeyOrigin::ConversationRoot(_) | KeyOrigin::ViewerForCoAllowedList => {
-                Some(Hydrator::ConversationControl)
-            }
-            KeyOrigin::MyNetworkRootNotFollowingViewer => Some(Hydrator::RootFollowsViewer),
-        }
-    }
-
-    fn reads(self) -> Hydrators {
-        let input = match self.input() {
-            Some(input) => Hydrators::of(input),
-            None => Hydrators::empty(),
-        };
-        match self {
-            KeyOrigin::MyNetworkRootNotFollowingViewer => input.with(Hydrator::ConversationControl),
-            KeyOrigin::RequestTweets
-            | KeyOrigin::Viewer
-            | KeyOrigin::PureCoreAuthor
-            | KeyOrigin::PureCoreRetweeter
-            | KeyOrigin::PureCoreReplyRoot
-            | KeyOrigin::ExclusiveConversationAuthor
-            | KeyOrigin::ConversationRoot(_)
-            | KeyOrigin::ViewerForCoAllowedList => input,
-        }
-    }
-}
-
-impl Hydrator {
-    pub(super) const fn spec(self) -> NodeSpec {
-        use Hydrator as H;
-        use KeyOrigin as K;
-        use Source as S;
-        const fn node(
-            source: Source,
-            part: Part,
-            key: KeyOrigin,
-            label: (&'static str, &'static str),
-        ) -> NodeSpec {
-            NodeSpec {
-                source,
-                part,
-                key,
-                label,
-            }
-        }
-        const RELATIONSHIPS: (&str, &str) = ("socialgraph", "batch_check_relationships");
-        const BLOCKED_BY: (&str, &str) = ("blocked_by", "batch_check_blocked_by");
-        match self {
-            H::PureCore => node(
-                S::TesPureCore,
-                Part::Column,
-                K::RequestTweets,
-                ("tes", "get_tweet_core_datas"),
-            ),
-            H::Tweet => node(
-                S::TesTweet,
-                Part::Column,
-                K::RequestTweets,
-                ("tes", "get_tweets"),
-            ),
-            H::ConversationControl => node(
-                S::TesConversationControl,
-                Part::Column,
-                K::RequestTweets,
-                ("conversation_control", "get_conversation_controls"),
-            ),
-            H::TweetSafetyLabels => node(
-                S::SafetyLabels,
-                Part::Column,
-                K::RequestTweets,
-                ("safety_labels", "get"),
-            ),
-            H::ViewerProfile => node(
-                S::GizmoduckViewer,
-                Part::Fields(&[
-                    QueryFields::ACCOUNT,
-                    QueryFields::EXTENDED_PROFILE,
-                    QueryFields::SAFETY,
-                ]),
-                K::Viewer,
-                ("gizmoduck", "get_viewer_data"),
-            ),
-            H::ViewerLabels => node(
-                S::GizmoduckViewer,
-                Part::Fields(&[QueryFields::LABELS]),
-                K::Viewer,
-                ("gizmoduck", "get_viewer_data"),
-            ),
-            H::AuthorSafety => node(
-                S::GizmoduckAuthor,
-                Part::Fields(&[QueryFields::SAFETY]),
-                K::PureCoreAuthor,
-                ("gizmoduck", "get_users"),
-            ),
-            H::AuthorLabels => node(
-                S::GizmoduckAuthor,
-                Part::Fields(&[QueryFields::LABELS]),
-                K::PureCoreAuthor,
-                ("gizmoduck", "get_users"),
-            ),
-            H::Follows => node(
-                S::Flock,
-                Part::Edge(Edge::Follows),
-                K::PureCoreAuthor,
-                RELATIONSHIPS,
-            ),
-            H::Blocks => node(
-                S::Flock,
-                Part::Edge(Edge::Blocks),
-                K::PureCoreAuthor,
-                RELATIONSHIPS,
-            ),
-            H::Mutes => node(
-                S::Flock,
-                Part::Edge(Edge::Mutes),
-                K::PureCoreAuthor,
-                RELATIONSHIPS,
-            ),
-            H::MuteRetweets => node(
-                S::Flock,
-                Part::Edge(Edge::MuteRetweets),
-                K::PureCoreRetweeter,
-                RELATIONSHIPS,
-            ),
-            H::BlockedByAuthor => node(
-                S::Flock,
-                Part::Edge(Edge::BlockedBy),
-                K::PureCoreAuthor,
-                BLOCKED_BY,
-            ),
-            H::BlockedByReplyRoot => node(
-                S::Flock,
-                Part::Edge(Edge::BlockedBy),
-                K::PureCoreReplyRoot,
-                BLOCKED_BY,
-            ),
-            H::SuperFollowsExclusive => node(
-                S::Flock,
-                Part::Edge(Edge::SuperFollows),
-                K::ExclusiveConversationAuthor,
-                ("exclusive_content", "batch_check_super_follows"),
-            ),
-            H::RootFollowsViewer => node(
-                S::Flock,
-                Part::Edge(Edge::FollowedBy),
-                K::ConversationRoot(&[
-                    ConversationControlArm::Community,
-                    ConversationControlArm::MyNetwork,
-                ]),
-                ("conversation_control", "batch_check_followed_by"),
-            ),
-            H::RootFollowsViewerSecondDegree => node(
-                S::Wingman,
-                Part::Edge(Edge::SecondDegree),
-                K::MyNetworkRootNotFollowingViewer,
-                ("conversation_control", "exists_intersect"),
-            ),
-            H::SuperFollowsRoot => node(
-                S::Flock,
-                Part::Edge(Edge::SuperFollows),
-                K::ConversationRoot(&[ConversationControlArm::Subscribers]),
-                ("conversation_control", "batch_check_super_follows"),
-            ),
-            H::ViewerCountry => node(
-                S::ViewerCountry,
-                Part::Column,
-                K::ViewerForCoAllowedList,
-                ("conversation_control", "tfe_top_country"),
-            ),
-        }
-    }
-
-    pub(super) const fn input(self) -> Option<Hydrator> {
-        self.spec().key.input()
-    }
-
-    pub(super) const fn edge(self) -> Option<Edge> {
-        match self.spec().part {
-            Part::Edge(edge) => Some(edge),
-            Part::Column | Part::Fields(_) => None,
-        }
-    }
-
-    pub(crate) const fn is_edge(self) -> bool {
-        self.edge().is_some()
-    }
-
-    pub(super) const fn needs_viewer(self) -> bool {
-        self.is_edge()
-            || matches!(
-                self.spec().key,
-                KeyOrigin::Viewer | KeyOrigin::ViewerForCoAllowedList
-            )
-    }
-}
-
-const fn inputs_precede_nodes() -> bool {
-    let mut rest = Hydrator::VARIANTS;
-    while let [node, tail @ ..] = rest {
-        if let Some(input) = node.input()
-            && input as u8 >= *node as u8
-        {
-            return false;
-        }
-        rest = tail;
-    }
-    true
-}
-
-const fn author_keys_come_from_pure_core() -> bool {
-    let mut rest = Hydrator::VARIANTS;
-    while let [node, tail @ ..] = rest {
-        if matches!(node.spec().source, Source::GizmoduckAuthor)
-            && !matches!(node.input(), Some(Hydrator::PureCore))
-        {
-            return false;
-        }
-        rest = tail;
-    }
-    true
-}
-
-const _: () = assert!(inputs_precede_nodes());
-const _: () = assert!(author_keys_come_from_pure_core());
-const _: () = assert!(Hydrator::VARIANTS.len() <= u32::BITS as usize);
-
-impl Hydrators {
-    pub const fn closed(self) -> Self {
-        let mut closed = self.with(Hydrator::PureCore);
-        let mut rest = Hydrator::VARIANTS;
-        while let [head @ .., node] = rest {
-            if let Some(input) = node.input()
-                && closed.contains(*node)
-            {
-                closed = closed.with(input);
-            }
-            rest = head;
-        }
-        closed
-    }
-
-    pub(crate) fn iter(self) -> impl Iterator<Item = Hydrator> {
-        Hydrator::VARIANTS
-            .iter()
-            .copied()
-            .filter(move |&node| self.contains(node))
-    }
-}
 
 pub(crate) struct HydrationPlan {
     level: SafetyLevel,
+    rows: RequestRows,
     groups: Vec<Group>,
     nodes: Hydrators,
     logged_out_nodes: Hydrators,
@@ -341,7 +19,7 @@ pub(crate) struct HydrationPlan {
 
 pub(super) struct Group {
     pub(super) position: usize,
-    pub(super) source: Source,
+    pub(super) fetcher: FetcherId,
     pub(super) input: Option<Hydrator>,
     pub(super) nodes: Hydrators,
     clients: Vec<&'static str>,
@@ -353,15 +31,19 @@ pub(super) struct Group {
 
 impl HydrationPlan {
     pub(crate) fn new(level: SafetyLevel, hydrators: Hydrators) -> Self {
-        let nodes = hydrators.closed();
+        Self::with_rows(level, level.spec().rows, hydrators)
+    }
+
+    pub(crate) fn with_rows(level: SafetyLevel, rows: RequestRows, hydrators: Hydrators) -> Self {
+        let nodes = hydrators.closed(rows);
         let mut groups: Vec<Group> = Vec::new();
         for node in nodes.iter() {
-            let spec = node.spec();
+            let spec = node.spec_at(rows);
             let (client, method) = spec.label;
-            let input = node.input();
+            let input = node.input_at(rows);
             match groups
                 .iter_mut()
-                .find(|group| group.source == spec.source && group.input == input)
+                .find(|group| group.fetcher == spec.fetcher() && group.input == input)
             {
                 Some(group) => {
                     group.nodes = group.nodes.with(node);
@@ -374,7 +56,7 @@ impl HydrationPlan {
                 }
                 None => groups.push(Group {
                     position: groups.len(),
-                    source: spec.source,
+                    fetcher: spec.fetcher(),
                     input,
                     nodes: Hydrators::of(node),
                     clients: vec![client],
@@ -389,7 +71,7 @@ impl HydrationPlan {
             .iter()
             .map(|group| {
                 group.nodes.iter().fold(Hydrators::empty(), |reads, node| {
-                    reads.union(node.spec().key.reads())
+                    reads.union(node.reads_at(rows))
                 })
             })
             .collect();
@@ -406,11 +88,12 @@ impl HydrationPlan {
             .collect();
         for (group, readers) in groups.iter_mut().zip(readers) {
             group.edges = edges(group.nodes);
-            group.fields = fields(group.source, group.nodes);
+            group.fields = fields(group.fetcher, group.nodes, rows);
             group.readers = readers;
         }
         Self {
             level,
+            rows,
             groups,
             nodes,
             logged_out_nodes: nodes
@@ -424,6 +107,30 @@ impl HydrationPlan {
         self.level
     }
 
+    pub(crate) fn rows(&self) -> RequestRows {
+        self.rows
+    }
+
+    pub(crate) fn keys_only_user_rows_or_viewer(&self) -> bool {
+        self.nodes
+            .iter()
+            .all(|node| node.key_at(self.rows).keys_user_rows())
+    }
+
+    pub(crate) fn keys_a_node_only_user_rows_give(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.key_at(self.rows).keys_only_user_rows())
+    }
+
+    pub(super) fn reads_viewer_profile(&self) -> bool {
+        self.nodes.contains(Hydrator::ViewerProfile)
+    }
+
+    pub(super) fn reads_viewer_labels(&self) -> bool {
+        self.nodes.contains(Hydrator::ViewerLabels)
+    }
+
     pub(super) fn callable(&self, viewer_id: Option<u64>) -> Hydrators {
         match viewer_id {
             Some(_) => self.nodes,
@@ -435,6 +142,25 @@ impl HydrationPlan {
         self.groups.iter()
     }
 
+    fn relations(&self) -> impl Iterator<Item = Relation> + '_ {
+        Relation::VARIANTS
+            .iter()
+            .copied()
+            .filter(|&relation| match relation.spec().role {
+                Role::Judged { rpc } => {
+                    self.level.is_carried_by(rpc)
+                        && !self
+                            .nodes
+                            .intersection(relation.spec().trigger.reads())
+                            .is_empty()
+                }
+                Role::Read => self
+                    .nodes
+                    .iter()
+                    .any(|node| node.spec().relation == Some(relation)),
+            })
+    }
+
     pub(super) fn readers<'a>(&'a self, landed: &'a Group) -> impl Iterator<Item = &'a Group> {
         landed
             .readers
@@ -444,6 +170,18 @@ impl HydrationPlan {
 }
 
 impl Group {
+    pub(super) fn ceiling(&self) -> Duration {
+        if self.nodes.has_must_have() {
+            return HYDRATION_TIMEOUT;
+        }
+        self.nodes
+            .iter()
+            .find_map(|node| Expansion::of(node.relation()?))
+            .map_or(BEST_EFFORT_HYDRATION_TIMEOUT, |expansion| {
+                expansion.spec().deadline
+            })
+    }
+
     pub(super) fn label(&self) -> (String, String) {
         (self.clients.join("+"), self.methods.join("+"))
     }
@@ -457,21 +195,14 @@ impl Group {
     }
 }
 
-fn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {
-    let nodes = match source {
-        Source::GizmoduckAuthor => Hydrator::VARIANTS
+fn fields(fetcher: FetcherId, nodes: Hydrators, rows: RequestRows) -> Vec<QueryFields> {
+    let nodes = match fetcher.spec().fields {
+        AskedFields::EveryLevel => Hydrator::VARIANTS
             .iter()
             .copied()
-            .filter(|node| node.spec().source == source)
+            .filter(|node| node.spec_at(rows).fetcher() == fetcher)
             .fold(Hydrators::empty(), Hydrators::with),
-        Source::TesPureCore
-        | Source::TesTweet
-        | Source::TesConversationControl
-        | Source::SafetyLabels
-        | Source::GizmoduckViewer
-        | Source::Flock
-        | Source::ViewerCountry
-        | Source::Wingman => nodes,
+        AskedFields::Planned => nodes,
     };
     let mut fields = Vec::new();
     for node in nodes.iter() {
@@ -503,27 +234,6 @@ fn edges(nodes: Hydrators) -> Vec<(Edge, Graph, EdgeDirection, Hydrators)> {
     edges
 }
 
-impl fmt::Display for KeyOrigin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            KeyOrigin::RequestTweets => f.write_str("tweets"),
-            KeyOrigin::Viewer => f.write_str("viewer"),
-            KeyOrigin::PureCoreAuthor => f.write_str("author"),
-            KeyOrigin::PureCoreRetweeter => f.write_str("retweeter"),
-            KeyOrigin::PureCoreReplyRoot => f.write_str("reply_root"),
-            KeyOrigin::ExclusiveConversationAuthor => f.write_str("exclusive_author"),
-            KeyOrigin::ConversationRoot(arms) => {
-                let arms: Vec<String> = arms.iter().map(|arm| format!("{arm:?}")).collect();
-                write!(f, "root:{}", arms.join("|"))
-            }
-            KeyOrigin::ViewerForCoAllowedList => f.write_str("viewer:co_allowed_list"),
-            KeyOrigin::MyNetworkRootNotFollowingViewer => {
-                f.write_str("root:MyNetwork:not_followed")
-            }
-        }
-    }
-}
-
 impl fmt::Display for HydrationPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
@@ -553,7 +263,7 @@ impl fmt::Display for HydrationPlan {
                 };
                 let keys: Vec<String> = nodes
                     .iter()
-                    .map(|node| node.spec().key.to_string())
+                    .map(|node| node.key_at(self.rows).to_string())
                     .collect();
                 write!(
                     f,
@@ -562,10 +272,22 @@ impl fmt::Display for HydrationPlan {
                     keys.join(",")
                 )?;
             }
+            for node in group.nodes.iter() {
+                if let Some(edge) = node.pair_edge() {
+                    let graph: &str = edge.graph().into();
+                    write!(f, " {graph}-fwd[{}]", node.key_at(self.rows))?;
+                }
+            }
             if group.nodes.iter().all(Hydrator::needs_viewer) {
                 f.write_str(" (skipped logged out)")?;
             }
+            if group.ceiling() != HYDRATION_TIMEOUT {
+                write!(f, " timeout: {:?}", group.ceiling())?;
+            }
             writeln!(f)?;
+        }
+        for relation in self.relations() {
+            writeln!(f, "{relation}")?;
         }
         Ok(())
     }
@@ -573,49 +295,10 @@ impl fmt::Display for HydrationPlan {
 
 #[cfg(test)]
 mod tests {
+    use super::{HydrationPlan, RequestRows};
+    use crate::hydration::{Hydrator, Hydrators};
     use crate::rules::{RuleEngine, SafetyLevel};
     use strum::VariantArray;
-
-    const PLANS: &str = "\
-filter_all: 1 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-timeline_home: 7 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-timeline_home_recommendations: 7 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-timeline_home_hydration: 11 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-conversation_control/get_conversation_controls after: - nodes: conversation_control
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile,viewer_labels fields: ACCOUNT|EXTENDED_PROFILE|SAFETY|LABELS (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety fields: SAFETY|LABELS
-socialgraph+blocked_by/batch_check_relationships+batch_check_blocked_by after: pure_core nodes: follows,blocked_by_author,blocked_by_reply_root follows-fwd[author] blocks-rev[author,reply_root] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-conversation_control/batch_check_followed_by+batch_check_super_follows after: conversation_control nodes: root_follows_viewer,super_follows_root follows-rev[root:Community|MyNetwork] super_follows-fwd[root:Subscribers] (skipped logged out)
-conversation_control/exists_intersect after: root_follows_viewer nodes: root_follows_viewer_second_degree (skipped logged out)
-conversation_control/tfe_top_country after: conversation_control nodes: viewer_country (skipped logged out)
-immersive_expanded_recommendations: 7 calls
-tes/get_tweet_core_datas after: - nodes: pure_core
-tes/get_tweets after: - nodes: tweet
-safety_labels/get after: - nodes: tweet_safety_labels
-gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
-gizmoduck/get_users after: pure_core nodes: author_safety,author_labels fields: SAFETY|LABELS
-socialgraph/batch_check_relationships after: pure_core nodes: follows,blocks,mutes,mute_retweets follows-fwd[author] blocks-fwd[author] mutes-fwd[author] mute_retweets-fwd[retweeter] (skipped logged out)
-exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_exclusive super_follows-fwd[exclusive_author] (skipped logged out)
-";
 
     #[test]
     fn each_level_plans_these_calls() {
@@ -624,6 +307,26 @@ exclusive_content/batch_check_super_follows after: tweet nodes: super_follows_ex
             .iter()
             .map(|&level| engine.plan(level).to_string())
             .collect();
-        assert_eq!(plans, PLANS);
+        crate::pinned::assert_pinned("tests/fixtures/plans.txt", &plans);
+    }
+
+    #[test]
+    fn a_level_of_user_rows_plans_no_pure_core_and_asks_the_actor_source_by_user() {
+        let nodes = Hydrators::of(Hydrator::ViewerProfile)
+            .with(Hydrator::AuthorSafety)
+            .with(Hydrator::Follows)
+            .with(Hydrator::Blocks);
+        let plan =
+            HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes);
+        assert_eq!(
+            plan.to_string(),
+            "\
+quoted_tweet_rules: 3 calls
+gizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)
+gizmoduck_actor/get_users after: - nodes: author_safety fields: SAFETY|LABELS|PROFILE
+socialgraph/batch_check_relationships after: - nodes: follows,blocks follows-fwd[users] blocks-fwd[users] (skipped logged out)
+"
+        );
+        assert!(plan.keys_only_user_rows_or_viewer());
     }
 }

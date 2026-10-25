@@ -6,19 +6,24 @@ pub mod tweet;
 pub mod verdict;
 pub mod viewer;
 
-pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
+pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet, AuthorProfile};
 pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
-pub use tweet::{MediaFeature, NsfwFeature, TweetFeatures};
+pub use tweet::{
+    ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, ReactionContext,
+    TweetFeatures,
+};
 pub use verdict::{
-    Decided, DropReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, NsfwViewerDropReason, TombstoneReason, Verdict, Withholding,
+    Decided, DropReason, EmergencyCopy, Evaluation, FosnrReason, LabelInterstitial,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, MediaRestriction, Notice,
+    NsfwViewerDropReason, PublicInterest, TombstoneReason, Verdict, Withholding,
 };
 pub use viewer::{
-    ClientCapability, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
+    ClientCapability, NotificationFilters, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures,
+    ViewerProfile,
 };
 
-use crate::hydration::Hydrators;
+use crate::hydration::{Hydrator, Hydrators};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TweetId(pub u64);
@@ -43,7 +48,19 @@ pub struct PureCore {
     pub author_id: AuthorId,
     pub source_tweet_id: Option<TweetId>,
     pub source_author_id: Option<AuthorId>,
-    pub direct_reply_root_author_id: Option<AuthorId>,
+    pub reply_to: Option<ReplyTo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyTo {
+    Root {
+        conversation_id: TweetId,
+        root_author_id: AuthorId,
+    },
+    Nested {
+        conversation_id: TweetId,
+        parent_id: TweetId,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,16 +69,188 @@ pub struct RawCandidate {
     pub request_author_id: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Placement {
+    Standalone,
+    InnerQuoted { outer: TweetId },
+    RetweetSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuoteLink {
+    pub outer: TweetId,
+    pub quoting_author: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PairEdges {
+    pub author_blocks_outer_author: bool,
+    pub outer_author_follows_author: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuoteFacts {
+    pub link: Option<QuoteLink>,
+    pub pair_edges: PairEdges,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlacedCandidate {
+    pub candidate: RawCandidate,
+    pub placement: Placement,
+}
+
+impl PlacedCandidate {
+    pub fn standalone(candidate: RawCandidate) -> Self {
+        Self {
+            candidate,
+            placement: Placement::Standalone,
+        }
+    }
+
+    pub fn tweet_id(self) -> TweetId {
+        self.candidate.tweet_id
+    }
+
+    pub fn key(self) -> EvaluationKey {
+        EvaluationKey {
+            tweet_id: self.tweet_id(),
+            placement: self.placement,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EvaluationKey {
+    pub tweet_id: TweetId,
+    pub placement: Placement,
+}
+
+impl EvaluationKey {
+    pub fn retweet_source(tweet_id: TweetId) -> Self {
+        Self {
+            tweet_id,
+            placement: Placement::RetweetSource,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct HydratedTweetCandidate {
+pub struct PostCandidate {
+    pub author: UserEntity,
+    pub viewer_relationship: ViewerRelationship,
+    pub post: PostEntity,
+    pub failed: Hydrators,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserCandidate {
+    pub user: UserEntity,
+    pub viewer_relationship: ViewerRelationship,
+    pub quote: QuoteFacts,
+    pub failed: Hydrators,
+}
+
+#[cfg(test)]
+impl UserCandidate {
+    pub(crate) fn author_of(post: &PostCandidate) -> Self {
+        Self {
+            user: post.author.clone(),
+            viewer_relationship: post.viewer_relationship,
+            quote: QuoteFacts::default(),
+            failed: post.failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UserEntity {
+    pub id: u64,
+    pub features: AuthorFeatures,
+    pub labels: AuthorLabelSet,
+    pub profile: AuthorProfile,
+    pub lacks_confirmed_email: bool,
+    pub lacks_verified_phone: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewerRelationship {
+    pub follows: bool,
+    pub blocks: bool,
+    pub mutes: bool,
+    pub blocked_by: bool,
+    pub followed_by: bool,
+}
+
+impl ViewerRelationship {
+    #[inline]
+    pub(crate) fn slot(&mut self, node: Hydrator) -> Option<&mut bool> {
+        match node {
+            Hydrator::Follows => Some(&mut self.follows),
+            Hydrator::Blocks => Some(&mut self.blocks),
+            Hydrator::Mutes => Some(&mut self.mutes),
+            Hydrator::BlockedByAuthor => Some(&mut self.blocked_by),
+            Hydrator::AuthorFollowsViewer => Some(&mut self.followed_by),
+            Hydrator::PureCore
+            | Hydrator::Tweet
+            | Hydrator::ConversationControl
+            | Hydrator::TweetSafetyLabels
+            | Hydrator::ViewerProfile
+            | Hydrator::ViewerLabels
+            | Hydrator::AuthorSafety
+            | Hydrator::AuthorLabels
+            | Hydrator::MuteRetweets
+            | Hydrator::BlockedByReplyRoot
+            | Hydrator::SuperFollowsExclusive
+            | Hydrator::RootFollowsViewer
+            | Hydrator::RootFollowsViewerSecondDegree
+            | Hydrator::SuperFollowsRoot
+            | Hydrator::ViewerFollowsRoot
+            | Hydrator::BlockedByConversationRoot
+            | Hydrator::ConversationRootPost
+            | Hydrator::BlockedByConversationRootPost
+            | Hydrator::ViewerCountry
+            | Hydrator::CommunityModeration
+            | Hydrator::CommunityModerator
+            | Hydrator::CommunityViewerRemoved
+            | Hydrator::ArticleLifecycle
+            | Hydrator::ArticleMediaEntities
+            | Hydrator::ArticleCoverMedia
+            | Hydrator::TrustedFriends
+            | Hydrator::OutsideNarrowcastPlace
+            | Hydrator::AuthorBlocksOuterAuthor
+            | Hydrator::OuterAuthorFollowsAuthor
+            | Hydrator::QuotedTweet
+            | Hydrator::ReactedToPostSafetyLabels
+            | Hydrator::ReactedToAuthorSafety
+            | Hydrator::ViewerNotificationFilters
+            | Hydrator::AuthorProfile
+            | Hydrator::AuthorConfirmedEmail
+            | Hydrator::AuthorVerifiedPhone => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(mut self, node: Hydrator) -> Option<bool> {
+        self.slot(node).copied()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PostEntity {
     pub tweet_id: u64,
-    pub author_id: u64,
     pub source_tweet_id: Option<u64>,
+    pub is_reply: bool,
     pub tweet_features: TweetFeatures,
-    pub author_features: AuthorFeatures,
-    pub author_labels: AuthorLabelSet,
     pub safety_labels: SafetyLabelMap,
     pub edges: Hydrators,
     pub conversation_control: Option<ConversationControlFeatures>,
-    pub failed: Hydrators,
+    pub community_moderation: CommunityModeration,
+            pub viewer_is_community_moderator: Option<bool>,
+    pub viewer_is_removed_from_community: bool,
+        pub article_lifecycle: Option<ArticleLifecycle>,
+    pub article_has_media_entities: bool,
+    pub article_has_cover_media: bool,
+    pub reacted_to_post_safety_labels: SafetyLabelMap,
+    pub reacted_to_author_is_protected: bool,
 }

@@ -1,20 +1,23 @@
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
-    TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer, ViewerFeatures,
-    ViewerProfile, Withholding,
+    DropReason, FosnrReason, LabelInterstitial, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity,
+    SafetyLabelMap, SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict,
+    VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile, Withholding,
 };
+use crate::params::LimitedActionType;
+use crate::rules::RuleId;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::{InterstitialAction, InterstitialReason};
+use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
 const TWEET_ID: u64 = 1;
 pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
+#[derive(Clone, Copy)]
 pub(crate) struct ClientClass {
     pub(crate) name: &'static str,
     pub(crate) app_id: i64,
@@ -22,7 +25,7 @@ pub(crate) struct ClientClass {
     pub(crate) capability: ClientCapability,
 }
 
-pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
+pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
     use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported};
     const RWEB: i64 = 3033300;
     const IPHONE: i64 = 129032;
@@ -44,10 +47,23 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
                 verify_blur_support: Some(verify_blur_support),
                 modern_blur,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: matches!(app_id, RWEB | IPHONE | ANDROID),
                 gore_blur_ignores_settings,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
+                soft_nsfw_new_user_drop: false,
             },
+        }
+    }
+    const fn android_9_82(class: ClientClass) -> ClientClass {
+        ClientClass {
+            capability: ClientCapability {
+                fosnr_rules: false,
+                fosnr_fallback_drops: true,
+                community_viewer_removed_limits: false,
+                ..class.capability
+            },
+            ..class
         }
     }
     [
@@ -94,6 +110,15 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
             true,
             true,
         ),
+        android_9_82(class(
+            "android_without_fosnr",
+            ANDROID,
+            "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+             (Google;panther;google;panther;0;;1;2022)",
+            AndroidNeedsUpdate,
+            false,
+            false,
+        )),
         class(
             "mac_app",
             MAC,
@@ -113,8 +138,118 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
     ]
 };
 
+fn id_of(by: &str) -> RuleId {
+    RuleId::of_rule_name(by).unwrap_or(RuleId::FilterAll)
+}
+
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
+        notice: None,
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn label_interstitial(
+    interstitial: LabelInterstitial,
+    by: &'static str,
+    engagement: Option<(LimitedEngagementReason, &'static str)>,
+) -> Verdict {
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::LabelInterstitial(interstitial),
+            id: id_of(by),
+            by,
+        }),
+        media: None,
+        engagement: engagement.map(|(reason, by)| Decided {
+            value: LimitedEngagement::new(reason),
+            id: id_of(by),
+            by,
+        }),
+    }
+}
+
+pub(crate) fn with_label_interstitial(
+    shown: Verdict,
+    interstitial: LabelInterstitial,
+    by: &'static str,
+) -> Verdict {
+    let Verdict::Shown {
+        media, engagement, ..
+    } = shown
+    else {
+        panic!("a label interstitial joins a shown verdict");
+    };
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::LabelInterstitial(interstitial),
+            id: id_of(by),
+            by,
+        }),
+        media,
+        engagement,
+    }
+}
+
+pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::SoftIntervention(FosnrReason {
+                policy: AppealablePolicy::ABUSE,
+                level: 1,
+                proactive,
+                appeal_submitted,
+            }),
+            id: id_of(by),
+            by,
+        }),
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn appealed(
+    policy: AppealablePolicy,
+    level: i8,
+    proactive: bool,
+    appeal_submitted: bool,
+    by: &'static str,
+) -> Verdict {
+    use LimitedActionType as A;
+    let limited_actions: &'static [LimitedActionType] = if level == 1 {
+        &[A::EditTweet]
+    } else {
+        &[
+            A::Like,
+            A::Reply,
+            A::Retweet,
+            A::QuoteTweet,
+            A::ShareTweetVia,
+            A::AddToBookmarks,
+            A::PinToProfile,
+            A::CopyLink,
+            A::SendViaDm,
+            A::EditTweet,
+            A::Highlight,
+            A::Embed,
+            A::ListsAddRemove,
+        ]
+    };
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::Appealable {
+                reason: FosnrReason {
+                    policy,
+                    level,
+                    proactive,
+                    appeal_submitted,
+                },
+                limited_actions,
+            },
+            id: id_of(by),
+            by,
+        }),
         media: None,
         engagement: None,
     }
@@ -123,6 +258,7 @@ pub(crate) fn allow() -> Verdict {
 pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::Legacy(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -130,6 +266,7 @@ pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
 pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Drop(DropReason::NsfwViewer(reason)),
+        id: id_of(by),
         by,
     })
 }
@@ -137,6 +274,7 @@ pub(crate) fn nsfw_viewer_dropped(reason: NsfwViewerDropReason, by: &'static str
 pub(crate) fn tombstoned(reason: TombstoneReason, by: &'static str) -> Verdict {
     Verdict::Withheld(Decided {
         value: Withholding::Tombstone(reason),
+        id: id_of(by),
         by,
     })
 }
@@ -159,12 +297,14 @@ fn media_blurred(
     by: &'static str,
 ) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                 legacy: FilteredReason::ContainNsfwMedia,
                 reason,
                 prompt,
             }),
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -173,8 +313,10 @@ fn media_blurred(
 
 pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
+            id: id_of(by),
             by,
         }),
         engagement: None,
@@ -192,16 +334,23 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
         value.add(reason);
     }
     Verdict::Shown {
+        notice: None,
         media: None,
-        engagement: Some(Decided { value, by }),
+        engagement: Some(Decided {
+            value,
+            id: id_of(by),
+            by,
+        }),
     }
 }
 
 pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
     match (blur, limit) {
-        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => {
-            Verdict::Shown { media, engagement }
-        }
+        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => Verdict::Shown {
+            notice: None,
+            media,
+            engagement,
+        },
         (blur, limit) => panic!("expected two Shown verdicts, got {blur:?} and {limit:?}"),
     }
 }
@@ -262,25 +411,111 @@ pub(super) fn conversation_control(
     }
 }
 
+pub(super) fn author_candidate(set: fn(&mut AuthorFeatures)) -> PostCandidate {
+    let mut features = AuthorFeatures::default();
+    set(&mut features);
+    candidate().with_author_features(features).build()
+}
+
+pub(super) fn tweet_candidate(set: fn(&mut TweetFeatures)) -> PostCandidate {
+    let mut features = TweetFeatures::default();
+    set(&mut features);
+    candidate().with_tweet_features(features).build()
+}
+
+pub(super) fn labeled(label: SafetyLabelType) -> PostCandidate {
+    candidate().with_label(label).build()
+}
+
+pub(super) fn controlled_root(arm: ConversationControlArm) -> ConversationControlFeatures {
+    conversation_control(arm, AUTHOR_ID)
+}
+
+pub(super) fn viewer_in_country(code: &str) -> ViewerFeatures {
+    ViewerFeatures {
+        country_code: Some(code.to_string()),
+        ..viewer(VIEWER_ID)
+    }
+}
+
+pub(super) fn on_client(class_name: &str, country: &str, base: ViewerFeatures) -> ViewerFeatures {
+    let class = CLIENT_CLASSES
+        .iter()
+        .find(|class| class.name == class_name)
+        .unwrap_or_else(|| panic!("no client class {class_name}"));
+    ViewerFeatures {
+        country_code: Some(country.to_string()),
+        client_capability: class.capability,
+        ..base
+    }
+}
+
+pub(super) fn nsfw_high_precision_media() -> PostCandidate {
+    candidate()
+        .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
+        .with_media()
+        .build()
+}
+
+pub(super) fn viewer_with_age(age: ViewerAge) -> ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
+        viewer_age: age,
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn no_stated_age_viewer(account_country_code: &str) -> ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
+        viewer_age: ViewerAge::NotStated,
+        account_country_code: Some(account_country_code.to_string()),
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn read_only_viewer(id: u64) -> ViewerFeatures {
+    ViewerFeatures {
+        viewer: Viewer::LoggedIn {
+            id,
+            profile: ViewerProfile {
+                is_read_only: true,
+                ..ViewerProfile::default()
+            },
+            has_age_verified_18_label: false,
+        },
+        ..ViewerFeatures::default()
+    }
+}
+
 pub(crate) fn candidate() -> CandidateBuilder {
     CandidateBuilder {
-        candidate: HydratedTweetCandidate {
-            tweet_id: TWEET_ID,
-            author_id: AUTHOR_ID,
-            ..Default::default()
+        candidate: PostCandidate {
+            author: UserEntity {
+                id: AUTHOR_ID,
+                ..Default::default()
+            },
+            post: PostEntity {
+                tweet_id: TWEET_ID,
+                ..Default::default()
+            },
+            viewer_relationship: Default::default(),
+            failed: Hydrators::empty(),
         },
         labels: HashSet::new(),
+        agent_labels: HashSet::new(),
+        label_sources: Vec::new(),
     }
 }
 
 pub(crate) struct CandidateBuilder {
-    candidate: HydratedTweetCandidate,
+    candidate: PostCandidate,
     labels: HashSet<SafetyLabelType>,
+    agent_labels: HashSet<SafetyLabelType>,
+    label_sources: Vec<(SafetyLabelType, &'static str)>,
 }
 
 impl CandidateBuilder {
     pub(crate) fn tweet_id(mut self, id: u64) -> Self {
-        self.candidate.tweet_id = id;
+        self.candidate.post.tweet_id = id;
         self
     }
 
@@ -289,29 +524,58 @@ impl CandidateBuilder {
         self
     }
 
+    pub(crate) fn with_label_source(
+        mut self,
+        label: SafetyLabelType,
+        source: &'static str,
+    ) -> Self {
+        self.labels.insert(label);
+        self.label_sources.push((label, source));
+        self
+    }
+
+    pub(crate) fn with_agent_label(mut self, label: SafetyLabelType) -> Self {
+        self.agent_labels.insert(label);
+        self.with_label(label)
+    }
+
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
-        self.candidate.author_labels.insert(label);
+        self.candidate.author.labels.insert(label);
         self
     }
 
     pub(crate) fn with_tweet_features(mut self, features: TweetFeatures) -> Self {
-        self.candidate.tweet_features = features;
+        self.candidate.post.tweet_features = features;
         self
     }
 
     pub(crate) fn with_author_features(mut self, features: AuthorFeatures) -> Self {
-        self.candidate.author_features = features;
+        self.candidate.author = UserEntity {
+            id: self.candidate.author.id,
+            features,
+            labels: self.candidate.author.labels,
+            ..UserEntity::default()
+        };
         self
     }
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
         debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
-        self.candidate.edges = self.candidate.edges.with(edge);
+        if let Some(slot) = self.candidate.viewer_relationship.slot(edge) {
+            *slot = true;
+        } else {
+            self.candidate.post.edges = self.candidate.post.edges.with(edge);
+        }
+        debug_assert!(self.candidate.post.edges.iter().all(|node| self
+            .candidate
+            .viewer_relationship
+            .get(node)
+            .is_none()));
         self
     }
 
     pub(crate) fn with_media(mut self) -> Self {
-        self.candidate.tweet_features.media.has_media = true;
+        self.candidate.post.tweet_features.media.has_media = true;
         self
     }
 
@@ -319,19 +583,42 @@ impl CandidateBuilder {
         mut self,
         features: ConversationControlFeatures,
     ) -> Self {
-        self.candidate.conversation_control = Some(features);
+        self.candidate.post.conversation_control = Some(features);
         self
     }
 
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.source_tweet_id = Some(source_tweet_id);
+        self.candidate.post.source_tweet_id = Some(source_tweet_id);
         self
     }
 
-    pub(crate) fn build(self) -> HydratedTweetCandidate {
+    pub(crate) fn reply(mut self) -> Self {
+        self.candidate.post.is_reply = true;
+        self
+    }
+
+    pub(crate) fn with_reacted_to_post_labels(mut self, labels: &[SafetyLabelType]) -> Self {
+        self.candidate.post.reacted_to_post_safety_labels =
+            SafetyLabelMap::new(labels.iter().copied().collect());
+        self
+    }
+
+    pub(crate) fn with_protected_reacted_to_author(mut self) -> Self {
+        self.candidate.post.reacted_to_author_is_protected = true;
+        self
+    }
+
+    pub(crate) fn build(self) -> PostCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.safety_labels = SafetyLabelMap::new(self.labels);
+            let labels = self.label_sources.into_iter().fold(
+                SafetyLabelMap::new(self.labels),
+                |labels, (label, source)| labels.with_source(label, source),
+            );
+            candidate.post.safety_labels = self
+                .agent_labels
+                .into_iter()
+                .fold(labels, SafetyLabelMap::assigned_by_agent);
         }
         candidate
     }

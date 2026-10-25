@@ -278,7 +278,8 @@ def build1FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRe
   val object = {
     postId = candidate.postId,
     authorId = candidate.authorId,
-    indexName = "1fav_reply"
+    indexName = "1fav_reply",
+    inReplyToPostId = candidate.tweetMedadata.flatMap { tweet => eventProcessing.inReplyToPostId(tweet) }
   }
   #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
   stats.counter("1fav_reply_indexing_event_created").incr(1)
@@ -289,7 +290,8 @@ def build32FavReplyIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsR
     val object = {
       postId = candidate.postId,
       authorId = candidate.authorId,
-      indexName = "32fav_reply"
+      indexName = "32fav_reply",
+      inReplyToPostId = candidate.tweetMedadata.flatMap { tweet => eventProcessing.inReplyToPostId(tweet) }
     }
     #<hydra/kafka/indexingEventKafkaTopic>.insert((), object)
     stats.counter("32fav_reply_indexing_event_created").incr(1)
@@ -351,7 +353,11 @@ def buildImagineIndex(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRece
   }
 }
 
-def buildMetadataDump(candidate: PhoenixRankAllCandidate, stats: Stats.StatsReceiver): Unit = {
+def buildMetadataDump(
+  candidate: PhoenixRankAllCandidate,
+  stats: Stats.StatsReceiver,
+  isReply: Boolean
+): Unit = {
   candidate.tweetMedadata match {
     case Some(tweet) =>
       val hasImage = tweetUtil.hasImage(tweet)
@@ -365,9 +371,14 @@ def buildMetadataDump(candidate: PhoenixRankAllCandidate, stats: Stats.StatsRece
         authorFollowersCount = candidate.authorFollowers,
         engagementCount = candidate.engagementCount,
         videoDurationMs = videoDurationMsOpt,
+        isReply = Some(isReply),
       }
       #<hydra/kafka/metadataEventKafkaTopic>.insert((), flatObject)
-      stats.counter("metadata_dump_created").incr(1)
+      if (isReply) {
+        stats.counter("reply_metadata_dump_created").incr(1)
+      } else {
+        stats.counter("metadata_dump_created").incr(1)
+      }
     case None => ()
   }
 }
@@ -479,6 +490,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                 } else {
                   build1FavReplyIndex(candidate, receiverStats)
                   build32FavReplyIndex(candidate, receiverStats)
+                  buildMetadataDump(candidate, receiverStats, isReply)
                 }
               }
             } else if (isRepost) {
@@ -486,7 +498,7 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
             } else if (shouldDropPost) {
               if (hasImmersiveVideo && eventSource == Fav && isAdultPost) {
                 buildNsfwVideoIndex(candidate, receiverStats)
-                buildMetadataDump(candidate, receiverStats)
+                buildMetadataDump(candidate, receiverStats, isReply)
                 buildMMEmbMetadataDump(candidate, receiverStats)
               } else {
                 numSkippedPosts.incr(1)
@@ -503,14 +515,14 @@ val executeOp = Op.execute({ idempotent = true })[PhoenixRankAllIndexingRequest,
                     build1FavVideoIndex(candidate, receiverStats)
                     buildImagineIndex(candidate, receiverStats)
                   }
-                  buildMetadataDump(candidate, receiverStats)
+                  buildMetadataDump(candidate, receiverStats, isReply)
                   buildMMEmbMetadataDump(candidate, receiverStats)
                 case PostCreation =>
                   buildPostCreationIndex(candidate, receiverStats)
                   if(hasImmersiveVideo) {
                     buildVideoIndex(candidate, receiverStats)
                   }
-                  buildMetadataDump(candidate, receiverStats)
+                  buildMetadataDump(candidate, receiverStats, isReply)
                 case _ =>
                   numInvalidEventSource.incr(1)
               }

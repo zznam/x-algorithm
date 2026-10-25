@@ -1,67 +1,89 @@
 use crate::models::tweet_timestamp_ms;
 use quanta::Clock;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use xai_visibility_filtering_proto as vf_pb;
 
 use super::expiring_cache::{ExpiringCache, Lookup};
-use super::lookup::{LookupError, RemoteSource};
+use super::lookup::{LookupError, LookupResults, RemoteSource};
 use super::metrics::{self, BatchStage, CacheResult, CacheTier};
 
-const CACHE_CAPACITY: usize = 1_000_000;
+const TTL: Duration = Duration::from_secs(10);
 
-const YOUNG_TWEET_AGE: Duration = Duration::from_secs(5 * 60);
-const SHORT_TTL: Duration = Duration::from_secs(30);
-const LONG_TTL: Duration = Duration::from_secs(60);
-
-fn tweet_age(tweet_id: u64, now: SystemTime) -> Option<Duration> {
-    let created_ms = tweet_timestamp_ms(tweet_id);
-    let created_at = UNIX_EPOCH.checked_add(Duration::from_millis(created_ms))?;
-    now.duration_since(created_at).ok()
+fn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(tweet_timestamp_ms(tweet_id)))
+        .is_none_or(|created_at| created_at > now)
 }
 
-fn ttl_for_tweet(tweet_id: u64, now: SystemTime) -> Option<Duration> {
-    let age = tweet_age(tweet_id, now)?;
-    if age < YOUNG_TWEET_AGE {
-        Some(SHORT_TTL.min(YOUNG_TWEET_AGE - age))
-    } else {
-        Some(LONG_TTL)
+fn system_unix_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn label_is_live(expires_at_msec: Option<i64>, now_ms: i64) -> bool {
+    match expires_at_msec {
+        Some(expires_at_msec) => expires_at_msec.wrapping_sub(now_ms) > 0,
+        None => true,
+    }
+}
+
+fn drop_expired_labels(map: &vf_pb::SafetyLabelMap, now_ms: i64) -> vf_pb::SafetyLabelMap {
+    vf_pb::SafetyLabelMap {
+        labels: map
+            .labels
+            .iter()
+            .filter(|(_, label)| label_is_live(label.expires_at_msec, now_ms))
+            .map(|(id, label)| (*id, label.clone()))
+            .collect(),
     }
 }
 
 pub struct SafetyLabelSource {
-    cache: ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>,
+        cache: Option<ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>>,
     remote: Arc<RemoteSource>,
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl SafetyLabelSource {
-    pub(crate) fn new(remote: Arc<RemoteSource>) -> Self {
-        Self::with_clock(remote, Clock::new())
+    pub(crate) fn new(remote: Arc<RemoteSource>, cache_capacity: Option<usize>) -> Self {
+        Self::with_clock(remote, cache_capacity, Clock::new())
     }
 
-    fn with_clock(remote: Arc<RemoteSource>, clock: Clock) -> Self {
+    fn with_clock(remote: Arc<RemoteSource>, cache_capacity: Option<usize>, clock: Clock) -> Self {
+        Self::with_clocks(remote, cache_capacity, clock, Arc::new(system_unix_ms))
+    }
+
+    fn with_clocks(
+        remote: Arc<RemoteSource>,
+        cache_capacity: Option<usize>,
+        clock: Clock,
+        now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
         info!(
-            cache_capacity = CACHE_CAPACITY,
-            young_ttl_secs = SHORT_TTL.as_secs(),
-            old_ttl_secs = LONG_TTL.as_secs(),
-            age_threshold_secs = YOUNG_TWEET_AGE.as_secs(),
+            cache_capacity = cache_capacity.unwrap_or(0),
+            ttl_secs = TTL.as_secs(),
             "Local safety-label cache initialized (single pool, per-entry TTL)"
         );
         Self {
-            cache: ExpiringCache::with_clock(CACHE_CAPACITY, clock),
+            cache: cache_capacity.map(|capacity| ExpiringCache::with_clock(capacity, clock)),
             remote,
+            now_ms,
         }
     }
 
     pub async fn get(
         &self,
         ids: &[u64],
-    ) -> HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
+    ) -> FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
         let total = ids.len();
-        let mut results: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
-            HashMap::with_capacity(total);
+        let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
+            FxHashMap::with_capacity_and_hasher(total, Default::default());
 
         let (local_misses, expired) = self.get_local(ids, &mut results);
         let batch_size = local_misses.len();
@@ -71,18 +93,37 @@ impl SafetyLabelSource {
 
         Self::emit_stats(total - batch_size, batch_size, expired);
 
+        let now_ms = (self.now_ms)();
+        let mut dropped = 0;
+        for labels in results.values_mut() {
+            let Ok(map) = labels else { continue };
+            if map
+                .labels
+                .values()
+                .any(|label| !label_is_live(label.expires_at_msec, now_ms))
+            {
+                let live = drop_expired_labels(map, now_ms);
+                dropped += map.labels.len() - live.labels.len();
+                *map = Arc::new(live);
+            }
+        }
+        metrics::record_expired_labels(dropped);
+
         results
     }
 
     fn get_local(
         &self,
         ids: &[u64],
-        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) -> (Vec<u64>, usize) {
+        let Some(cache) = &self.cache else {
+            return (ids.to_vec(), 0);
+        };
         let mut misses = Vec::with_capacity(ids.len());
         let mut expired = 0;
         for &tweet_id in ids {
-            match self.cache.get(&tweet_id) {
+            match cache.get(&tweet_id) {
                 Lookup::Found(labels) => {
                     results.insert(tweet_id, Ok(labels));
                 }
@@ -98,16 +139,17 @@ impl SafetyLabelSource {
 
     fn backfill_local(
         &self,
-        remote_results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
-        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+        remote_results: LookupResults,
+        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) {
         let wall_now = SystemTime::now();
         for (id, result) in remote_results {
             let result = result.map(Arc::new);
-            if let Ok(label_map) = &result
-                && let Some(ttl) = ttl_for_tweet(id, wall_now)
+            if let Some(cache) = &self.cache
+                && let Ok(label_map) = &result
+                && !is_future_dated(id, wall_now)
             {
-                self.cache.insert(id, Arc::clone(label_map), ttl);
+                cache.insert(id, Arc::clone(label_map), TTL);
             }
             results.insert(id, result);
         }
@@ -130,10 +172,13 @@ mod tests {
     };
     use crate::safety_label_source::codec::RawSafetyLabel;
     use crate::safety_label_source::lookup::RemoteSource;
+    use crate::safety_label_source::lookup::{LookupResults, ManhattanLookup, TwemcacheLookup};
     use crate::safety_label_source::manhattan::ManhattanSource;
     use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::safety_label_source::types::TwemcacheOutcome;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tonic::async_trait;
     use xai_cache::{KVCacheError, Key, Value};
 
@@ -208,6 +253,7 @@ mod tests {
             cache_results,
             Arc::new(FakeLabelFetcher { items: mh_items }),
             clock,
+            Some(1024),
         )
     }
 
@@ -215,6 +261,7 @@ mod tests {
         cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         fetcher: Arc<dyn ManhattanLabelFetcher>,
         clock: Clock,
+        l1_capacity: Option<usize>,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
         let remote_keys = Arc::new(AtomicUsize::new(0));
         let twemcache = Arc::new(TwemcacheSource::with_cache(Arc::new(FakeTwemcache {
@@ -223,7 +270,17 @@ mod tests {
         })));
         let manhattan = Arc::new(ManhattanSource::new(fetcher));
         let remote = Arc::new(RemoteSource::new(twemcache, manhattan));
-        (SafetyLabelSource::with_clock(remote, clock), remote_keys)
+        (
+            SafetyLabelSource::with_clock(remote, l1_capacity, clock),
+            remote_keys,
+        )
+    }
+
+    fn l1_expiry(source: &SafetyLabelSource, tweet_id: u64) -> Option<quanta::Instant> {
+        source
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.expiry_of(&tweet_id))
     }
 
     fn cache_key(tweet_id: u64) -> Key {
@@ -254,7 +311,7 @@ mod tests {
         let results1 = source.get(&[42]).await;
         let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
-        assert!(source.cache.expiry_of(&42).is_some());
+        assert!(l1_expiry(&source, 42).is_some());
 
         let results2 = source.get(&[42]).await;
         assert!(Arc::ptr_eq(
@@ -270,14 +327,32 @@ mod tests {
             HashMap::new(),
             Arc::new(FailingLabelFetcher),
             Clock::new(),
+            Some(1024),
         );
 
         let results1 = source.get(&[42]).await;
         assert!(results1.get(&42).unwrap().is_err());
-        assert!(source.cache.expiry_of(&42).is_none());
+        assert!(l1_expiry(&source, 42).is_none());
 
         let results2 = source.get(&[42]).await;
         assert!(results2.get(&42).unwrap().is_err());
+        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn without_an_l1_every_read_goes_remote() {
+        let (source, remote_keys) = make_counting_source_with_fetcher(
+            HashMap::from([(cache_key(42), Ok(Some(cached_value_found_mval())))]),
+            Arc::new(FakeLabelFetcher {
+                items: HashMap::new(),
+            }),
+            Clock::new(),
+            None,
+        );
+
+        for _ in 0..2 {
+            assert!(source.get(&[42]).await.get(&42).unwrap().is_ok());
+        }
         assert_eq!(remote_keys.load(Ordering::SeqCst), 2);
     }
 
@@ -293,7 +368,7 @@ mod tests {
         let results = source.get(&[tweet_id]).await;
 
         assert!(results.get(&tweet_id).unwrap().is_ok());
-        assert!(source.cache.expiry_of(&tweet_id).is_none());
+        assert!(l1_expiry(&source, tweet_id).is_none());
     }
 
     #[tokio::test]
@@ -313,7 +388,7 @@ mod tests {
                 .labels
                 .is_empty()
         );
-        assert!(source.cache.expiry_of(&42).is_some());
+        assert!(l1_expiry(&source, 42).is_some());
 
         let results2 = source.get(&[42]).await;
         assert!(
@@ -328,30 +403,6 @@ mod tests {
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn tweet_age_selects_and_clamps_local_ttl() {
-        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        for (age, expected) in [
-            (Duration::from_secs(60), Some(SHORT_TTL)),
-            (Duration::from_secs(600), Some(LONG_TTL)),
-            (
-                YOUNG_TWEET_AGE - Duration::from_secs(10),
-                Some(Duration::from_secs(10)),
-            ),
-            (
-                YOUNG_TWEET_AGE - Duration::from_millis(1),
-                Some(Duration::from_millis(1)),
-            ),
-            (YOUNG_TWEET_AGE, Some(LONG_TTL)),
-        ] {
-            let tweet_id = tweet_id_created_at(now - age);
-            assert_eq!(ttl_for_tweet(tweet_id, now), expected);
-        }
-
-        let future_id = tweet_id_created_at(now + Duration::from_secs(60));
-        assert_eq!(ttl_for_tweet(future_id, now), None);
-    }
-
     #[tokio::test]
     async fn expired_entry_is_refetched_and_restamped() {
         let (clock, mock) = Clock::mock();
@@ -363,12 +414,97 @@ mod tests {
         );
 
         source.get(&[tweet_id]).await;
-        let first_expiry = source.cache.expiry_of(&tweet_id).expect("backfilled");
+        let first_expiry = l1_expiry(&source, tweet_id).expect("backfilled");
 
-        mock.increment(SHORT_TTL + Duration::from_secs(1));
+        mock.increment(TTL + Duration::from_secs(1));
         source.get(&[tweet_id]).await;
-        let restamped = source.cache.expiry_of(&tweet_id).expect("re-backfilled");
+        let restamped = l1_expiry(&source, tweet_id).expect("re-backfilled");
 
         assert!(restamped > first_expiry);
+    }
+
+    fn proto_label(expires_at_msec: Option<i64>) -> vf_pb::SafetyLabel {
+        vf_pb::SafetyLabel {
+            expires_at_msec,
+            ..vf_pb::SafetyLabel::default()
+        }
+    }
+
+    struct HitMap {
+        map: vf_pb::SafetyLabelMap,
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TwemcacheLookup for HitMap {
+        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
+            self.fetches.fetch_add(ids.len(), Ordering::SeqCst);
+            ids.iter()
+                .map(|&id| (id, TwemcacheOutcome::Hit(self.map.clone())))
+                .collect()
+        }
+    }
+
+    struct EmptyManhattan;
+
+    #[async_trait]
+    impl ManhattanLookup for EmptyManhattan {
+        async fn get(&self, _: &[u64]) -> LookupResults {
+            FxHashMap::default()
+        }
+    }
+
+    fn label_ids(map: &vf_pb::SafetyLabelMap) -> Vec<i32> {
+        let mut ids: Vec<i32> = map.labels.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_cached_label_drops_out_after_it_expires_without_a_refetch() {
+        let now = Arc::new(AtomicI64::new(1_000));
+        let now_ms = Arc::clone(&now);
+        let hit = Arc::new(HitMap {
+            map: vf_pb::SafetyLabelMap {
+                labels: HashMap::from([
+                    (1, proto_label(None)),
+                    (2, proto_label(Some(1_000))),
+                    (3, proto_label(Some(5_000))),
+                ]),
+            },
+            fetches: AtomicUsize::new(0),
+        });
+        let source = SafetyLabelSource::with_clocks(
+            Arc::new(RemoteSource::new(
+                Arc::clone(&hit),
+                Arc::new(EmptyManhattan),
+            )),
+            Some(8),
+            Clock::new(),
+            Arc::new(move || now_ms.load(Ordering::Relaxed)),
+        );
+
+        let first = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(first.get(&42).unwrap().as_ref().unwrap()),
+            vec![1, 3]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
+
+        now.store(5_000, Ordering::Relaxed);
+        let later = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(later.get(&42).unwrap().as_ref().unwrap()),
+            vec![1]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
+
+        now.store(0, Ordering::Relaxed);
+        let rewound = source.get(&[42]).await;
+        assert_eq!(
+            label_ids(rewound.get(&42).unwrap().as_ref().unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);
     }
 }

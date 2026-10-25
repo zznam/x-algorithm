@@ -1,3 +1,4 @@
+use crate::ads::drops::AdDrops;
 use crate::models::candidate::PostCandidate;
 use crate::models::engagement_signals::EngagementSignalsByType;
 use crate::models::fs_recipient::FsRecipientInputs;
@@ -11,7 +12,7 @@ use xai_core_entities::entities::SubscriptionLevel;
 use xai_decider::Decider;
 use xai_feature_switches::Params;
 use xai_recsys_proto::gender_prediction::InferredGenderLabel;
-use xai_recsys_proto::{DeviceNetworkType, Timezone};
+use xai_recsys_proto::{DeviceNetworkType, RecentSearchQueries, Timezone};
 use xai_twittercontext_proto::{GetTwitterContextViewer, TwitterContextViewer};
 use xai_urt_thrift::cursor::UrtOrderedCursor;
 use xai_x_thrift::non_polling_timestamps::NonPollingTimestamps;
@@ -58,6 +59,12 @@ pub struct ScoredPostsQuery {
     pub scoring_sequence: Option<xai_recsys_proto::UserActionSequence>,
     #[serde(skip)]
     pub columnar_scoring_sequence: Option<bytes::Bytes>,
+    #[serde(skip)]
+    pub history_topics: Option<xai_vm_ranker_proto::experiment::HistoryTopics>,
+    #[serde(skip)]
+    pub stats_history_topics: Option<xai_vm_ranker_proto::experiment::HistoryTopics>,
+    #[serde(skip)]
+    pub immersive_columnar_scoring_sequence: Option<bytes::Bytes>,
     #[serde(skip)]
     pub retrieval_sequence: Option<xai_recsys_proto::UserActionSequence>,
     #[serde(skip)]
@@ -106,8 +113,11 @@ pub struct ScoredPostsQuery {
     pub implicit_engagement_signals: Option<EngagementSignalsByType>,
     #[serde(serialize_with = "serialize_debug")]
     pub user_installed_apps: Option<Vec<bool>>,
+    #[serde(skip)]
+    pub recent_search_queries: Option<RecentSearchQueries>,
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
+    pub is_under_the_hood_request: bool,
     pub is_preview: bool,
     pub is_polling: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -117,6 +127,7 @@ pub struct ScoredPostsQuery {
     pub served_history: Vec<ServedHistory>,
     pub who_to_follow_eligible: bool,
     pub feed_survey_eligible: bool,
+    pub video_carousel_eligible: bool,
     #[serde(serialize_with = "serialize_debug")]
     pub non_polling_timestamps: Option<NonPollingTimestamps>,
     pub impressed_post_ids: Vec<u64>,
@@ -124,6 +135,10 @@ pub struct ScoredPostsQuery {
     pub seed_candidate_post_ids: Vec<u64>,
     #[serde(serialize_with = "serialize_debug")]
     pub following_pagination_meta: Arc<OnceLock<FollowingPaginationMeta>>,
+    #[serde(skip)]
+    pub ad_drops: Arc<AdDrops>,
+    #[serde(serialize_with = "serialize_debug")]
+    pub video_carousel: Arc<OnceLock<Vec<PostCandidate>>>,
 }
 
 pub use xai_candidate_pipeline::component_library::clients::strato_client::UserDemographics;
@@ -176,6 +191,9 @@ impl ScoredPostsQuery {
             bloom_filter_entries: vec![],
             scoring_sequence: None,
             columnar_scoring_sequence: None,
+            history_topics: None,
+            stats_history_topics: None,
+            immersive_columnar_scoring_sequence: None,
             retrieval_sequence: None,
             columnar_retrieval_sequence: None,
             user_features: UserFeatures {
@@ -218,8 +236,10 @@ impl ScoredPostsQuery {
             explicit_engagement_signals: None,
             implicit_engagement_signals: None,
             user_installed_apps: None,
+            recent_search_queries: None,
             subscription_level,
             is_shadow_traffic,
+            is_under_the_hood_request: false,
             is_preview,
             is_polling: false,
             cursor: None,
@@ -227,11 +247,14 @@ impl ScoredPostsQuery {
             served_history: vec![],
             who_to_follow_eligible: false,
             feed_survey_eligible: false,
+            video_carousel_eligible: false,
             non_polling_timestamps: None,
             impressed_post_ids: Vec::new(),
             push_to_home_post_id,
             seed_candidate_post_ids: Vec::new(),
             following_pagination_meta: Arc::new(OnceLock::new()),
+            ad_drops: Arc::default(),
+            video_carousel: Arc::new(OnceLock::new()),
         }
     }
 

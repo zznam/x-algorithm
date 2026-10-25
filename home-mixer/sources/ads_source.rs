@@ -1,11 +1,14 @@
-use crate::clients::ad_index_client::AdIndexClient;
+use crate::clients::ad_index_client::{AdIndexClient, SR_ROUTER_DECIDER};
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::EnableAdsSource;
 use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::utils::client_utils::{
+    feed_cursor_direction, RequestContext,
+};
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto::{feed_item, FeedItem};
-use xai_recsys_proto::{AdIndexRequest, ClientContext, ProductSurface};
+use xai_recsys_proto::{AdIndexRequest, ClientContext, FeedRequestContext, ProductSurface};
 
 pub struct AdsSource {
     pub ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
@@ -19,10 +22,14 @@ impl Source<ScoredPostsQuery, FeedItem> for AdsSource {
 
     async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {
         let request = build_ad_index_request(query);
+        let sr_router_enabled = query
+            .decider
+            .as_ref()
+            .is_some_and(|d| d.enabled(SR_ROUTER_DECIDER));
 
         let response = self
             .ad_index_client
-            .get_eligible_ads(request)
+            .get_eligible_ads(request, sr_router_enabled)
             .await
             .map_err(|e| format!("AdsSource: {e}"))?;
 
@@ -56,6 +63,10 @@ fn build_ad_index_request(query: &ScoredPostsQuery) -> AdIndexRequest {
         product_surface: product_surface as i32,
         dsp_client_context,
         client_seen_post_ids: query.seen_ids.iter().map(|&id| id as i64).collect(),
+        feed_request_context: FeedRequestContext::from(RequestContext::parse(
+            &query.request_context,
+        )) as i32,
+        feed_cursor_direction: feed_cursor_direction(query.cursor.as_ref()) as i32,
         client_context: Some(ClientContext {
             user_id: query.user_id as i64,
             app_id: query.client_app_id as i64,

@@ -1,7 +1,8 @@
-use crate::limited_actions_copy::{Prompt, PromptCopy};
 use crate::models::LimitedEngagementReason;
+use crate::params::limited_actions_copy::{Prompt, PromptCopy};
 use xai_feature_switches::FeatureSwitchResults;
 use xai_stats_receiver::StatsReceiverExt;
+use xai_stringcenter::DEFAULT_LANGUAGE;
 
 pub(super) const REASON_FIELD: &str = "LimitedEngagementReason";
 const LIMITED_ACTIONS_KEY: &str = "limited_actions_policy_limited_actions";
@@ -12,7 +13,7 @@ const MISSING_POLICY_COUNTER: &str = "limited_actions_policy_missing";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum LimitedActionType {
+pub enum LimitedActionType {
     Reply,
     Retweet,
     QuoteTweet,
@@ -57,6 +58,7 @@ pub(crate) struct LimitedAction {
 #[derive(Default)]
 pub(crate) struct LimitedActionsPolicies {
     policies: Vec<(LimitedEngagementReason, Vec<LimitedAction>)>,
+    language: Option<String>,
 }
 
 impl LimitedActionsPolicies {
@@ -107,7 +109,19 @@ impl LimitedActionsPolicies {
             }
             policies.push((reason, actions));
         }
-        Self { policies }
+        Self {
+            policies,
+            language: None,
+        }
+    }
+
+    pub(super) fn in_language(mut self, language: Option<&str>) -> Self {
+        self.language = language.map(str::to_owned);
+        self
+    }
+
+    pub(crate) fn language(&self) -> &str {
+        self.language.as_deref().unwrap_or(DEFAULT_LANGUAGE)
     }
 
     pub(crate) fn actions(&self, reason: LimitedEngagementReason) -> &[LimitedAction] {
@@ -130,6 +144,7 @@ impl LimitedActionsPolicies {
                 .into_iter()
                 .map(|(reason, types)| (reason, types.into_iter().map(unprompted).collect()))
                 .collect(),
+            language: None,
         }
     }
 }
@@ -138,22 +153,92 @@ impl LimitedActionsPolicies {
 mod tests {
     use super::super::tests::Counted;
     use super::*;
-    use crate::limited_actions_copy::LimitedActionsCopy;
+    use crate::params::limited_actions_copy::LimitedActionsCopy;
     use crate::params::ClientSwitches;
     use arc_swap::ArcSwap;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use xai_feature_switches::FeatureSwitches;
     use LimitedEngagementReason::{
-        BlockedViewer, ConversationControl, ReadonlyViewer, RootAuthorBlockedViewer, StaleTweet,
+        BlockedViewer, CommunityTweetCommunityDeleted, CommunityTweetCommunityNotFound,
+        CommunityTweetCommunitySuspended, CommunityTweetHidden, CommunityTweetMemberRemoved,
+        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, NonCompliant, ReadonlyViewer,
+        RootAuthorBlockedViewer, StaleTweet,
     };
+
+    fn copy_naming_namespaces<'a>(
+        policies: impl IntoIterator<Item = (&'a str, &'a [LimitedActionType])>,
+    ) -> LimitedActionsCopy {
+        let mut keys = BTreeMap::new();
+        for (namespace, actions) in policies {
+            keys.insert(format!("{namespace}_GenericSubtext"), namespace);
+            for action in actions {
+                keys.insert(format!("{namespace}_{action:?}_Headline"), namespace);
+                keys.insert(format!("{namespace}_{action:?}_Subtext"), namespace);
+            }
+        }
+        let entries: Vec<String> = keys
+            .iter()
+            .map(|(key, namespace)| {
+                format!(
+                    r#"{{"string_key": "{key}", "current_variant": "{namespace}", "instructions_v2": []}}"#
+                )
+            })
+            .collect();
+        LimitedActionsCopy::from_json(&format!("[{}]", entries.join(",")))
+    }
 
     #[test]
     fn each_reason_resolves_its_policy_from_the_scala_file() {
         use LimitedActionType as T;
+        let community_unavailable = vec![
+            T::AddToBookmarks,
+            T::AddToMoment,
+            T::Embed,
+            T::Follow,
+            T::HideCommunityTweet,
+            T::Like,
+            T::ListsAddRemove,
+            T::MuteConversation,
+            T::PinToProfile,
+            T::QuoteTweet,
+            T::React,
+            T::RemoveFromCommunity,
+            T::Reply,
+            T::Retweet,
+            T::SendViaDm,
+            T::ShareTweetVia,
+            T::ViewHiddenReplies,
+            T::ViewTweetActivity,
+            T::VoteOnPoll,
+        ];
+        let community_hidden = community_unavailable
+            .iter()
+            .copied()
+            .filter(|action| *action != T::RemoveFromCommunity)
+            .collect();
         let expected = [
-            (ConversationControl, vec![T::Reply]),
+            (
+                NonCompliant,
+                Some("NonCompliant"),
+                vec![
+                    T::Reply,
+                    T::Retweet,
+                    T::Like,
+                    T::React,
+                    T::SendViaDm,
+                    T::AddToBookmarks,
+                    T::AddToMoment,
+                    T::PinToProfile,
+                    T::ViewTweetActivity,
+                    T::ShareTweetVia,
+                    T::CopyLink,
+                ],
+            ),
+            (ConversationControl, Some("LimitedReplies"), vec![T::Reply]),
             (
                 BlockedViewer,
+                Some("BlockedViewer"),
                 vec![
                     T::Reply,
                     T::Retweet,
@@ -176,9 +261,14 @@ mod tests {
                     T::Highlight,
                 ],
             ),
-            (RootAuthorBlockedViewer, vec![T::Reply]),
+            (
+                RootAuthorBlockedViewer,
+                Some("BlockedViewer"),
+                vec![T::Reply],
+            ),
             (
                 ReadonlyViewer,
+                Some("ReadonlyViewer"),
                 vec![
                     T::AddToBookmarks,
                     T::AddToMoment,
@@ -198,6 +288,7 @@ mod tests {
             ),
             (
                 StaleTweet,
+                None,
                 vec![
                     T::Reply,
                     T::Retweet,
@@ -216,40 +307,71 @@ mod tests {
                     T::CopyLink,
                 ],
             ),
+            (
+                CommunityTweetHidden,
+                Some("CommunityHidden"),
+                community_hidden,
+            ),
+            (
+                CommunityTweetMemberRemoved,
+                Some("Default"),
+                community_unavailable.clone(),
+            ),
+            (
+                CommunityTweetCommunityNotFound,
+                Some("Default"),
+                community_unavailable.clone(),
+            ),
+            (
+                CommunityTweetCommunityDeleted,
+                Some("Default"),
+                vec![T::HideCommunityTweet, T::RemoveFromCommunity],
+            ),
+            (
+                CommunityTweetCommunitySuspended,
+                Some("Default"),
+                community_unavailable,
+            ),
+            (
+                CommunityTweetViewerRemoved,
+                Some("ViewerIsRemovedFromCommunity"),
+                vec![T::Reply, T::PinToProfile],
+            ),
+            (LocalTweet, Some("LocalPost"), vec![T::Retweet, T::Reply]),
         ];
+        let copy = copy_naming_namespaces(
+            expected
+                .iter()
+                .filter_map(|(_, namespace, actions)| Some(((*namespace)?, actions.as_slice()))),
+        );
         let stats = Counted::default();
         let policies = ClientSwitches::for_tests().limited_actions_policies(
             None,
             None,
             None,
-            expected.iter().map(|(reason, _)| *reason),
-            &LimitedActionsCopy::from_json("[]"),
+            expected.iter().map(|(reason, _, _)| *reason),
+            &copy,
             Some(&stats),
         );
-        for (reason, actions) in expected {
-            let action_types: Vec<LimitedActionType> = policies
-                .actions(reason)
-                .iter()
-                .map(|action| action.action_type)
-                .collect();
+        for (reason, namespace, actions) in expected {
+            let resolved = policies.actions(reason);
+            let action_types: Vec<LimitedActionType> =
+                resolved.iter().map(|action| action.action_type).collect();
             assert_eq!(action_types, actions, "{reason:?}");
+            for action in resolved {
+                assert_eq!(
+                    action
+                        .prompt
+                        .as_ref()
+                        .map(|prompt| prompt.headline.as_str()),
+                    namespace,
+                    "{reason:?} {:?}",
+                    action.action_type
+                );
+            }
         }
-        let missing_copy = |reason: &str| {
-            (
-                MISSING_POLICY_COUNTER.to_string(),
-                format!("reason={reason},missing=copy"),
-                1,
-            )
-        };
-        assert_eq!(
-            stats.take(),
-            [
-                missing_copy("conversation_control"),
-                missing_copy("blocked_viewer"),
-                missing_copy("root_author_blocked_viewer"),
-                missing_copy("readonly_viewer"),
-            ]
-        );
+        let counted = stats.take();
+        assert!(counted.is_empty(), "{counted:?}");
     }
 
     #[test]

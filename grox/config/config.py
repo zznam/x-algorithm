@@ -1,7 +1,6 @@
 import os
 import logging
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field, BaseModel, ConfigDict
 from monitor.config import LoggingConfig, MetricsConfig
@@ -112,9 +111,9 @@ class MediaHydrationConfig(BaseModel):
     image_tile_size: int = 448
     enable_light_dark_enhancement: bool = False
     enable_clahe_enhancement: bool = False
-    enable_motion_reveal: bool = False
     enable_local_broadcast_frame_extraction: bool = False
     enable_video_preview_image: bool = False
+    highest_video_bitrate: bool = False
     deluxe_fav_count_threshold: int = 64
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
@@ -247,7 +246,6 @@ class GroxConfig(BaseSettings):
     kerberos: KerberosConfig = KerberosConfig()
     asr: ASRConfig = ASRConfig()
     prompt_tokens: PromptTokensConfig = PromptTokensConfig()
-    enrichment_write: Literal["mh", "both_mh"] = "mh"
 
     model_config = SettingsConfigDict(yaml_file=_get_config_file_paths(), frozen=True)
 

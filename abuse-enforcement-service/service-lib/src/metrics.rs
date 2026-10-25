@@ -28,28 +28,28 @@ lazy_static! {
             &["kind", "outcome"])
             .unwrap();
 
-                                                            pub static ref DEDUP_CLASS_BYPASS_TOTAL: IntCounterVec =
+                                                    pub static ref DEDUP_CLASS_BYPASS_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_class_bypass_total",
             "Dedup entries re-claimed by a strictly higher-class incoming row.",
             &["topic", "head", "held_class", "incoming_class"])
             .unwrap();
 
-                                                                            pub static ref DEDUP_WRITE_FENCED_TOTAL: IntCounterVec =
+                                                                    pub static ref DEDUP_WRITE_FENCED_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_write_fenced_total",
             "Dedup terminal writes dropped because a strictly stronger terminal outcome is held.",
             &["op", "held_class", "writer_class"])
             .unwrap();
 
-                                        pub static ref DEDUP_DISPLACED_RESTORED_TOTAL: IntCounterVec =
+                                    pub static ref DEDUP_DISPLACED_RESTORED_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_dedup_displaced_restored_total",
             "Displaced dedup holds restored after a bypassing decision resolved without acting.",
             &["op"])
             .unwrap();
 
-                        pub static ref DEDUP_BYPASS_CLAIM_LOST_TOTAL: IntCounter =
+                    pub static ref DEDUP_BYPASS_CLAIM_LOST_TOTAL: IntCounter =
         register_int_counter!(
             "abuse_enforcement_dedup_bypass_claim_lost_total",
             "Bypass claims lost to a concurrent claimant at nonce verification.")
@@ -190,14 +190,6 @@ lazy_static! {
             .unwrap();
 
 
-                                                                                    pub static ref GENERIC_ACTION_TOTAL: IntCounterVec =
-        register_int_counter_vec!(
-            "abuse_enforcement_generic_action_total",
-            "Requested actions handled by the generic executor, by entity_type, kind, result, and fail-closed skip reason.",
-            &["entity_type", "kind", "result", "reason"])
-            .unwrap();
-
-
         pub static ref HTTP_LATENCY: HistogramVec =
         register_histogram_vec!(
             "abuse_enforcement_http_latency_seconds",
@@ -286,6 +278,134 @@ lazy_static! {
             "abuse_enforcement_hold_gate_breaker_open",
             "Overturn-hold gate circuit breaker state (1 = open, probes skipped).")
             .unwrap();
+
+
+                    pub static ref OFF_SWITCH_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_off_switch_total",
+            "Decisions skipped because an enforcement off switch matched.",
+            &["topic", "head", "scope"])
+            .unwrap();
+
+                pub static ref OFF_SWITCH_SNAPSHOT_AGE_SECONDS: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_off_switch_snapshot_age_seconds",
+            "Seconds since the last successful off-switch list read.")
+            .unwrap();
+
+                pub static ref OFF_SWITCH_ENTRIES: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_off_switch_entries",
+            "Off-switch records in this pod's in-memory list.",
+            &["state"])
+            .unwrap();
+
+                pub static ref OFF_SWITCH_REFRESH_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_off_switch_refresh_total",
+            "Off-switch list reads by result.",
+            &["result"])
+            .unwrap();
+
+            pub static ref OFF_SWITCH_BAD_RECORDS_TOTAL: IntCounter =
+        register_int_counter!(
+            "abuse_enforcement_off_switch_bad_records_total",
+            "Off-switch records that failed to parse.")
+            .unwrap();
+
+            pub static ref OFF_SWITCH_ENABLED: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_off_switch_enabled",
+            "Whether the decision path honours enforcement off switches (1 = yes).")
+            .unwrap();
+
+                    pub static ref OFF_SWITCH_FIRST_LOAD_PENDING: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_off_switch_first_load_pending",
+            "1 while the pod waits for its first off-switch list read (not ready, not consuming).")
+            .unwrap();
+
+                    pub static ref OFF_SWITCH_HEADLESS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_off_switch_headless_total",
+            "Decisions with no driving head, which no off switch can match.",
+            &["topic", "model"])
+            .unwrap();
+
+                        pub static ref OFF_SWITCH_SEEN_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_off_switch_seen_total",
+            "Seen head + classifier pair records by result.",
+            &["result"])
+            .unwrap();
+
+
+                                                pub static ref HEAD_GUARD_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_head_guard_total",
+            "Head-guard events by head, scope, window and result.",
+            &["head", "scope", "window", "result"])
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_LOADED: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_action_control_loaded",
+            "Whether this pod has read the action-control records (1 = yes).")
+            .unwrap();
+
+                pub static ref ACTION_CONTROL_SNAPSHOT_AGE_SECONDS: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_action_control_snapshot_age_seconds",
+            "Seconds since the last successful action-control read.")
+            .unwrap();
+
+        pub static ref ACTION_CONTROL_ENTRIES: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_action_control_entries",
+            "Action-control records in this pod's list by mode.",
+            &["mode"])
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_REFRESH_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_action_control_refresh_total",
+            "Action-control record reads by result.",
+            &["result"])
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_UNREADABLE_TOTAL: IntCounter =
+        register_int_counter!(
+            "abuse_enforcement_action_control_unreadable_total",
+            "Action-control records that failed to parse.")
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_DECISIONS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_action_control_decisions_total",
+            "Decisions an action-control record matched, by effective mode.",
+            &["head", "mode", "forced"])
+            .unwrap();
+
+                pub static ref ACTION_CONTROL_ROLLOUT_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_action_control_rollout_total",
+            "Decisions a live row's rollout placed, by head, row and side (inside, outside).",
+            &["head", "row", "side"])
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_SAFETY_CHECKS_OK: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_action_control_safety_checks_ok",
+            "Whether the live rules' safety skips match the service's list (1 = yes).",
+            &["entity_type"])
+            .unwrap();
+
+            pub static ref ACTION_CONTROL_SEEN_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_action_control_seen_total",
+            "Action-control seen records by result.",
+            &["result"])
+            .unwrap();
 }
 
 pub fn observe_user_active_seconds(
@@ -348,7 +468,6 @@ pub fn init() {
     let _ = &*MANHATTAN_ERRORS_TOTAL;
     let _ = &*KAFKA_SELF_DELETE_TOTAL;
     let _ = &*RULES_YAML_COMPILED;
-    let _ = &*GENERIC_ACTION_TOTAL;
     let _ = &*HTTP_LATENCY;
     let _ = &*HTTP_INFLIGHT;
     let _ = &*KAFKA_PUBLISH_TOTAL;
@@ -362,6 +481,16 @@ pub fn init() {
     let _ = &*HOLD_GATE_BREAKER_OPEN;
     let _ = &*HOLD_GATE_MODE;
     let _ = &*HOLD_GATE_CONFIG_INFO;
+    let _ = &*ACTION_CONTROL_LOADED;
+    let _ = &*ACTION_CONTROL_SNAPSHOT_AGE_SECONDS;
+    let _ = &*ACTION_CONTROL_ENTRIES;
+    let _ = &*ACTION_CONTROL_REFRESH_TOTAL;
+    let _ = &*ACTION_CONTROL_UNREADABLE_TOTAL;
+    let _ = &*ACTION_CONTROL_DECISIONS_TOTAL;
+    let _ = &*ACTION_CONTROL_ROLLOUT_TOTAL;
+    let _ = &*ACTION_CONTROL_SAFETY_CHECKS_OK;
+    let _ = &*ACTION_CONTROL_SEEN_TOTAL;
+    let _ = &*HEAD_GUARD_TOTAL;
 }
 
 #[cfg(test)]

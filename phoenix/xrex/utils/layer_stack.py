@@ -4,7 +4,7 @@ import collections
 import functools
 import inspect
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Protocol
 
@@ -25,6 +25,13 @@ LayerStackScanned = collections.namedtuple(
 
 NestedArray = Any
 WrappedFn = Callable[..., NestedArray | tuple[NestedArray]]
+
+
+@dataclass(frozen=True)
+class LayerStackTail:
+    num_layers: int
+    layer_fn: WrappedFn
+    split_inputs: Callable[[NestedArray], tuple[NestedArray, NestedArray]]
 
 
 def _check_no_varargs(f: Callable[..., Any]) -> None:
@@ -177,11 +184,12 @@ class _LayerStack:
     def __init__(
         self,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
         scan_impl: Callable = jax.lax.scan,
+        tail: LayerStackTail | None = None,
     ):
         self._name = name
         self._count = count
@@ -189,6 +197,7 @@ class _LayerStack:
         self._pass_reverse_to_layer_fn = pass_reverse_to_layer_fn
         self._transparency_map = transparency_map
         self._scan_impl = scan_impl
+        self._tail = tail
 
     def __call__(self, x, *args_ys, reverse=False, **kwargs):
         count = self._count
@@ -241,7 +250,7 @@ class _LayerStack:
             state = _merge_inner_state(state, recollected_state)
 
         def layer(
-            carry: LayerStackCarry, scanned: LayerStackScanned
+            carry: LayerStackCarry, scanned: LayerStackScanned, layer_apply_fn: Callable = apply_fn
         ) -> tuple[LayerStackCarry, Any]:
             rng = scanned.rng
             params = scanned.params
@@ -251,7 +260,9 @@ class _LayerStack:
             kwargs["global_layer_index"] = carry.idx
             if self._pass_reverse_to_layer_fn:
                 kwargs["reverse"] = reverse
-            (out_x, z), state = apply_fn(params, state, rng, carry.x, *scanned.args_ys, **kwargs)
+            (out_x, z), state = layer_apply_fn(
+                params, state, rng, carry.x, *scanned.args_ys, **kwargs
+            )
             return LayerStackCarry(idx=carry.idx + 1, x=out_x), (z, state)
 
         rng = _get_rng_stack(count)
@@ -267,24 +278,32 @@ class _LayerStack:
             lifted_state = _apply_generator_fn_to_parameter_states(params, state)
         scanned = LayerStackScanned(params=params, rng=rng, state=lifted_state, args_ys=args_ys)
 
-        if self._unroll == self._count:
-            yss = []
-            states = []
-            for i in range(self._count):
-                xs = jax.tree.map(lambda x, i=i: x[i], scanned)
-                carry, (ys, state) = layer(carry, xs)
-                yss.append(ys)
-                states.append(state)
-
-            states = jax.tree.map(jnp.stack, *states)
-            updater.update(states)
-            return carry.x, jax.tree.map(jnp.stack, *yss)
-        else:
+        if self._tail is None:
             carry, (zs, states) = self._scan_impl(
                 layer, carry, scanned, length=count, unroll=self._unroll, reverse=reverse
             )
-            updater.update(states)
-            return carry.x, zs
+        else:
+            assert not reverse, "A layer stack tail runs forward"
+            first_tail_layer = count - self._tail.num_layers
+            scanned_before_tail = jax.tree.map(lambda a: a[:first_tail_layer], scanned)
+            scanned_in_tail = jax.tree.map(lambda a: a[first_tail_layer:], scanned)
+            carry, outputs_before_tail = self._scan_impl(
+                layer, carry, scanned_before_tail, unroll=self._unroll
+            )
+            tail_input, tail_x = self._tail.split_inputs(carry.x)
+            tail_layer_fn = partial(self._tail.layer_fn, tail_input=tail_input)
+            carry, tail_outputs = self._scan_impl(
+                partial(layer, layer_apply_fn=hk.transform_with_state(tail_layer_fn).apply),
+                carry._replace(x=tail_x),
+                scanned_in_tail,
+                unroll=self._unroll,
+            )
+            carry = carry._replace(x=(tail_input, carry.x))
+            zs, states = jax.tree.map(
+                lambda *parts: jnp.concatenate(parts), outputs_before_tail, tail_outputs
+            )
+        updater.update(states)
+        return carry.x, zs
 
     def _call_wrapped(
         self,
@@ -300,7 +319,7 @@ class _LayerStackNoPerLayer(_LayerStack):
         self,
         f: WrappedFn,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
@@ -331,11 +350,12 @@ class _LayerStackWithPerLayer(_LayerStack):
         self,
         f: WrappedFn,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
         scan_impl: Callable = jax.lax.scan,
+        tail: LayerStackTail | None = None,
     ):
         super().__init__(
             count=count,
@@ -344,6 +364,7 @@ class _LayerStackWithPerLayer(_LayerStack):
             transparency_map=transparency_map,
             name=name,
             scan_impl=scan_impl,
+            tail=tail,
         )
         self._f = f
 
@@ -355,17 +376,19 @@ class _LayerStackWithPerLayer(_LayerStack):
 def layer_stack(
     num_layers: int,
     with_per_layer_inputs=False,
-    unroll: int = 1,
+    unroll: bool = False,
     pass_reverse_to_layer_fn: bool = False,
     transparent: bool = False,
     transparency_map: TransparencyMapping | None = None,
     name: str = "layer_stack",
     scan_impl: Callable = jax.lax.scan,
+    tail: LayerStackTail | None = None,
 ):
     if transparent and transparency_map is None:
         raise ValueError("transparency_map must be provided with transparent=True.")
     if not transparent:
         transparency_map = None
+    assert tail is None or with_per_layer_inputs, "A tail needs with_per_layer_inputs=True"
 
     def iterate(f):
         if with_per_layer_inputs:
@@ -382,6 +405,7 @@ def layer_stack(
                     transparency_map=transparency_map,
                     name=name,
                     scan_impl=scan_impl,
+                    tail=tail,
                 )(x, *args, **kwargs)
 
         else:

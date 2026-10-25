@@ -1,13 +1,13 @@
-use std::collections::HashMap;
-use std::future::Future;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
-use xai_x_rpc::WithBudget;
 
-use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
+use crate::hydration::batch::{Hydrated, HydrationBatch};
+use crate::hydration::sources::Expired;
+use crate::params::CountryList;
 use crate::rules::SafetyLevel;
 
 const HYDRATOR_REQUESTS: &str = "vf_hydrator_requests";
@@ -20,9 +20,11 @@ const HYDRATOR_EXPANDED_KEYS: &str = "vf_hydrator_expanded_keys";
 const HYDRATOR_UNASKED_KEYS: &str = "vf_hydrator_unasked_keys";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
-const AUTHOR_LABELS: &str = "vf_author_labels";
+const FALLBACK_CACHE_RESIDENT_KEYS: &str = "vf_fallback_cache_resident_keys";
 const VIEWER_COUNTRY: &str = "vf_viewer_country";
-const WINGMAN_SECOND_DEGREE: &str = "vf_wingman_second_degree";
+const VIEWER_STATE: &str = "vf_viewer_state";
+const REQUEST_COUNTRY: &str = "vf_request_country";
+const VIEWER_NOT_AGE_VERIFIED: &str = "vf_viewer_not_age_verified";
 const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -32,6 +34,17 @@ pub(crate) enum HydratorOutcome {
     Partial,
     Timeout,
     Error,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum FallbackCacheResult {
+    Fresh,
+    Stale,
+    NotFound,
+    Partial,
+    PartialStale,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,14 +61,14 @@ struct KeyedResultCounts {
 
 impl KeyedResultCounts {
     fn from_batch<K, V>(
-        candidate_count_by_key: &HashMap<K, usize>,
+        candidate_count_by_claimed_key: &FxHashMap<K, usize>,
         batches: &impl AsRef<[HydrationBatch<K, V>]>,
     ) -> Self
     where
         K: Eq + Hash,
     {
         let mut counts = Self::default();
-        for (key, candidate_count) in candidate_count_by_key {
+        for (key, &candidate_count) in candidate_count_by_claimed_key {
             let hydrated = batches
                 .as_ref()
                 .iter()
@@ -69,17 +82,21 @@ impl KeyedResultCounts {
                     counts.partial_keys += 1;
                     counts.partial_candidates += candidate_count;
                 }
-                Some(Hydrated::Failed(HydrationError::Timeout)) => {
-                    counts.timeout_keys += 1;
-                    counts.timeout_candidates += candidate_count;
-                }
-                _ => {
+                Some(Hydrated::Failed | Hydrated::Unanswered) | None => {
                     counts.error_keys += 1;
                     counts.error_candidates += candidate_count;
                 }
             }
         }
         counts
+    }
+
+    fn timed_out<K>(candidate_count_by_claimed_key: &FxHashMap<K, usize>) -> Self {
+        Self {
+            timeout_keys: candidate_count_by_claimed_key.len(),
+            timeout_candidates: candidate_count_by_claimed_key.values().sum(),
+            ..Self::default()
+        }
     }
 
     fn outcome(self) -> HydratorOutcome {
@@ -94,13 +111,20 @@ impl KeyedResultCounts {
     }
 }
 
-fn record_keyed_hydrator_request(
+pub(crate) fn record_keyed_hydrator_request<K, V>(
     client: &str,
     method: &str,
     safety_level: SafetyLevel,
-    counts: KeyedResultCounts,
+    candidate_count_by_claimed_key: &FxHashMap<K, usize>,
+    answer: Result<&impl AsRef<[HydrationBatch<K, V>]>, &Expired>,
     latency_ms: f64,
-) {
+) where
+    K: Eq + Hash,
+{
+    let counts = match answer {
+        Ok(answer) => KeyedResultCounts::from_batch(candidate_count_by_claimed_key, answer),
+        Err(Expired) => KeyedResultCounts::timed_out(candidate_count_by_claimed_key),
+    };
     let outcome = counts.outcome();
     if outcome != HydratorOutcome::Success {
         debug!(
@@ -181,12 +205,6 @@ pub(crate) fn record_tes_join_latency(safety_level: SafetyLevel, elapsed: Durati
     );
 }
 
-pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
-    for (result, count) in [("mapped", mapped), ("unmapped", unmapped)] {
-        incr_nonzero(AUTHOR_LABELS, &[("result", result)], count as u64);
-    }
-}
-
 pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLevel) {
     incr(
         VIEWER_COUNTRY,
@@ -195,21 +213,46 @@ pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLe
     );
 }
 
-pub(crate) fn record_wingman_second_degree(
-    in_network: usize,
-    not_in_network: usize,
-    safety_level: SafetyLevel,
-) {
-    for (result, count) in [
-        ("in_network", in_network),
-        ("not_in_network", not_in_network),
-    ] {
-        incr_nonzero(
-            WINGMAN_SECOND_DEGREE,
-            &[("result", result), ("safety_level", safety_level.into())],
-            count as u64,
-        );
-    }
+pub(crate) fn record_viewer_state(state: &'static str, safety_level: SafetyLevel) {
+    incr(
+        VIEWER_STATE,
+        &[("state", state), ("safety_level", safety_level.into())],
+        1,
+    );
+}
+
+const REQUEST_COUNTRY_EXTRA: [&str; 28] = [
+    "ae", "ch", "cl", "co", "ec", "eg", "gh", "hk", "il", "iq", "jp", "ke", "kw", "my", "ng", "om",
+    "pe", "pk", "sa", "sg", "tr", "tw", "ua", "us", "ve", "vn", "ye", "za",
+];
+
+fn request_country_label(request_country: Option<&str>) -> &'static str {
+    let Some(code) = request_country else {
+        return "none";
+    };
+    CountryList::listed_by_default(code)
+        .or_else(|| {
+            REQUEST_COUNTRY_EXTRA
+                .into_iter()
+                .find(|&extra| extra == code)
+        })
+        .unwrap_or("other")
+}
+
+pub(crate) fn record_request_country(request_country: Option<&str>) {
+    incr(
+        REQUEST_COUNTRY,
+        &[("country", request_country_label(request_country))],
+        1,
+    );
+}
+
+pub(crate) fn record_viewer_not_age_verified(country: &'static str, age: &'static str) {
+    incr(
+        VIEWER_NOT_AGE_VERIFIED,
+        &[("country", country), ("age", age)],
+        1,
+    );
 }
 
 pub(crate) fn record_flock_missing_keys(
@@ -252,56 +295,61 @@ pub(crate) fn record_unasked_keys(client: &str, method: &str, keys: usize) {
     );
 }
 
-pub(crate) fn record_fallback_cache_keys(
-    facet: &'static str,
-    fresh: usize,
-    stale: usize,
-    not_found: usize,
-    partial: usize,
-    unavailable: usize,
-) {
-    for (result, count) in [
-        ("fresh", fresh),
-        ("stale", stale),
-        ("not_found", not_found),
-        ("partial", partial),
-        ("unavailable", unavailable),
-    ] {
-        incr_nonzero(
-            FALLBACK_CACHE_KEYS,
-            &[("facet", facet), ("result", result)],
-            count as u64,
-        );
-    }
+#[derive(Default)]
+pub(crate) struct FallbackCacheCounts {
+    pub(crate) fresh: usize,
+    pub(crate) stale: usize,
+    pub(crate) not_found: usize,
+    pub(crate) partial: usize,
+    pub(crate) partial_stale: usize,
+    pub(crate) unavailable: usize,
+    pub(crate) resident: usize,
 }
 
-pub(crate) async fn timed_results<K, V, A>(
-    client: &str,
-    method: &str,
-    safety_level: SafetyLevel,
-    candidate_count_by_key: &HashMap<K, usize>,
-    timeout: Duration,
-    fut: impl Future<Output = A>,
-    timed_out: impl FnOnce(HydrationBatch<K, V>) -> A,
-) -> A
-where
-    K: Copy + Eq + Hash,
-    A: AsRef<[HydrationBatch<K, V>]>,
-{
-    let start = Instant::now();
-    let answer = fut.with_budget(timeout).await.unwrap_or_else(|_| {
-        timed_out(HydrationBatch::timed_out(
-            candidate_count_by_key.keys().copied(),
-        ))
-    });
-    record_keyed_hydrator_request(
-        client,
-        method,
-        safety_level,
-        KeyedResultCounts::from_batch(candidate_count_by_key, &answer),
-        start.elapsed().as_secs_f64() * 1000.0,
-    );
-    answer
+impl FallbackCacheCounts {
+    pub(crate) fn record(&self, cache: &'static str, column: &'static str) {
+        let live = self.fresh + self.not_found + self.partial + self.partial_stale;
+        for (metric, result, count) in [
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Fresh.into(),
+                self.fresh,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Stale.into(),
+                self.stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::NotFound.into(),
+                self.not_found,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Partial.into(),
+                self.partial,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::PartialStale.into(),
+                self.partial_stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Unavailable.into(),
+                self.unavailable,
+            ),
+            (FALLBACK_CACHE_RESIDENT_KEYS, "resident", self.resident),
+            (FALLBACK_CACHE_RESIDENT_KEYS, "absent", live - self.resident),
+        ] {
+            incr_nonzero(
+                metric,
+                &[("cache", cache), ("column", column), ("result", result)],
+                count as u64,
+            );
+        }
+    }
 }
 
 fn incr(metric: &str, labels: &[(&str, &str)], count: u64) {
@@ -319,9 +367,9 @@ fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) -> bool {
     }
 }
 
-pub(crate) fn record_fallback_cache_entries(facet: &'static str, entries: usize) {
+pub(crate) fn record_fallback_cache_entries(cache: &'static str, entries: usize) {
     if let Some(sr) = global_stats_receiver() {
-        sr.gauge(FALLBACK_CACHE_ENTRIES, &[("facet", facet)], entries as f64);
+        sr.gauge(FALLBACK_CACHE_ENTRIES, &[("cache", cache)], entries as f64);
     }
 }
 
@@ -334,11 +382,34 @@ fn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: Histogram
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::identity;
+    use crate::hydration::execute::Reply;
+    use crate::hydration::inventory::Source;
+    use crate::hydration::store::Store;
+    use crate::models::{ClientCapability, RawCandidate, TweetFeatures, TweetId};
+    use crate::rules::RuleEngine;
+    use std::collections::HashMap;
 
     #[test]
-    fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
-    {
+    fn a_request_country_reads_its_listed_code_other_or_none() {
+        for (country, label) in [
+            (Some("de"), "de"),
+            (Some("us"), "us"),
+            (Some("zz"), "other"),
+            (None, "none"),
+        ] {
+            assert_eq!(request_country_label(country), label, "{country:?}");
+        }
+        for extra in REQUEST_COUNTRY_EXTRA {
+            assert_eq!(
+                CountryList::listed_by_default(extra),
+                None,
+                "{extra} is listed"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_generator_pins_the_key_results_fallback_cache_results_and_viewer_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -348,17 +419,26 @@ mod tests {
         };
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
-        use crate::hydration::Hydrator;
-        let root_edges = format!(
-            "{}+{}",
-            Hydrator::RootFollowsViewer.spec().label.1,
-            Hydrator::SuperFollowsRoot.spec().label.1
-        );
-        assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
         assert!(dashboard.contains(&format!(
-            "WINGMAN_SECOND_DEGREE_METRIC = \"{WINGMAN_SECOND_DEGREE}\""
+            "FALLBACK_CACHE_KEYS_METRIC = \"{FALLBACK_CACHE_KEYS}\""
         )));
+        assert!(dashboard.contains(&format!("VIEWER_STATE_METRIC = \"{VIEWER_STATE}\"")));
+        assert!(dashboard.contains(&format!("REQUEST_COUNTRY_METRIC = \"{REQUEST_COUNTRY}\"")));
+        assert!(dashboard.contains(&format!(
+            "VIEWER_NOT_AGE_VERIFIED_METRIC = \"{VIEWER_NOT_AGE_VERIFIED}\""
+        )));
+        for result in [
+            FallbackCacheResult::Stale,
+            FallbackCacheResult::Unavailable,
+            FallbackCacheResult::PartialStale,
+            FallbackCacheResult::Partial,
+        ] {
+            let result: &str = result.into();
+            assert!(
+                dashboard.contains(&format!("    \"{result}\": ")),
+                "{result}"
+            );
+        }
         let key_results: Vec<&str> = <HydratorOutcome as strum::VariantArray>::VARIANTS
             .iter()
             .map(|&result| result.into())
@@ -369,20 +449,9 @@ mod tests {
         )));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn caller_deadline_cancels_a_hop_before_the_static_ceiling() {
-        let start = tokio::time::Instant::now();
-        let context = crate::hydration::request_context(start, Some(Duration::from_millis(40)));
-        let result = context
-            .scope(std::future::pending::<()>().with_budget(crate::hydration::HYDRATION_TIMEOUT))
-            .await;
-        assert!(result.is_err());
-        assert_eq!(start.elapsed(), Duration::from_millis(30));
-    }
-
     #[test]
     fn partial_keys_make_a_partial_call_and_a_failed_one_key_call_is_an_error() {
-        use crate::hydration::decode::author::decode_authors;
+        use crate::hydration::decode::author::author_batch;
         use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
         let user = |state| {
             Ok::<_, ()>(Some(GizmoduckUserResult {
@@ -396,9 +465,9 @@ mod tests {
                 .map(|&(author, state)| (author, user(state)))
                 .collect::<HashMap<_, _>>();
             let expected: Vec<u64> = results.keys().copied().collect();
-            decode_authors(HydrationBatch::from_results(expected, results))
+            author_batch(HydrationBatch::from_results(expected, results))
         };
-        let counts = HashMap::from([(10, 1), (20, 2)]);
+        let counts = FxHashMap::from_iter([(10, 1), (20, 2)]);
 
         let one_partial = KeyedResultCounts::from_batch(
             &counts,
@@ -429,14 +498,14 @@ mod tests {
             [50],
             HashMap::from([(50, Err::<Option<u8>, _>("gizmoduck unavailable"))]),
         );
-        let viewer = KeyedResultCounts::from_batch(&HashMap::from([(50, 1)]), &viewer);
+        let viewer = KeyedResultCounts::from_batch(&FxHashMap::from_iter([(50, 1)]), &viewer);
         assert_eq!((viewer.error_keys, viewer.error_candidates), (1, 1));
         assert_eq!(viewer.outcome(), HydratorOutcome::Error);
     }
 
     #[test]
     fn from_batch_counts_not_found_as_success_and_missing_as_error() {
-        let expected = HashMap::from([(1, 1), (2, 2), (3, 3), (4, 4)]);
+        let expected = FxHashMap::from_iter([(1, 1), (2, 2), (3, 3), (4, 4)]);
         let batch: HydrationBatch<u64, u8> = HydrationBatch::from_results(
             [1, 2, 3, 4],
             HashMap::from([(1, Ok(Some(7))), (2, Ok(None)), (3, Err("boom"))]),
@@ -452,38 +521,41 @@ mod tests {
     }
 
     #[test]
-    fn from_batch_counts_timeout_keys() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([1, 2]);
+    fn a_tweet_keyed_call_counts_its_keys_before_pure_core_resolves_authors() {
+        let engine = RuleEngine::for_tests();
+        let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
+        let raw = [RawCandidate {
+            tweet_id: TweetId(1),
+            request_author_id: None,
+        }];
+        let mut store = Store::new(plan, Some(50), ClientCapability::default(), &raw, None);
+        let group = |source| {
+            plan.groups()
+                .find(|group| group.fetcher.source == source)
+                .unwrap()
+        };
+        let tweets = store.offer(group(Source::TesTweet)).unwrap();
+        let circle = TweetFeatures {
+            trusted_friends_list_id: Some(7),
+            ..Default::default()
+        };
+        let landed =
+            HydrationBatch::from_results([1], HashMap::from([(1, Ok::<_, ()>(Some(circle)))]));
+        store.land(&tweets, Reply::Tweets(landed), Duration::ZERO);
 
-        let counts = KeyedResultCounts::from_batch(&expected, &batch);
-
-        assert_eq!(counts.timeout_keys, 2);
-        assert_eq!(counts.timeout_candidates, 5);
-        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
+        let call = store.offer(group(Source::TrustedFriends)).unwrap();
+        let failed: HydrationBatch<u64, bool> =
+            HydrationBatch::from_results(call.keys.clone(), HashMap::<_, Result<_, ()>>::new());
+        let counts = KeyedResultCounts::from_batch(&call.candidate_count_by_claimed_key, &failed);
+        assert_eq!((counts.error_keys, counts.error_candidates), (1, 1));
+        assert_eq!(counts.outcome(), HydratorOutcome::Error);
     }
 
-    #[tokio::test]
-    async fn timed_results_outer_timeout_fails_every_expected_key() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
-        let never = std::future::pending::<HydrationBatch<u64, u8>>();
+    #[test]
+    fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
+        let counts = KeyedResultCounts::timed_out(&FxHashMap::from_iter([(40, 0), (41, 3)]));
 
-        let returned = timed_results(
-            "test",
-            "timeout",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::ZERO,
-            never,
-            identity,
-        )
-        .await;
-
-        for key in [1, 2] {
-            assert!(matches!(
-                returned.hydrated(&key),
-                Some(Hydrated::Failed(HydrationError::Timeout))
-            ));
-        }
+        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (2, 3));
+        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
     }
 }

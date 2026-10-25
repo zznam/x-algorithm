@@ -256,7 +256,7 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "enable_user_location_feature": True,
         "enable_user_gender_feature": True,
         "enable_user_age_feature": True,
-        "enable_user_installed_apps": True,
+        "enable_user_installed_apps": False,
         "candidate_seq_len": 64,
         "num_negatives_per_example": 0,
         "num_global_negatives_per_example": 64,
@@ -290,8 +290,10 @@ def _xrecsys_two_tower_combined_base() -> dict:
             recsys_pb2.ActionName.CLIENT_TWEET_BOOKMARK,
             recsys_pb2.ActionName.CLIENT_TWEET_SHARE,
         ],
-        "num_candidate_heads": 2,
-        "head_names": ["home", "immersive"],
+        "ld_positive_actions": [recsys_pb2.ActionName.CLIENT_TWEET_RECAP_DWELLED],
+        "num_candidate_heads": 3,
+        "head_names": ["home", "immersive", "ld"],
+        "w_ld": 0.75,
         "head_dataset_mapping": {
             "HOME": 0,
             "HOME_COLD": 0,
@@ -366,6 +368,7 @@ def _immersive_only_base() -> dict:
         "eval_bs_per_device": 8,
         "eval_every_n": 1000,
         "target_dataset_type": RetrievalDataset.IMMERSIVE2Day,
+        "extra_eval_dataset_types": ["IMMERSIVE4Day", "EVERGREEN", "IMMERSIVENSFW"],
         "checkpoint_dataset_names": [
             "IMMERSIVE4Day",
             "IMMERSIVE2Day",
@@ -636,6 +639,7 @@ for config in configs:
     positive_actions = mparams.get(
         "positive_actions", RecsysTwoTowerModelConfig.get_positive_actions()
     )
+    head_names = mparams.get("head_names", ["home"])
     hard_negative_actions = mparams.get(
         "hard_negative_actions", RecsysTwoTowerModelConfig.get_hard_negative_actions()
     )
@@ -696,6 +700,52 @@ for config in configs:
             logq_correction_scale=mparams.get(
                 "logq_correction_scale", RecsysTwoTowerModelConfig.logq_correction_scale
             ),
+            fixed_temperature=mparams.get(
+                "fixed_temperature", RecsysTwoTowerModelConfig.fixed_temperature
+            ),
+            own_negative_logit_offset=mparams.get(
+                "own_negative_logit_offset", RecsysTwoTowerModelConfig.own_negative_logit_offset
+            ),
+            positive_count_user_weight_power=mparams.get(
+                "positive_count_user_weight_power",
+                RecsysTwoTowerModelConfig.positive_count_user_weight_power,
+            ),
+            mask_in_batch_false_negatives=mparams.get(
+                "mask_in_batch_false_negatives",
+                RecsysTwoTowerModelConfig.mask_in_batch_false_negatives,
+            ),
+            user_query_heads=mparams.get(
+                "user_query_heads", RecsysTwoTowerModelConfig.user_query_heads
+            ),
+            user_query_head_init_std=mparams.get(
+                "user_query_head_init_std", RecsysTwoTowerModelConfig.user_query_head_init_std
+            ),
+            mol_item_components=mparams.get(
+                "mol_item_components", RecsysTwoTowerModelConfig.mol_item_components
+            ),
+            mol_item_adapter_rank=mparams.get(
+                "mol_item_adapter_rank", RecsysTwoTowerModelConfig.mol_item_adapter_rank
+            ),
+            mol_gate_hidden=mparams.get(
+                "mol_gate_hidden", RecsysTwoTowerModelConfig.mol_gate_hidden
+            ),
+            mol_conditioned_gate=mparams.get(
+                "mol_conditioned_gate", RecsysTwoTowerModelConfig.mol_conditioned_gate
+            ),
+            mol_train_user_chunk=mparams.get(
+                "mol_train_user_chunk", RecsysTwoTowerModelConfig.mol_train_user_chunk
+            ),
+            mol_fused_gate=mparams.get("mol_fused_gate", RecsysTwoTowerModelConfig.mol_fused_gate),
+            mol_eval_user_chunk=mparams.get(
+                "mol_eval_user_chunk", RecsysTwoTowerModelConfig.mol_eval_user_chunk
+            ),
+            mol_serving_kernel=mparams.get(
+                "mol_serving_kernel", RecsysTwoTowerModelConfig.mol_serving_kernel
+            ),
+            mol_side_table_in_checkpoint=mparams.get(
+                "mol_side_table_in_checkpoint",
+                RecsysTwoTowerModelConfig.mol_side_table_in_checkpoint,
+            ),
             user_features=user_features_config,
             checkpoint_dataset_names=checkpoint_dataset_names,
             split_home_checkpoint=mparams.get("split_home_checkpoint", False),
@@ -721,8 +771,28 @@ for config in configs:
                     "immersive_soft_negative_actions"
                 ].default_factory(),
             ),
+            ld_positive_actions=mparams.get(
+                "ld_positive_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_positive_actions"
+                ].default_factory(),
+            ),
+            ld_hard_negative_actions=mparams.get(
+                "ld_hard_negative_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_hard_negative_actions"
+                ].default_factory(),
+            ),
+            ld_soft_negative_actions=mparams.get(
+                "ld_soft_negative_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_soft_negative_actions"
+                ].default_factory(),
+            ),
             head_dataset_mapping=mparams.get("head_dataset_mapping", None),
-            head_names=mparams.get("head_names", ["home"]),
+            head_names=head_names,
+            w_fav=mparams.get("w_fav", 1.0),
+            w_ld=mparams.get("w_ld", 0.0),
             user_tower_config=RecsysAggregatedModelConfig(
                 candidate_seq_len=mparams["candidate_seq_len"],
                 pad_token=PAD_TOKEN,

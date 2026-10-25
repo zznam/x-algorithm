@@ -20,6 +20,7 @@ use crate::scored_posts_server::ScoredPostsServer;
 use crate::selectors::BlenderSelector;
 use crate::side_effects::ads_injection_logging_side_effect::AdsInjectionLoggingSideEffect;
 use crate::side_effects::client_events_kafka_side_effect::ClientEventsKafkaSideEffect;
+use crate::side_effects::funnel_trace_side_effect::FunnelTraceSideEffect;
 use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsToKafkaSideEffect;
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
@@ -28,6 +29,7 @@ use crate::side_effects::served_event_kafka_side_effect::ServedEventKafkaSideEff
 use crate::side_effects::truncate_served_history_side_effect::TruncateServedHistorySideEffect;
 use crate::side_effects::update_past_request_timestamps_side_effect::UpdatePastRequestTimestampsSideEffect;
 use crate::side_effects::update_served_history_side_effect::UpdateServedHistorySideEffect;
+use crate::side_effects::video_carousel_candidates_kafka_side_effect::VideoCarouselCandidatesKafkaSideEffect;
 use crate::sources::ads_source::AdsSource;
 use crate::sources::feed_survey_source::FeedSurveySource;
 use crate::sources::jetfuel_frame_source::JetfuelFrameSource;
@@ -73,11 +75,13 @@ impl ForYouCandidatePipeline {
         let (
             ad_index_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -94,11 +98,13 @@ impl ForYouCandidatePipeline {
                 ) as Arc<dyn AdIndexClient + Send + Sync>
             },
             AdsInjectionLoggingSideEffect::prod(),
+            FunnelTraceSideEffect::prod(),
             ServedAdHistoryCacheSideEffect::prod(datacenter),
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
             ClientEventsKafkaSideEffect::prod(),
             ServedEventKafkaSideEffect::prod(),
+            VideoCarouselCandidatesKafkaSideEffect::prod(),
             async {
                 Arc::new(
                     ProdServedHistoryClient::new(datacenter)
@@ -155,11 +161,13 @@ impl ForYouCandidatePipeline {
             strato_client,
             ad_index_client,
             ads_injection_logging,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -175,11 +183,13 @@ impl ForYouCandidatePipeline {
         strato_client: Arc<dyn StratoClient + Send + Sync>,
         ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,
         ads_injection_logging: AdsInjectionLoggingSideEffect,
+        funnel_trace: FunnelTraceSideEffect,
         served_ad_history: ServedAdHistoryCacheSideEffect,
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
         client_events: ClientEventsKafkaSideEffect,
         served_event: ServedEventKafkaSideEffect,
+        video_carousel_candidates: VideoCarouselCandidatesKafkaSideEffect,
         served_history_client: Arc<dyn ServedHistoryClient>,
         who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
         prompts_client: Arc<dyn PromptsClient + Send + Sync>,
@@ -221,11 +231,13 @@ impl ForYouCandidatePipeline {
         let side_effects: Arc<Vec<Box<dyn SideEffect<ScoredPostsQuery, FeedItem>>>> =
             Arc::new(vec![
                 Box::new(ads_injection_logging),
+                Box::new(funnel_trace),
                 Box::new(served_ad_history),
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
                 Box::new(client_events),
                 Box::new(served_event),
+                Box::new(video_carousel_candidates),
                 Box::new(ResponseStatsSideEffect),
                 Box::new(UpdatePastRequestTimestampsSideEffect::new(
                     past_request_timestamps_client,
@@ -253,6 +265,7 @@ impl ForYouCandidatePipeline {
         let ad_index_client: Arc<dyn AdIndexClient + Send + Sync> = Arc::new(MockAdIndexClient);
         let mock_kafka = Arc::new(MockKafkaPublisherClient) as Arc<dyn KafkaPublisherClient>;
         let ads_injection = AdsInjectionLoggingSideEffect::new(Arc::clone(&mock_kafka));
+        let funnel_trace = FunnelTraceSideEffect::new(Arc::clone(&mock_kafka));
         let served_ad_history = ServedAdHistoryCacheSideEffect::new(Arc::new(
             xai_ad_index_history::InMemoryUserAdHistoryStore::default(),
         ));
@@ -260,6 +273,8 @@ impl ForYouCandidatePipeline {
         let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_event = ServedEventKafkaSideEffect::new(Arc::clone(&mock_kafka));
+        let video_carousel_candidates =
+            VideoCarouselCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_history_client: Arc<dyn ServedHistoryClient> = Arc::new(MockServedHistoryClient);
         let who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync> =
             Arc::new(MockWhoToFollowClient);
@@ -275,11 +290,13 @@ impl ForYouCandidatePipeline {
             strato_client,
             ad_index_client,
             ads_injection,
+            funnel_trace,
             served_ad_history,
             publish_seen_ids,
             served_candidates,
             client_events,
             served_event,
+            video_carousel_candidates,
             served_history_client,
             who_to_follow_client,
             prompts_client,

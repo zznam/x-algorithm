@@ -40,6 +40,10 @@ use xai_pipeline_tracing::{extract_b3_info, B3RequestInfo};
 use xai_recsys_proto::{network_type_string_to_enum, timezone_string_to_enum};
 use xai_urt_thrift::cursor_utils;
 use xai_urt_thrift::operation::CursorType;
+use xai_visibility_filtering::tweet_safety_label::{
+    ProdTweetSafetyLabelClient, TweetSafetyLabelClient,
+};
+use xai_visibility_filtering::vf_client::{VfClient, XaiVfClient};
 use xai_x_rpc::wily_lookup_service::ShardCoordinate;
 
 const VIEWER_ROLES_TIMEOUT_MS: u64 = 200;
@@ -52,7 +56,9 @@ pub struct RequestContext {
 
 pub(crate) struct PipelineOutput {
     pub scored_posts: Vec<ScoredPost>,
+    pub video_carousel: Option<pb::VideoCarouselModule>,
     pub pipeline_result: PipelineResult<ScoredPostsQuery, PostCandidate>,
+    pub pipeline_trace: Option<pb::PipelineTrace>,
 }
 
 pub struct HomeMixerConfig {
@@ -120,7 +126,7 @@ impl QueryBuilder {
         let device_status = proto_query.device_status.unwrap_or_default();
         let prediction_id = generate_request_id();
         let request_id = resolve_request_id(proto_query.request_id);
-        let is_shadow_traffic = crate::util::shadow::is_shadow_traffic(&params, request_id);
+        let is_shadow_traffic = crate::util::shadow::is_shadow_traffic(&params, prediction_id);
         let mut query = ScoredPostsQuery::new(
             proto_query.viewer_id,
             proto_query.client_app_id,
@@ -157,6 +163,8 @@ impl QueryBuilder {
         query.request_type = request_type;
         query.resurrection_time_ms = resurrection_time_ms;
         query.fs_recipient_inputs = Some(fs_recipient_inputs);
+        query.is_under_the_hood_request =
+            proto_query.is_under_the_hood_request && query.params.get(params::EnableUnderTheHood);
 
         query.dsp_client_context = proto_query.dsp_client_context;
 
@@ -312,6 +320,7 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
         let mut response = Response::new(DebugScoredPostsResponse {
             scored_posts: output.scored_posts,
             debug_json,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -349,6 +358,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -444,6 +454,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -809,6 +820,25 @@ impl xai_x_service_builder::XService for HomeMixerServer {
             config,
         } = ctx;
 
+        let (xai_vf_client, vf_safety_labels_client) = tokio::join!(
+            async {
+                Arc::new(
+                    XaiVfClient::connect(&datacenter)
+                        .await
+                        .expect("Failed to create XAI VF client"),
+                ) as Arc<dyn VfClient + Send + Sync>
+            },
+            async {
+                Arc::new(
+                    ProdTweetSafetyLabelClient::new(&datacenter)
+                        .await
+                        .expect("Failed to create VF SafetyLabels client")
+                        .with_timeout_ms(500)
+                        .with_max_batch_size(100),
+                ) as Arc<dyn TweetSafetyLabelClient>
+            },
+        );
+
         let (
             gizmoduck_client,
             resurrection_date_client,
@@ -841,6 +871,8 @@ impl xai_x_service_builder::XService for HomeMixerServer {
                         feature_switches.clone(),
                         &config.phoenix_xds,
                         &config.vm_ranker_xds,
+                        Arc::clone(&xai_vf_client),
+                        Arc::clone(&vf_safety_labels_client),
                     )
                     .await,
                 )
@@ -877,7 +909,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
                 &datacenter,
             ),
             RankedFollowingCandidatePipeline::new(Arc::clone(&scored_posts), &datacenter),
-            FollowingCandidatePipeline::new(&datacenter),
+            FollowingCandidatePipeline::new(&datacenter, xai_vf_client, vf_safety_labels_client),
         );
 
         let for_you = Arc::new(ForYouFeedServer::new(

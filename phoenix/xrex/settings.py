@@ -45,6 +45,8 @@ RETRIEVAL_DUMP_PATH: str = os.environ.get("XREX_RETRIEVAL_DUMP_PATH", "/path/to/
 SID_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_GLOBAL_IDS_SNAPSHOT", "")
 SID_VIDEO_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_VIDEO_GLOBAL_IDS_SNAPSHOT", "")
 
+SID_DECODER_PATH: str = os.environ.get("XREX_SID_DECODER_PATH", "")
+
 GEN_RECS_GLOBAL_IDS: str = os.environ.get(
     "XREX_GEN_RECS_GLOBAL_IDS", "/path/to/global_negative_pool.parquet"
 )
@@ -85,6 +87,10 @@ ADS_CONVERSION_CHECKPOINT_DIR: str = os.environ.get("XREX_ADS_CONVERSION_CHECKPO
 
 
 AOT_CACHE_DIR: str = os.environ.get("XREX_AOT_CACHE_DIR", "")
+
+HISTORY_URL_EMBEDDING_XDS_BOOTSTRAP: str = os.environ.get(
+    "XREX_HISTORY_URL_EMBEDDING_XDS_BOOTSTRAP", ""
+)
 
 
 REPL_SOCKET_PATH: str = os.environ.get("XREX_REPL_SOCKET", "/tmp/driver.sock")

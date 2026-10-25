@@ -1,74 +1,191 @@
+use super::viewer::is_younger_than;
 use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
-use crate::hydration::fallback_cache::FallbackCache;
-use crate::hydration::metrics::record_author_labels;
-use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
-use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
+use crate::hydration::fallback_cache::{Column, FallbackCache};
+use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet, AuthorProfile};
+use std::time::Duration;
+use strum::VariantArray;
+use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, UserResponseState};
 use xai_x_thrift::user_labels::LabelValue;
-const CACHE_CAPACITY: usize = 1_000_000;
 
 pub(crate) type DecodedAuthor = (AuthorFeatures, AuthorLabelSet);
+pub(crate) type DecodedActor = (DecodedAuthor, AuthorProfile);
 pub(crate) type AuthorFallbackCache = FallbackCache<DecodedAuthor>;
 
-pub(crate) fn fallback_cache() -> AuthorFallbackCache {
-    FallbackCache::new("author", CACHE_CAPACITY)
+pub(crate) fn fallback_cache(capacity: usize) -> AuthorFallbackCache {
+    FallbackCache::new("author", capacity)
 }
 
-pub(crate) fn decode_authors(
+pub(crate) struct AuthorColumn;
+
+impl Column for AuthorColumn {
+    type Entry = DecodedAuthor;
+    type Value = DecodedAuthor;
+    type Stored = DecodedAuthor;
+    const NAME: &'static str = "author";
+
+    fn store(value: &DecodedAuthor) -> DecodedAuthor {
+        *value
+    }
+
+    fn new_entry(stored: DecodedAuthor) -> DecodedAuthor {
+        stored
+    }
+
+    fn replace(entry: &mut DecodedAuthor, stored: DecodedAuthor) -> Option<DecodedAuthor> {
+        Some(std::mem::replace(entry, stored))
+    }
+
+    fn get(entry: &DecodedAuthor) -> Option<DecodedAuthor> {
+        Some(*entry)
+    }
+
+    fn holds(_: &DecodedAuthor) -> bool {
+        true
+    }
+
+    fn others_hold(_: &DecodedAuthor) -> bool {
+        false
+    }
+
+    fn clear(_: &mut DecodedAuthor) -> Option<DecodedAuthor> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AuthorNotFound {
+    #[default]
+    Unresolves,
+    ReadsErased,
+}
+
+impl AuthorNotFound {
+    pub(crate) fn read(
+        self,
+        authors: RawHydrationBatch<DecodedAuthor>,
+    ) -> RawHydrationBatch<DecodedAuthor> {
+        match self {
+            AuthorNotFound::Unresolves => authors,
+            AuthorNotFound::ReadsErased => HydrationBatch::from_hydrated(
+                authors
+                    .into_hydrated()
+                    .into_iter()
+                    .map(|(author, decoded)| match decoded {
+                        Hydrated::NotFound => (author, Hydrated::Found(erased_author())),
+                        decoded @ (Hydrated::Found(_)
+                        | Hydrated::Partial(_)
+                        | Hydrated::Failed
+                        | Hydrated::Unanswered) => (author, decoded),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn erased_author() -> DecodedAuthor {
+    (
+        AuthorFeatures {
+            is_erased: true,
+            ..AuthorFeatures::default()
+        },
+        AuthorLabelSet::default(),
+    )
+}
+
+pub(crate) fn author_batch(
     users: RawHydrationBatch<GizmoduckUserResult>,
 ) -> RawHydrationBatch<DecodedAuthor> {
-    let mut label_counts = LabelCounts::default();
     let authors = users
         .into_hydrated()
         .into_iter()
         .map(|(author, user)| {
             let decoded = match user {
                 Hydrated::Found(result) | Hydrated::Partial(result) => {
-                    evaluable_author_features(result, &mut label_counts)
+                    evaluable_author_features(result)
                 }
                 Hydrated::NotFound => Hydrated::NotFound,
-                Hydrated::Failed(error) => Hydrated::Failed(error),
+                Hydrated::Failed => Hydrated::Failed,
+                Hydrated::Unanswered => Hydrated::Unanswered,
             };
             (author, decoded)
         })
         .collect();
-    record_author_labels(label_counts.mapped, label_counts.unmapped);
     HydrationBatch::from_hydrated(authors)
 }
 
-#[derive(Default)]
-struct LabelCounts {
-    mapped: usize,
-    unmapped: usize,
+pub(crate) fn actor_batch(
+    users: RawHydrationBatch<GizmoduckUserResult>,
+) -> RawHydrationBatch<DecodedActor> {
+    let actors = users
+        .into_hydrated()
+        .into_iter()
+        .map(|(actor, user)| {
+            let decoded = match user {
+                Hydrated::Found(result) | Hydrated::Partial(result) => {
+                    let profile = result.user.as_ref().map(author_profile).unwrap_or_default();
+                    match evaluable_author_features(result) {
+                        Hydrated::Found(author) => Hydrated::Found((author, profile)),
+                        Hydrated::Partial(author) => Hydrated::Partial((author, profile)),
+                        Hydrated::NotFound => Hydrated::NotFound,
+                        Hydrated::Failed => Hydrated::Failed,
+                        Hydrated::Unanswered => Hydrated::Unanswered,
+                    }
+                }
+                Hydrated::NotFound => Hydrated::NotFound,
+                Hydrated::Failed => Hydrated::Failed,
+                Hydrated::Unanswered => Hydrated::Unanswered,
+            };
+            (actor, decoded)
+        })
+        .collect();
+    HydrationBatch::from_hydrated(actors)
 }
 
-fn evaluable_author_features(
-    result: GizmoduckUserResult,
-    counts: &mut LabelCounts,
-) -> Hydrated<DecodedAuthor> {
-    let partial = matches!(
-        result.response_state,
-        None | Some(UserResponseState::Failed) | Some(UserResponseState::Partial)
-    );
-    let author = author_features(result, counts);
-    if partial {
-        Hydrated::Partial(author)
-    } else {
-        Hydrated::Found(author)
+const NEW_AUTHOR_AGE: Duration = Duration::from_secs(72 * 60 * 60);
+
+fn author_profile(user: &GizmoduckUser) -> AuthorProfile {
+    AuthorProfile {
+        has_default_profile_image: !user.profile.has_profile_image,
+        is_new_account: is_younger_than(user.created_at_msec, NEW_AUTHOR_AGE),
     }
 }
 
-fn author_features(user_result: GizmoduckUserResult, counts: &mut LabelCounts) -> DecodedAuthor {
+fn evaluable_author_features(result: GizmoduckUserResult) -> Hydrated<DecodedAuthor> {
+    match result.response_state {
+        Some(UserResponseState::Failed | UserResponseState::Filtered) => Hydrated::Failed,
+        Some(
+            UserResponseState::NotFound
+            | UserResponseState::SoftUser
+            | UserResponseState::PeriscopeUser
+            | UserResponseState::NoScreenNameUser,
+        ) => Hydrated::NotFound,
+        None | Some(UserResponseState::Found | UserResponseState::Partial)
+            if result.user.is_none() =>
+        {
+            Hydrated::NotFound
+        }
+        None | Some(UserResponseState::Partial) => Hydrated::Partial(author_features(result)),
+        Some(
+            UserResponseState::Found
+            | UserResponseState::DeactivatedUser
+            | UserResponseState::SuspendedUser
+            | UserResponseState::ProtectedUser
+            | UserResponseState::ErasedUser
+            | UserResponseState::UnsafeUser
+            | UserResponseState::OffboardedUser,
+        ) => Hydrated::Found(author_features(result)),
+    }
+}
+
+fn author_features(user_result: GizmoduckUserResult) -> DecodedAuthor {
     user_result
         .user
         .map(|user| {
             let mut user_labels = AuthorLabelSet::default();
             for label in &user.labels.labels {
-                match author_label(LabelValue(label.label_value)) {
-                    Some(modeled) => {
-                        user_labels.insert(modeled);
-                        counts.mapped += 1;
-                    }
-                    None => counts.unmapped += 1,
+                if let Some(modeled) = author_label(LabelValue(label.label_value)) {
+                    user_labels.insert(modeled);
                 }
             }
             let features = AuthorFeatures {
@@ -86,19 +203,30 @@ fn author_features(user_result: GizmoduckUserResult, counts: &mut LabelCounts) -
 }
 
 fn author_label(value: LabelValue) -> Option<AuthorLabel> {
-    match value {
-        LabelValue::NSFW_HIGH_RECALL => Some(AuthorLabel::NsfwHighRecall),
-        LabelValue::NSFW_HIGH_PRECISION => Some(AuthorLabel::NsfwHighPrecision),
-        LabelValue::NSFW_NEAR_PERFECT => Some(AuthorLabel::NsfwNearPerfect),
-        LabelValue::NSFW_AVATAR_IMAGE => Some(AuthorLabel::NsfwAvatarImage),
-        LabelValue::NSFW_BANNER_IMAGE => Some(AuthorLabel::NsfwBannerImage),
-        LabelValue::SPAM_HIGH_RECALL => Some(AuthorLabel::SpamHighRecall),
-        LabelValue::ABUSIVE_HIGH_RECALL => Some(AuthorLabel::AbusiveHighRecall),
-        LabelValue::COMPROMISED => Some(AuthorLabel::Compromised),
-        LabelValue::READ_ONLY => Some(AuthorLabel::ReadOnly),
-        LabelValue::IMPERSONATION_HIGH_PRECISION => Some(AuthorLabel::ImpersonationHighPrecision),
-        LabelValue::DO_NOT_AMPLIFY => Some(AuthorLabel::DoNotAmplify),
-        _ => None,
+    AuthorLabel::VARIANTS
+        .iter()
+        .copied()
+        .find(|&label| gizmoduck_label(label) == value)
+}
+
+const fn gizmoduck_label(label: AuthorLabel) -> LabelValue {
+    match label {
+        AuthorLabel::NsfwHighRecall => LabelValue::NSFW_HIGH_RECALL,
+        AuthorLabel::NsfwHighPrecision => LabelValue::NSFW_HIGH_PRECISION,
+        AuthorLabel::NsfwNearPerfect => LabelValue::NSFW_NEAR_PERFECT,
+        AuthorLabel::NsfwAvatarImage => LabelValue::NSFW_AVATAR_IMAGE,
+        AuthorLabel::NsfwBannerImage => LabelValue::NSFW_BANNER_IMAGE,
+        AuthorLabel::SpamHighRecall => LabelValue::SPAM_HIGH_RECALL,
+        AuthorLabel::AbusiveHighRecall => LabelValue::ABUSIVE_HIGH_RECALL,
+        AuthorLabel::Compromised => LabelValue::COMPROMISED,
+        AuthorLabel::ReadOnly => LabelValue::READ_ONLY,
+        AuthorLabel::ImpersonationHighPrecision => LabelValue::IMPERSONATION_HIGH_PRECISION,
+        AuthorLabel::DoNotAmplify => LabelValue::DO_NOT_AMPLIFY,
+        AuthorLabel::NotGraduated => LabelValue::NOT_GRADUATED,
+        AuthorLabel::AgathaSpamTopUser => LabelValue::AGATHA_SPAM_TOP_USER,
+        AuthorLabel::EngagementSpammer => LabelValue::ENGAGEMENT_SPAMMER,
+        AuthorLabel::BlinkWorst => LabelValue::BLINK_WORST,
+        AuthorLabel::DownrankSpamReply => LabelValue::DOWNRANK_SPAM_REPLY,
     }
 }
 
@@ -108,7 +236,7 @@ mod tests {
     use xai_core_entities::entities::{GizmoduckUser, Label, Labels, Safety};
 
     #[test]
-    fn only_failed_partial_or_missing_response_states_are_incomplete() {
+    fn response_states_decode_as_tweetypie_reads_them() {
         let suspended = GizmoduckUserResult {
             user: Some(GizmoduckUser {
                 safety: Safety {
@@ -119,28 +247,60 @@ mod tests {
             }),
             ..Default::default()
         };
-        for (state, complete) in [
-            (Some(UserResponseState::Found), true),
-            (Some(UserResponseState::NotFound), true),
-            (Some(UserResponseState::DeactivatedUser), true),
-            (Some(UserResponseState::SuspendedUser), true),
-            (Some(UserResponseState::ProtectedUser), true),
-            (Some(UserResponseState::ErasedUser), true),
-            (Some(UserResponseState::OffboardedUser), true),
-            (Some(UserResponseState::UnsafeUser), true),
-            (Some(UserResponseState::Partial), false),
-            (Some(UserResponseState::Failed), false),
-            (None, false),
+        let found = Hydrated::Found(());
+        for (state, expected) in [
+            (Some(UserResponseState::Found), found.clone()),
+            (Some(UserResponseState::DeactivatedUser), found.clone()),
+            (Some(UserResponseState::SuspendedUser), found.clone()),
+            (Some(UserResponseState::ProtectedUser), found.clone()),
+            (Some(UserResponseState::ErasedUser), found.clone()),
+            (Some(UserResponseState::OffboardedUser), found.clone()),
+            (Some(UserResponseState::UnsafeUser), found),
+            (Some(UserResponseState::Partial), Hydrated::Partial(())),
+            (None, Hydrated::Partial(())),
+            (Some(UserResponseState::NotFound), Hydrated::NotFound),
+            (Some(UserResponseState::SoftUser), Hydrated::NotFound),
+            (Some(UserResponseState::PeriscopeUser), Hydrated::NotFound),
+            (
+                Some(UserResponseState::NoScreenNameUser),
+                Hydrated::NotFound,
+            ),
+            (Some(UserResponseState::Failed), Hydrated::Failed),
+            (Some(UserResponseState::Filtered), Hydrated::Failed),
         ] {
-            let author = evaluable_author_features(
-                GizmoduckUserResult {
-                    response_state: state,
-                    ..suspended.clone()
-                },
-                &mut LabelCounts::default(),
-            );
-            assert_eq!(matches!(author, Hydrated::Found(_)), complete, "{state:?}");
-            assert!(author.value().unwrap().0.is_suspended, "{state:?}");
+            let author = evaluable_author_features(GizmoduckUserResult {
+                response_state: state,
+                ..suspended.clone()
+            });
+            assert_eq!(shape(&author), expected, "{state:?}");
+            if let Some((features, _)) = author.value() {
+                assert!(features.is_suspended, "{state:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_success_state_without_a_user_is_not_found() {
+        for state in [
+            None,
+            Some(UserResponseState::Found),
+            Some(UserResponseState::Partial),
+        ] {
+            let author = evaluable_author_features(GizmoduckUserResult {
+                response_state: state,
+                user: None,
+            });
+            assert_eq!(shape(&author), Hydrated::NotFound, "{state:?}");
+        }
+    }
+
+    fn shape(author: &Hydrated<DecodedAuthor>) -> Hydrated<()> {
+        match author {
+            Hydrated::Found(_) => Hydrated::Found(()),
+            Hydrated::Partial(_) => Hydrated::Partial(()),
+            Hydrated::NotFound => Hydrated::NotFound,
+            Hydrated::Failed => Hydrated::Failed,
+            Hydrated::Unanswered => Hydrated::Unanswered,
         }
     }
 
@@ -187,25 +347,21 @@ mod tests {
             ),
             (LabelValue::DO_NOT_AMPLIFY, AuthorLabel::DoNotAmplify),
         ] {
-            let mut counts = LabelCounts::default();
-            let (_, labels) = author_features(user_with_labels(&[thrift.0]), &mut counts);
+            let (_, labels) = author_features(user_with_labels(&[thrift.0]));
             assert!(labels.has_label(variant), "{thrift:?}");
-            assert_eq!((counts.mapped, counts.unmapped), (1, 0), "{thrift:?}");
         }
 
         for unmodelled in [
             LabelValue::EGREGIOUS_NSFW,
             LabelValue::RECOMMENDATIONS_BLACKLIST,
         ] {
-            let mut counts = LabelCounts::default();
-            let (_, labels) = author_features(
-                user_with_labels(&[unmodelled.0, LabelValue::SPAM_HIGH_RECALL.0]),
-                &mut counts,
-            );
+            let (_, labels) = author_features(user_with_labels(&[
+                unmodelled.0,
+                LabelValue::SPAM_HIGH_RECALL.0,
+            ]));
             let mut expected = AuthorLabelSet::default();
             expected.insert(AuthorLabel::SpamHighRecall);
             assert_eq!(labels, expected, "{unmodelled:?}");
-            assert_eq!((counts.mapped, counts.unmapped), (1, 1), "{unmodelled:?}");
         }
     }
 }
