@@ -3,23 +3,22 @@ use super::conditions::{
     VIEWER_IS_NOT_AGE_VERIFIED_IN_AGE_VERIFICATION_COUNTRIES,
     VIEWER_IS_NOT_AGE_VERIFIED_IN_TOMBSTONE_COUNTRIES,
 };
-use super::engine::{Engine, Fold, PostEngine, UserEngine};
+use super::engine::{Engine, Fold, UserEngine};
 use super::features::{CompoundLeaf, ReplyControlLeaf, RequestLeaf};
 use super::rule::Audience::{self, Everyone, NonAuthors, NonFollowers, OnlyAuthor};
 use super::rule::{Rule, RuleCond};
 use super::*;
-use crate::hydration::inventory::Tier;
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Relation};
 use crate::models::{
-    ClientCapability, PostCandidate, UserCandidate, VerifyBlurSupport, ViewerFeatures,
+    ClientCapability, ClientSwitch, PostCandidate, RequestFacts, SafetyLabelMap, SafetyLabelType,
+    UserCandidate, VerifyBlurSupport, ViewerFeatures,
 };
 use crate::params::CountryLists;
-use crate::rules::expansion::Expansion;
 use crate::rules::fixtures::{candidate, viewer, VIEWER_ID};
 use crate::rules::golden_corpus::{corpus, Subject};
-use crate::rules::levels::PostRules;
+use crate::rules::levels::LevelLists;
 use crate::rules::SafetyLevel;
-use crate::rules::{placed_test_context, test_context};
+use crate::rules::{placed_test_context, test_context, tweet_rules};
 use std::iter::once;
 use strum::VariantArray;
 
@@ -35,10 +34,10 @@ fn truths() -> Vec<Truth> {
     truths
 }
 
-fn wired<E: Engine>(list: fn(PostRules) -> &'static [&'static Rule<E>]) -> Vec<&'static Rule<E>> {
+fn wired<E: Engine>(list: fn(LevelLists) -> Vec<&'static Rule<E>>) -> Vec<&'static Rule<E>> {
     let mut rules: Vec<&'static Rule<E>> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        for &rule in list(level.spec().rules.lists()) {
+        for rule in level.judged_lists().flat_map(|(_, lists)| list(lists)) {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -52,18 +51,16 @@ fn wired_user_rules() -> Vec<&'static Rule<UserEngine>> {
 }
 
 fn wired_rules() -> Vec<&'static Rule> {
-    wired(|rules| rules.post)
+    wired(|rules| rules.post_rules().collect())
 }
 
 fn wired_leaves() -> Vec<Predicate> {
     let mut read = Vec::new();
     for rule in wired_user_rules() {
-        rule.audience.condition::<UserEngine>().leaves(&mut read);
-        rule.when.leaves(&mut read);
+        rule.leaves(&mut read);
     }
     for rule in wired_rules() {
-        rule.audience.condition::<PostEngine>().leaves(&mut read);
-        rule.when.leaves(&mut read);
+        rule.leaves(&mut read);
     }
     let mut leaves = Vec::new();
     for leaf in read {
@@ -163,6 +160,16 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         "the default drops the quote of a protected author the quoting author really follows",
     ),
     (
+        "do_not_amplify/drop/undesirable",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
+        "malicious_url/drop/undesirable",
+        Hydrator::Follows,
+        "the default drops the post for real followers",
+    ),
+    (
         "fosnr_abuse_insults_non_follower/drop/undesirable",
         Hydrator::Follows,
         "the default drops the post for real followers",
@@ -213,6 +220,16 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         FAILS_THE_NOTIFICATION,
     ),
     (
+        "only_people_i_follow_outside_community/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "muted_keyword/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
         "not_graduated_user_label/drop/unspecified",
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
@@ -237,6 +254,36 @@ const ACCEPTED_BEST_EFFORT_READS: &[(&str, Hydrator, &str)] = &[
         Hydrator::Follows,
         FAILS_THE_NOTIFICATION,
     ),
+    (
+        "duplicate_mention_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "abusive_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "untrusted_url_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "downrank_spam_reply_uqf/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "spam_high_recall_oon/drop/undesirable",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
+    (
+        "risky_high_viz_reply_oon/drop/unspecified",
+        Hydrator::Follows,
+        FAILS_THE_NOTIFICATION,
+    ),
 ];
 
 #[test]
@@ -249,14 +296,10 @@ fn a_rule_reading_a_best_effort_node_limits_engagement_or_is_accepted() {
     });
     let post = wired_rules().into_iter().map(|rule| {
         let limits = matches!(rule.action.spec(), ActionSpec::LimitedEngagement(_));
-        let shown = rule.requirements().iter().filter(|node| {
-            node.relation()
-                .and_then(Expansion::of)
-                .is_some_and(|expansion| {
-                    let spec = expansion.spec();
-                    spec.on_failure.tier() == Tier::BestEffort && spec.rules.contains(&rule)
-                })
-        });
+        let shown = rule
+            .requirements()
+            .iter()
+            .filter(|node| node.relation() == Some(Relation::ReactedTo));
         let shown = shown.fold(Hydrators::empty(), Hydrators::with);
         (rule.name(), limits, rule.requirements(), shown)
     });
@@ -300,9 +343,9 @@ fn faithful<E: Fold>(
         if rule.requirements().intersection(failed) != failed {
             continue;
         }
-        let (truth, ()) = observed::evaluate_rule(rule, context, &mut observed::NoTrace, None);
+        let (truth, ()) = observed::evaluate_rule(rule, context, &mut observed::NoTrace, false);
         let (total, _) =
-            observed::evaluate_rule(rule, context, &mut observed::NodeTracer::default(), None);
+            observed::evaluate_rule(rule, context, &mut observed::Total::default(), false);
         assert_eq!(truth, total, "{} with {failed:?} failed", rule.name());
         assert_eq!(
             truth.resolves_true(),
@@ -368,7 +411,7 @@ fn reads_one_definition<E: Fold>(
     ) {
         match condition {
             condition if definitions.contains(&condition) => uses.push(negated),
-            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),
+            RuleCond::Leaf(leaf) => outside.push(leaf.lift()),
             RuleCond::All(children) | RuleCond::Any(children) => {
                 for &child in children {
                     walk(child, definitions, negated, outside, uses);
@@ -454,126 +497,89 @@ fn the_conversation_root_exemption_is_whole() {
 }
 
 #[test]
-fn every_client_capability_is_live() {
+fn every_client_capability_and_rule_switch_is_live() {
     let base = ClientCapability::default();
-    let ClientCapability {
-        verify_blur_support,
-        modern_blur,
-        stale_tweet_limits,
-        community_viewer_removed_limits,
-        gore_blur_ignores_settings,
-        fosnr_rules,
-        fosnr_fallback_drops,
-        soft_nsfw_new_user_drop,
-    } = base;
+    let with_client = |client| RequestFacts::default().with_client(client);
     let blur_supports = once(None)
         .chain(VerifyBlurSupport::VARIANTS.iter().copied().map(Some))
-        .filter(|&support| support != verify_blur_support)
-        .map(|support| ClientCapability {
-            verify_blur_support: support,
-            ..base
+        .filter(|&support| support != base.verify_blur_support)
+        .map(|support| {
+            with_client(ClientCapability {
+                verify_blur_support: support,
+                ..base
+            })
         })
         .collect();
-    let toggled: [(&str, Vec<ClientCapability>); 8] = [
+    let toggle = |switch| {
+        with_client(if base.has(switch) {
+            base.without(switch)
+        } else {
+            base.with(switch)
+        })
+    };
+    let toggled: Vec<(&str, Vec<RequestFacts>)> = [
         ("verify_blur_support", blur_supports),
         (
-            "modern_blur",
-            vec![ClientCapability {
-                modern_blur: !modern_blur,
-                ..base
-            }],
-        ),
-        (
-            "stale_tweet_limits",
-            vec![ClientCapability {
-                stale_tweet_limits: !stale_tweet_limits,
-                ..base
-            }],
-        ),
-        (
-            "community_viewer_removed_limits",
-            vec![ClientCapability {
-                community_viewer_removed_limits: !community_viewer_removed_limits,
-                ..base
-            }],
-        ),
-        (
-            "gore_blur_ignores_settings",
-            vec![ClientCapability {
-                gore_blur_ignores_settings: !gore_blur_ignores_settings,
-                ..base
-            }],
-        ),
-        (
-            "fosnr_rules",
-            vec![ClientCapability {
-                fosnr_rules: !fosnr_rules,
-                ..base
-            }],
-        ),
-        (
-            "fosnr_fallback_drops",
-            vec![ClientCapability {
-                fosnr_fallback_drops: !fosnr_fallback_drops,
-                ..base
-            }],
-        ),
-        (
             "soft_nsfw_new_user_drop",
-            vec![ClientCapability {
-                soft_nsfw_new_user_drop: !soft_nsfw_new_user_drop,
-                ..base
-            }],
+            vec![RequestFacts::default().with_soft_nsfw_new_user_drop(true)],
         ),
-    ];
+    ]
+    .into_iter()
+    .chain(
+        ClientSwitch::VARIANTS
+            .iter()
+            .map(|&switch| (<&str>::from(switch), vec![toggle(switch)])),
+    )
+    .collect();
     let leaves = wired_leaves();
     let fetched = candidate().build();
-    let holds = |client_capability: ClientCapability, leaf: Predicate| {
+    let holds = |facts: &RequestFacts, leaf: Predicate| {
         let features = ViewerFeatures {
-            client_capability,
+            facts: facts.clone(),
             ..viewer(VIEWER_ID)
         };
         leaf.holds(&test_context(&features, &fetched))
     };
-    for (field, capabilities) in toggled {
-        let live = capabilities.iter().any(|&capability| {
+    let default = RequestFacts::default();
+    for (field, variants) in toggled {
+        let live = variants.iter().any(|facts| {
             leaves
                 .iter()
-                .any(|&leaf| holds(capability, leaf) != holds(base, leaf))
+                .any(|&leaf| holds(facts, leaf) != holds(&default, leaf))
         });
         assert!(
             live,
-            "no wired leaf reads ClientCapability::{field}: wire a rule that reads it, or delete it"
+            "no wired leaf reads the request's {field}: wire a rule that reads it, or delete it"
         );
     }
 }
 
 #[test]
-fn only_the_quote_pass_reads_quote_facts() {
+fn only_the_quote_pass_reads_the_quote() {
     let mut readers = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules.lists();
+        let LevelLists { user, post } = level.spec().rules().lists();
         let mut read = Vec::new();
         for rule in user {
             rule.when.leaves(&mut read);
         }
-        for rule in post {
-            rule.when.leaves(&mut read);
+        for row in post {
+            row.rule.when.leaves(&mut read);
         }
-        let reads_quote_facts = read.iter().any(|leaf| {
+        let reads_quote = read.iter().any(|leaf| {
             matches!(
                 leaf,
                 Predicate::PairEdge(_) | Predicate::AuthorFacts(AuthorFactsLeaf::IsSelfQuote)
             )
         });
-        if reads_quote_facts && level != SafetyLevel::QuotedTweetRules {
+        if reads_quote && level != SafetyLevel::QuotedTweetRules {
             readers.push(level);
         }
     }
     assert_eq!(
         readers,
         Vec::<SafetyLevel>::new(),
-        "quote facts are hydrated only for the quote pass's inner-quoted authors"
+        "a quote is hydrated only for the quote pass's inner-quoted authors"
     );
 }
 
@@ -614,7 +620,6 @@ fn every_post_rule_reads_the_post() {
         | Predicate::CommunityViewerRemoved(_)
         | Predicate::ReactedToPostSafetyLabels(_)
         | Predicate::ReactedToAuthorSafety(_)
-        | Predicate::Edge(_)
         | Predicate::Compound(_) => true,
     };
     let reading_no_post: Vec<String> = wired_rules()
@@ -622,11 +627,7 @@ fn every_post_rule_reads_the_post() {
         .filter(|rule| {
             let mut read = Vec::new();
             rule.when.leaves(&mut read);
-            let notice = matches!(
-                rule.action.spec(),
-                ActionSpec::SoftIntervention(_) | ActionSpec::Appealable(_)
-            );
-            !notice && !read.iter().any(reads_the_post)
+            !rule.action.spec().kind().lands_in_fosnr() && !read.iter().any(reads_the_post)
         })
         .map(|rule| rule.name())
         .collect();
@@ -642,16 +643,16 @@ fn every_post_rule_reads_the_post() {
 }
 
 #[test]
+fn a_less_severe_action_kind_never_relies_on_an_earlier_defaults_bucket() {
+    let mut kinds = ActionKind::VARIANTS.to_vec();
+    kinds.sort_by_key(|kind| std::cmp::Reverse(kind.severity()));
+    for pair in kinds.windows(2) {
+        assert!(pair[0].bucket() <= pair[1].bucket(), "{pair:?}");
+    }
+}
+
+#[test]
 fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
-    let ends_the_fold = |action: &ActionSpec<UserEngine>| match action {
-        ActionSpec::Drop(_)
-        | ActionSpec::Tombstone(_)
-        | ActionSpec::SoftIntervention(_)
-        | ActionSpec::Appealable(_) => true,
-        ActionSpec::MediaRestriction(_)
-        | ActionSpec::LimitedEngagement(_)
-        | ActionSpec::LabelInterstitial(_) => false,
-    };
     let disjoint = |user: Audience, post: Audience| match (user, post) {
         (OnlyAuthor, NonAuthors | NonFollowers) | (NonAuthors | NonFollowers, OnlyAuthor) => true,
         (Everyone, _)
@@ -661,11 +662,14 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
     };
     let mut shadowing = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let PostRules { user, post } = level.spec().rules.lists();
-        for &user_rule in user.iter().filter(|rule| ends_the_fold(rule.action.spec())) {
-            let severity = user_rule.action.spec().severity();
-            for &post_rule in post {
-                if post_rule.action.spec().severity() > severity
+        let LevelLists { user, post } = level.spec().rules().lists();
+        for &user_rule in user
+            .iter()
+            .filter(|rule| rule.action.spec().kind().ends_the_fold())
+        {
+            let severity = user_rule.action.spec().kind().severity();
+            for post_rule in post.iter().map(|row| row.rule) {
+                if post_rule.action.spec().kind().severity() > severity
                     && !disjoint(user_rule.audience, post_rule.audience)
                 {
                     shadowing.push(format!(
@@ -683,4 +687,145 @@ fn a_user_rule_that_ends_the_fold_never_shadows_a_more_severe_post_rule() {
         "the user list folds before every post rule, so a user rule that ends the fold needs an \
          audience disjoint from every more severe post rule"
     );
+}
+
+pub(in crate::rules) const WIRED_DIFFERENTLY: [&str; 6] = [
+    "nsfw_high_precision/blur/nudity",
+    "nsfw_high_precision/blur/sensitive",
+    "gore_and_violence_high_precision/blur",
+    "nsfw_card_image/blur/sensitive",
+    "nsfw_admin/blur/sensitive",
+    "nsfw_user/blur/sensitive_user",
+];
+
+#[test]
+fn each_rule_name_wires_the_same_rules_at_every_level() {
+    let mut first: Vec<(String, SafetyLevel, Vec<String>)> = Vec::new();
+    for &level in SafetyLevel::VARIANTS {
+        let rules = level.spec().rules().lists();
+        let authored = rules
+            .user
+            .iter()
+            .map(|rule| (rule.name(), rule.authored()))
+            .chain(
+                rules
+                    .post_rules()
+                    .map(|rule| (rule.name(), rule.authored())),
+            );
+        let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, rule) in authored {
+            match by_name.iter_mut().find(|(other, _)| *other == name) {
+                Some((_, rules)) => rules.push(rule),
+                None => by_name.push((name, vec![rule])),
+            }
+        }
+        for (name, rules) in by_name {
+            match first.iter().find(|(other, ..)| *other == name) {
+                None => first.push((name, level, rules)),
+                Some((_, first_level, wired)) => assert!(
+                    *wired == rules || WIRED_DIFFERENTLY.contains(&name.as_str()),
+                    "{name} wires other rules at {level:?} than at {first_level:?}: wire the \
+                     same rules at every level, or give the {level:?} rules their own RuleId"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn each_rule_of_a_rule_id_names_the_same_labels() {
+    fn labels<E: Engine>(rule: &Rule<E>) -> (RuleId, String, Vec<String>) {
+        let mut labels: Vec<String> = rule
+            .when
+            .conjuncts()
+            .iter()
+            .filter_map(|condition| condition.own_tweet_label())
+            .collect();
+        labels.sort_unstable();
+        (rule.id, rule.name(), labels)
+    }
+    let mut first: Vec<(RuleId, String, Vec<String>)> = Vec::new();
+    let user = wired_user_rules().into_iter().map(labels);
+    for (id, name, labels) in user.chain(wired_rules().into_iter().map(labels)) {
+        match first.iter().find(|(other, ..)| *other == id) {
+            None => first.push((id, name, labels)),
+            Some((_, other, read)) => assert!(
+                *read == labels,
+                "{name} names the labels {labels:?} but {other}, a rule of the same RuleId, \
+                 names {read:?}: copy the label conditions of {other}, or give it its own RuleId"
+            ),
+        }
+    }
+}
+
+#[test]
+fn each_fosnr_violation_has_a_label_drop_and_each_fosnr_label_drop_a_violation() {
+    let mut dropped = Vec::new();
+    for rule in wired_rules() {
+        let id: &str = rule.id.into();
+        let RuleCond::All([only]) = rule.when else {
+            continue;
+        };
+        let [label] = only.positive_tweet_labels()[..] else {
+            continue;
+        };
+        if !id.starts_with("fosnr") {
+            continue;
+        }
+        assert!(
+            tweet_rules::FOSNR_AUTHOR_VIOLATIONS
+                .iter()
+                .any(|violation| violation.label == label),
+            "{} drops a FOSNR label FOSNR_AUTHOR_VIOLATIONS does not name: add its row to \
+             FOSNR_AUTHOR_VIOLATIONS in src/rules/tweet_rules.rs",
+            rule.name()
+        );
+        dropped.push(label);
+    }
+    for violation in &tweet_rules::FOSNR_AUTHOR_VIOLATIONS {
+        assert!(
+            dropped.contains(&violation.label),
+            "FOSNR_AUTHOR_VIOLATIONS names {:?} but no level drops it: add a `const \
+             FOSNR_<LABEL>_DROP_UNDESIRABLE: Rule` reading it and list it in the levels",
+            label_meta(violation.label).map(|meta| meta.ident),
+        );
+    }
+}
+
+#[test]
+fn a_notice_reads_the_labels_it_names() {
+    for rule in wired_rules() {
+        let name = rule.name();
+        let mut read = rule.when.positive_tweet_labels();
+        let mut named: Vec<SafetyLabelType> = match rule.action.spec() {
+            ActionSpec::SoftIntervention(FosnrNotice { label, .. }) => vec![*label],
+            ActionSpec::Appealable(violations) => {
+                violations.iter().map(|violation| violation.label).collect()
+            }
+            ActionSpec::LabelInterstitial(spec) => {
+                for label in spec.labels() {
+                    assert!(
+                        SafetyLabelMap::SOURCE_READ_LABELS.contains(label),
+                        "{name} reads the source of {} but SafetyLabelMap drops it: add the \
+                         label to SafetyLabelMap::SOURCE_READ_LABELS",
+                        spelled_label(*label),
+                    );
+                }
+                spec.labels().to_vec()
+            }
+            ActionSpec::Drop(_)
+            | ActionSpec::Tombstone(_)
+            | ActionSpec::MediaRestriction(_)
+            | ActionSpec::LimitedEngagement(_) => continue,
+        };
+        read.sort_by_key(|label| label.0);
+        named.sort_by_key(|label| label.0);
+        assert!(
+            read == named,
+            "{name} names {:?} but its conditions read {:?}: make `when` read exactly the labels \
+             its action names",
+            named.into_iter().map(spelled_label).collect::<Vec<_>>(),
+            read.into_iter().map(spelled_label).collect::<Vec<_>>(),
+        );
+    }
 }

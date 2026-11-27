@@ -1,7 +1,7 @@
 pub mod batch;
 pub(crate) mod community_source;
 mod decode;
-mod execute;
+pub(crate) mod execute;
 pub(crate) mod fallback_cache;
 mod fetcher;
 mod hydrator;
@@ -13,30 +13,28 @@ pub(crate) mod sources;
 mod store;
 pub mod tweet_source;
 
-use crate::metrics::Rpc;
+use crate::metrics::RequestMetrics;
 use crate::models::{
-    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetId,
-    UserCandidate, UserEntity, ViewerFeatures, ViewerRelationship,
+    AuthorId, Deletion, EdgeSet, Evaluation, Placement, PostCandidate, Quote, RawCandidate,
+    RequestFacts, RetweetMerge, TweetId, UserCandidate, UserEntity, ViewerFeatures,
 };
 pub(crate) use decode::author::AuthorNotFound;
 pub(crate) use decode::author::fallback_cache as author_fallback_cache;
 pub(crate) use decode::tweet::tweet_fallback_cache;
 use decode::viewer::ViewerState;
 use fallback_cache::FallbackCaches;
-pub(crate) use fetcher::Owner;
 pub(crate) use hydrator::RequestRows;
 pub use hydrator::{Hydrator, Hydrators};
 pub(crate) use plan::HydrationPlan;
+#[cfg(test)]
 pub(crate) use relation::Relation;
 use rustc_hash::FxHashMap;
-use std::borrow::Cow;
-use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);
-pub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(300);
+pub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);
 
 pub(crate) fn request_context(
@@ -54,14 +52,13 @@ pub(crate) fn request_context(
 }
 
 pub(crate) struct HydrationRequest<'a> {
-    viewer_id: Option<u64>,
-    country_code: Option<String>,
-    client_capability: ClientCapability,
+    facts: RequestFacts,
     raw_candidates: Vec<RawCandidate>,
     users: Vec<AuthorId>,
     quotes: Vec<QuoteEntry>,
-    posts_judged_for: Option<Rpc>,
+    retweet_merge: RetweetMerge,
     fallback_caches: &'a FallbackCaches,
+    metrics: &'a RequestMetrics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,39 +69,37 @@ pub(crate) struct QuoteEntry {
 
 impl<'a> HydrationRequest<'a> {
     pub(crate) fn new(
-        viewer_id: Option<u64>,
-        country_code: Option<String>,
-        client_capability: ClientCapability,
+        facts: RequestFacts,
         raw_candidates: Vec<RawCandidate>,
-        posts_judged_for: Option<Rpc>,
+        retweet_merge: RetweetMerge,
         fallback_caches: &'a FallbackCaches,
+        metrics: &'a RequestMetrics,
     ) -> Self {
         Self {
-            viewer_id,
-            country_code,
-            client_capability,
+            facts,
             raw_candidates,
             users: Vec::new(),
             quotes: Vec::new(),
-            posts_judged_for,
+            retweet_merge,
             fallback_caches,
+            metrics,
         }
     }
 
     pub(crate) fn for_users(
-        viewer_id: u64,
+        facts: RequestFacts,
         users: Vec<AuthorId>,
         fallback_caches: &'a FallbackCaches,
+        metrics: &'a RequestMetrics,
     ) -> Self {
         Self {
             users,
             ..Self::new(
-                Some(viewer_id),
-                None,
-                ClientCapability::default(),
+                facts,
                 Vec::new(),
-                None,
+                RetweetMerge::Unmerged,
                 fallback_caches,
+                metrics,
             )
         }
     }
@@ -113,15 +108,6 @@ impl<'a> HydrationRequest<'a> {
         self.quotes = quotes;
         self
     }
-}
-
-fn candidate_count_by_key<K: Eq + Hash>(keys: impl Iterator<Item = K>) -> FxHashMap<K, usize> {
-    let mut candidate_count_by_key =
-        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());
-    for key in keys {
-        *candidate_count_by_key.entry(key).or_default() += 1;
-    }
-    candidate_count_by_key
 }
 
 pub(crate) struct Hydration {
@@ -133,13 +119,12 @@ pub(crate) struct Hydration {
     users: FxHashMap<AuthorId, HydratedUser>,
     quotes: FxHashMap<QuoteEntry, Quoted>,
     has_fetched_retweet_sources: bool,
-    posts_judged_for: Option<Rpc>,
 }
 
 pub(crate) enum HydratedUser {
     Resolved {
         user: UserEntity,
-        viewer_relationship: ViewerRelationship,
+        edges: EdgeSet,
         failed: Hydrators,
     },
     Unresolved(Cause),
@@ -147,7 +132,7 @@ pub(crate) enum HydratedUser {
 
 #[derive(Clone, Copy, Default)]
 struct Quoted {
-    facts: QuoteFacts,
+    quote: Option<Quote>,
     failed: Hydrators,
 }
 
@@ -193,8 +178,8 @@ impl Hydration {
         };
         Some(UserCandidate {
             user: post.author.clone(),
-            viewer_relationship: post.viewer_relationship,
-            quote: quoted.facts,
+            edges: post.edges,
+            quote: quoted.quote,
             failed: post.failed.intersection(reads).union(quoted.failed),
         })
     }
@@ -202,7 +187,7 @@ impl Hydration {
     pub(crate) fn user_candidate(&self, id: AuthorId, reads: Hydrators) -> Option<UserCandidate> {
         let HydratedUser::Resolved {
             user,
-            viewer_relationship,
+            edges,
             failed,
         } = self.user(id)?
         else {
@@ -210,45 +195,20 @@ impl Hydration {
         };
         Some(UserCandidate {
             user: user.clone(),
-            viewer_relationship: *viewer_relationship,
-            quote: QuoteFacts::default(),
+            edges: *edges,
+            quote: None,
             failed: failed.intersection(reads),
         })
     }
 
-    pub(crate) fn is_on(&self, relation: Relation) -> bool {
-        relation.is_on(self.posts_judged_for, self.planned)
-    }
-
-            pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {
-        let tweet = self.tweet(id)?;
-        let candidate = tweet.candidate()?;
-        let copy = copied
-            .then(|| self.tweet(tweet.source_tweet_id()?)?.candidate())
-            .flatten()
-            .map(|source| source.post.tweet_features.media.has_uploaded_media)
-            .filter(|&has_media| has_media != candidate.post.tweet_features.media.has_media);
-        Some(match copy {
-            None => Cow::Borrowed(candidate),
-            Some(has_media) => {
-                let mut candidate = candidate.clone();
-                candidate.post.tweet_features.media.has_media = has_media;
-                Cow::Owned(candidate)
-            }
-        })
-    }
-
     pub(crate) fn failed_nodes(&self, post: TweetId) -> Hydrators {
-        let Some(HydratedTweet::Resolved {
-            candidate,
-            source_tweet_id,
-            ..
-        }) = self.tweet(post)
-        else {
+        let Some(candidate) = self.tweet(post).and_then(HydratedTweet::candidate) else {
             return Hydrators::empty();
         };
-        let source = source_tweet_id
-            .and_then(|source| self.tweet(source)?.candidate())
+        let source = candidate
+            .post
+            .source_tweet_id
+            .and_then(|source| self.tweet(TweetId(source))?.candidate())
             .map_or(Hydrators::empty(), |source| source.failed);
         candidate.failed.union(source)
     }
@@ -265,11 +225,11 @@ impl Hydration {
 pub(crate) enum HydratedTweet {
     Resolved {
         candidate: PostCandidate,
-        source_tweet_id: Option<TweetId>,
         safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
     },
     Unresolved {
         reason: Unresolved,
+        deletion: Option<Deletion>,
         safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
     },
 }
@@ -278,6 +238,17 @@ pub(crate) enum HydratedTweet {
 pub(crate) struct Unresolved {
     pub(crate) lookup: Lookup,
     pub(crate) cause: Cause,
+}
+
+impl Unresolved {
+    pub(crate) fn evaluation(self, deletion: Option<Deletion>) -> Evaluation {
+        match self.cause {
+            Cause::NotFound => {
+                deletion.map_or(Evaluation::NotFound(self.lookup), Evaluation::Deleted)
+            }
+            Cause::Failed => Evaluation::Failed(self.lookup),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
@@ -305,23 +276,15 @@ impl HydratedTweet {
     }
 
     pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {
-        match self {
-            Self::Resolved {
-                source_tweet_id, ..
-            } => *source_tweet_id,
-            Self::Unresolved { .. } => None,
-        }
+        self.candidate()?.post.source_tweet_id.map(TweetId)
     }
 
     pub(crate) fn source_to_merge(&self) -> Option<TweetId> {
-        match self {
-            Self::Resolved {
-                candidate,
-                source_tweet_id,
-                ..
-            } if !candidate.failed.has_must_have() => *source_tweet_id,
-            Self::Resolved { .. } | Self::Unresolved { .. } => None,
-        }
+        self.candidate()
+            .filter(|candidate| !candidate.failed.has_must_have())?
+            .post
+            .source_tweet_id
+            .map(TweetId)
     }
 
     pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {

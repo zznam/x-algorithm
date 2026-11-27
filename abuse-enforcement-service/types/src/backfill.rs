@@ -2,7 +2,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::action_control::{ControlEntity, LevelRow, PageAction};
 
-pub const BACKFILL_RUN_RECORD_VERSION: u32 = 1;
+pub const BACKFILL_RUN_RECORD_VERSION: u32 = 3;
+
+pub fn run_record_version(actions: &[PageAction]) -> u32 {
+    if actions.iter().any(|a| a.uses_post_suspension_options()) {
+        3
+    } else if actions.iter().any(|a| a.uses_suspension_options()) {
+        2
+    } else {
+        1
+    }
+}
 
 pub const MAX_WINDOW_MS: i64 = 30 * 86_400_000;
 
@@ -206,6 +216,7 @@ pub struct BackfillSettingsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_control::{Lifetime, SuspensionPolicy};
 
     #[test]
     fn record_round_trips_and_refuses_unknown_fields() {
@@ -219,7 +230,7 @@ mod tests {
             levels: vec![LevelRow::Mid],
             window_start_ms: 1,
             window_end_ms: 2,
-            actions: vec![PageAction::Suspend {}],
+            actions: vec![PageAction::SUSPEND],
             rate_per_sec: 200,
             expected_count: 3,
             left_out: vec![],
@@ -259,5 +270,31 @@ mod tests {
         let mut extra = json;
         extra["surprise"] = true.into();
         assert!(serde_json::from_value::<BackfillRunRecord>(extra).is_err());
+    }
+
+    #[test]
+    fn a_run_is_written_at_the_version_its_suspension_options_need() {
+        let label = PageAction::PostSpamHighRecall {
+            lifetime: Lifetime::Permanent,
+        };
+        let account = PageAction::Suspend {
+            permanent: true,
+            policy: SuspensionPolicy::PlatformManipulation,
+        };
+        let author = PageAction::SuspendAuthor {
+            permanent: false,
+            policy: SuspensionPolicy::Cse,
+        };
+        for (actions, v) in [
+            (vec![], 1),
+            (vec![PageAction::SUSPEND], 1),
+            (vec![label, PageAction::SUSPEND_AUTHOR], 1),
+            (vec![account], 2),
+            (vec![author], 3),
+            (vec![label, author], 3),
+        ] {
+            assert_eq!(run_record_version(&actions), v, "{actions:?}");
+            assert!(run_record_version(&actions) <= BACKFILL_RUN_RECORD_VERSION);
+        }
     }
 }

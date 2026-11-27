@@ -4,7 +4,6 @@ use crate::params::{
     EnablePhoenixRetrievalStatsExperimentBucket, EnablePhoenixScoreStatsExperimentBucket,
     PhoenixRetrievalInferenceClusterId, PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
 };
-use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::value_model;
 use crate::sources::phoenix_source::PhoenixSource;
 
@@ -130,6 +129,13 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &retrieval_cluster,
                     &experiment_buckets,
                 );
+                record_phoenix_retrieval_ai_video_stats(
+                    receiver.as_ref(),
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                    &retrieval_cluster,
+                    &experiment_buckets,
+                );
                 if input.query.request_type != RequestType::PhoenixScores
                     && !input.query.in_network_only
                 {
@@ -138,7 +144,6 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                         &input.selected_candidates,
                         &input.non_selected_candidates,
                         &format!("{:?}", PhoenixSource::resolve_cluster(&input.query)),
-                        &format!("{:?}", PhoenixScorer::resolve_cluster(&input.query)),
                         &experiment_buckets,
                     );
                 }
@@ -226,7 +231,6 @@ fn record_retrieval_source_contribution(
     selected_candidates: &[PostCandidate],
     non_selected_candidates: &[PostCandidate],
     retrieval_cluster: &str,
-    ranker_cluster: &str,
     experiment_buckets: &[&ExperimentBucket],
 ) {
     let empty_bucket = ExperimentBucket::new("", "");
@@ -278,7 +282,6 @@ fn record_retrieval_source_contribution(
     for b in buckets {
         let common = [
             ("retrieval_cluster", retrieval_cluster),
-            ("ranker_cluster", ranker_cluster),
             ("ddg", b.experiment.as_str()),
             ("bucket", b.bucket.as_str()),
         ];
@@ -627,6 +630,24 @@ fn record_phoenix_retrieval_zero_fav_stats(
         experiment_buckets,
         ServedType::ForYouPhoenixRetrievalZeroFav,
         "PhoenixRetrievalZeroFavTweets",
+    );
+}
+
+fn record_phoenix_retrieval_ai_video_stats(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    record_retrieval_source_stats(
+        receiver,
+        selected_candidates,
+        non_selected_candidates,
+        retrieval_cluster,
+        experiment_buckets,
+        ServedType::ForYouPhoenixRetrievalAiVideo,
+        "PhoenixRetrievalAiVideoTweets",
     );
 }
 

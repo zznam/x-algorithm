@@ -1,33 +1,35 @@
 use super::{Role, Row, Subject, OUTER_TWEET_ID};
-use crate::hydration::Hydrator::{Blocks, Mutes};
-use crate::models::{PairEdges, PostCandidate, QuoteFacts, QuoteLink, UserCandidate, Verdict};
+use crate::hydration::Hydrator::{
+    AuthorBlocksOuterAuthor, Blocks, Mutes, OuterAuthorFollowsAuthor,
+};
+use crate::models::{EdgeSet, PostCandidate, Quote, QuoteLink, UserCandidate, Verdict};
 use crate::rules::fixtures::{allow, author_candidate, candidate, dropped, AUTHOR_ID};
 use crate::rules::SafetyLevel::{self, QuotedTweetRules};
 use xai_visibility_filtering::models::FilteredReason;
 
 const QUOTING_AUTHOR_ID: u64 = 200;
 
-fn quoted_by(quoting_author: u64, pair_edges: PairEdges) -> QuoteFacts {
-    QuoteFacts {
-        link: Some(QuoteLink {
+fn quoted_by(quoting_author: u64, pair_edges: EdgeSet) -> Quote {
+    Quote {
+        link: QuoteLink {
             outer: OUTER_TWEET_ID,
             quoting_author,
-        }),
+        },
         pair_edges,
     }
 }
 
-fn quoted() -> QuoteFacts {
-    quoted_by(QUOTING_AUTHOR_ID, PairEdges::default())
+fn quoted() -> Quote {
+    quoted_by(QUOTING_AUTHOR_ID, EdgeSet::default())
 }
 
-fn author(post: PostCandidate, quote: QuoteFacts) -> Subject {
-    Subject::User(UserCandidate {
+fn author(post: PostCandidate, quote: Quote) -> UserCandidate {
+    UserCandidate {
         user: post.author,
-        viewer_relationship: post.viewer_relationship,
-        quote,
+        edges: post.edges,
+        quote: Some(quote),
         failed: post.failed,
-    })
+    }
 }
 
 fn inner_quoted(role: Role, expected: Verdict) -> (SafetyLevel, Role, Verdict) {
@@ -69,8 +71,9 @@ pub(super) fn rows() -> Vec<Row> {
         .into_iter()
         .map(|(name, post, reason, by)| Row {
             name,
-            subject: author(post, quoted()),
-            expect: vec![
+            subject: Subject::User(author(post, quoted())),
+            expect: vec![],
+            at: vec![
                 inner_quoted(Role::NonFollower, dropped(reason, by)),
                 inner_quoted(Role::Author, allow()),
             ],
@@ -79,8 +82,9 @@ pub(super) fn rows() -> Vec<Row> {
     rows.extend([
         Row {
             name: "viewer_blocks_author",
-            subject: author(candidate().with_edge(Blocks).build(), quoted()),
-            expect: vec![inner_quoted(
+            subject: Subject::User(author(candidate().with_edge(Blocks).build(), quoted())),
+            expect: vec![],
+            at: vec![inner_quoted(
                 Role::NonFollower,
                 dropped(
                     FilteredReason::ViewerBlocksAuthor,
@@ -90,8 +94,9 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "viewer_mutes_author",
-            subject: author(candidate().with_edge(Mutes).build(), quoted()),
-            expect: vec![
+            subject: Subject::User(author(candidate().with_edge(Mutes).build(), quoted())),
+            expect: vec![],
+            at: vec![
                 inner_quoted(
                     Role::NonFollower,
                     dropped(
@@ -103,20 +108,14 @@ pub(super) fn rows() -> Vec<Row> {
             ],
         },
     ]);
-    let blocked = PairEdges {
-        author_blocks_outer_author: true,
-        ..PairEdges::default()
-    };
+    let blocked = EdgeSet::default().with(AuthorBlocksOuterAuthor);
     let blocks_quoting_author = || {
         dropped(
             FilteredReason::AuthorBlockViewer,
             "quoted_author_blocks_quoting_author/drop/author_block_viewer",
         )
     };
-    let quoting_author_follows = PairEdges {
-        outer_author_follows_author: true,
-        ..PairEdges::default()
-    };
+    let quoting_author_follows = EdgeSet::default().with(OuterAuthorFollowsAuthor);
     let protected = |quote| author(author_candidate(|a| a.is_protected = true), quote);
     let protected_dropped = || {
         dropped(
@@ -127,21 +126,27 @@ pub(super) fn rows() -> Vec<Row> {
     rows.extend([
         Row {
             name: "quoted_author_blocks_quoting_author",
-            subject: author(candidate().build(), quoted_by(QUOTING_AUTHOR_ID, blocked)),
-            expect: vec![
+            subject: Subject::User(author(
+                candidate().build(),
+                quoted_by(QUOTING_AUTHOR_ID, blocked),
+            )),
+            expect: vec![],
+            at: vec![
                 inner_quoted(Role::NonFollower, blocks_quoting_author()),
                 inner_quoted(Role::LoggedOut, blocks_quoting_author()),
             ],
         },
         Row {
             name: "quoted_author_blocks_quoting_author_self_quote",
-            subject: author(candidate().build(), quoted_by(AUTHOR_ID, blocked)),
-            expect: vec![inner_quoted(Role::NonFollower, allow())],
+            subject: Subject::User(author(candidate().build(), quoted_by(AUTHOR_ID, blocked))),
+            expect: vec![],
+            at: vec![inner_quoted(Role::NonFollower, allow())],
         },
         Row {
             name: "protected_quoted_author",
-            subject: protected(quoted()),
-            expect: vec![
+            subject: Subject::User(protected(quoted())),
+            expect: vec![],
+            at: vec![
                 inner_quoted(Role::NonFollower, protected_dropped()),
                 inner_quoted(Role::LoggedOut, protected_dropped()),
                 inner_quoted(Role::Author, protected_dropped()),
@@ -149,13 +154,18 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "protected_quoted_author_quoting_author_follows",
-            subject: protected(quoted_by(QUOTING_AUTHOR_ID, quoting_author_follows)),
-            expect: vec![inner_quoted(Role::NonFollower, allow())],
+            subject: Subject::User(protected(quoted_by(
+                QUOTING_AUTHOR_ID,
+                quoting_author_follows,
+            ))),
+            expect: vec![],
+            at: vec![inner_quoted(Role::NonFollower, allow())],
         },
         Row {
             name: "protected_quoted_author_self_quote",
-            subject: protected(quoted_by(AUTHOR_ID, PairEdges::default())),
-            expect: vec![inner_quoted(Role::NonFollower, allow())],
+            subject: Subject::User(protected(quoted_by(AUTHOR_ID, EdgeSet::default()))),
+            expect: vec![],
+            at: vec![inner_quoted(Role::NonFollower, allow())],
         },
     ]);
     rows

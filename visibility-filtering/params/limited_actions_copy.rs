@@ -1,29 +1,27 @@
-use crate::params::LimitedActionType;
+use crate::metrics::families::{LIMITED_ACTIONS_COPY_DRIFT_CHECKS, LIMITED_ACTIONS_COPY_KEYS};
+use crate::metrics::Metrics;
+use crate::models::LimitedActionType;
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use xai_stats_receiver::StatsReceiverExt;
-use xai_stringcenter::{StringCenter, DEFAULT_LANGUAGE};
+use xai_stringcenter::StringCenter;
 use xai_visibility_filtering::graphql_results::translate;
 
 const BUNDLE_PATH: &str = "/config/stringcenter/visibility-ltd-actions.json";
 const PINNED_METADATA_PATH: &str = "/config/stringcenter/_BUNDLE_METADATA.json";
 const LIVE_METADATA_DIR: &str = "/usr/local/config/stringcenter/bundles/visibility-ltd-actions";
 
-const KEYS_GAUGE: &str = "limited_actions_copy_keys";
-const DRIFT_COUNTER: &str = "limited_actions_copy_drift_checks";
-
 const GENERIC_SUBTEXT_NAMESPACES: [&str; 2] = ["BlockedViewer", "ReadonlyViewer"];
+const KEY_CAPACITY: usize = 64;
 pub(crate) const LEARN_MORE_PLACEHOLDER: &str = "learnmore";
 
 pub(crate) struct LimitedActionsCopy {
     bundle: StringCenter,
 }
 
-pub(crate) struct PromptCopy {
-    namespace: String,
-    prompt_type: PromptType,
-    learn_more_url: Option<String>,
+pub(crate) struct PromptCopy<'a> {
+    namespace: &'a str,
+    kind: PromptKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,16 +36,9 @@ pub(crate) enum PromptKind {
     Basic,
     SeeConversation,
     LearnMore {
-        language: String,
         link_text: &'static str,
         url: String,
     },
-}
-
-#[derive(Clone, Copy)]
-enum PromptType {
-    Basic,
-    Cta,
 }
 
 pub(crate) struct DriftCheck {
@@ -78,10 +69,7 @@ impl LimitedActionsCopy {
         clippy::expect_used,
         reason = "startup fail-fast: the image carries the bundle, so a load failure is a build bug"
     )]
-    pub(crate) fn load_baked(
-        datacenter: &str,
-        stats: Option<&dyn StatsReceiverExt>,
-    ) -> (Self, DriftCheck) {
+    pub(crate) fn load_baked(datacenter: &str, metrics: &Metrics) -> (Self, DriftCheck) {
         let (copy, drift) = Self::load(
             Path::new(BUNDLE_PATH),
             Path::new(PINNED_METADATA_PATH),
@@ -90,9 +78,7 @@ impl LimitedActionsCopy {
                 .join("_BUNDLE_METADATA.json"),
         )
         .expect("the image's limited-actions copy loads");
-        if let Some(stats) = stats {
-            stats.gauge(KEYS_GAUGE, &[], copy.bundle.len() as f64);
-        }
+        metrics.set(&LIMITED_ACTIONS_COPY_KEYS, [], copy.bundle.len() as f64);
         (copy, drift)
     }
 
@@ -110,45 +96,47 @@ impl LimitedActionsCopy {
         Ok((Self { bundle }, drift))
     }
 
-    pub(crate) fn prompt(
-        &self,
-        action: LimitedActionType,
-        copy: &PromptCopy,
-        language: Option<&str>,
-        country: Option<&str>,
-    ) -> Option<Prompt> {
-        let language = language.unwrap_or(DEFAULT_LANGUAGE);
-        let namespace = copy.namespace.as_str();
-        let action_key = string_center_key(action);
-        let headline_key = format!("{namespace}_{action_key}_Headline");
-        let subtext_key = if GENERIC_SUBTEXT_NAMESPACES.contains(&namespace) {
-            format!("{namespace}_GenericSubtext")
-        } else {
-            format!("{namespace}_{action_key}_Subtext")
-        };
-        let headline = self.bundle.get(&headline_key, language, country)?;
-        let subtext = self.bundle.get(&subtext_key, language, country)?;
-        Some(match (copy.prompt_type, &copy.learn_more_url) {
-            (PromptType::Cta, _) => Prompt {
+    pub(crate) fn prompts<'p>(
+        &'p self,
+        copy: &'p PromptCopy<'p>,
+        language: &'p str,
+        country: Option<&'p str>,
+    ) -> impl FnMut(LimitedActionType) -> Option<Prompt> + 'p {
+        let namespace = copy.namespace;
+        let mut key = String::with_capacity(KEY_CAPACITY);
+        let shared_subtext = GENERIC_SUBTEXT_NAMESPACES.contains(&namespace).then(|| {
+            self.bundle.get(
+                key_in(&mut key, [namespace, "_GenericSubtext"]),
+                language,
+                country,
+            )
+        });
+        move |action| {
+            let action_key = string_center_key(action);
+            let headline = self.bundle.get(
+                key_in(&mut key, [namespace, "_", action_key, "_Headline"]),
+                language,
+                country,
+            )?;
+            let subtext = match &shared_subtext {
+                Some(subtext) => subtext.clone()?,
+                None => self.bundle.get(
+                    key_in(&mut key, [namespace, "_", action_key, "_Subtext"]),
+                    language,
+                    country,
+                )?,
+            };
+            Some(Prompt {
                 headline,
-                subtext,
-                kind: PromptKind::SeeConversation,
-            },
-            (PromptType::Basic, Some(url)) => Prompt {
-                headline,
-                subtext: format!("{subtext} {{{LEARN_MORE_PLACEHOLDER}}}"),
-                kind: PromptKind::LearnMore {
-                    language: language.to_string(),
-                    link_text: translate("learn_more_link", language).unwrap_or("Learn more"),
-                    url: url.clone(),
+                subtext: match copy.kind {
+                    PromptKind::LearnMore { .. } => {
+                        format!("{subtext} {{{LEARN_MORE_PLACEHOLDER}}}")
+                    }
+                    PromptKind::Basic | PromptKind::SeeConversation => subtext,
                 },
-            },
-            (PromptType::Basic, None) => Prompt {
-                headline,
-                subtext,
-                kind: PromptKind::Basic,
-            },
-        })
+                kind: copy.kind.clone(),
+            })
+        }
     }
 
     #[cfg(test)]
@@ -159,39 +147,44 @@ impl LimitedActionsCopy {
     }
 }
 
-impl PromptCopy {
+fn key_in<'k, const N: usize>(key: &'k mut String, parts: [&str; N]) -> &'k str {
+    key.clear();
+    key.extend(parts);
+    key
+}
+
+impl<'a> PromptCopy<'a> {
     pub(crate) fn from_switches(
-        namespace: Option<&str>,
+        namespace: Option<&'a str>,
         prompt_type: Option<&str>,
         learn_more_url: Option<&str>,
+        language: &str,
     ) -> Option<Self> {
         if namespace == Some("NoCopy") {
             return None;
         }
         Some(Self {
-            namespace: namespace.unwrap_or("Default").to_string(),
-            prompt_type: if prompt_type == Some("cta") {
-                PromptType::Cta
-            } else {
-                PromptType::Basic
+            namespace: namespace.unwrap_or("Default"),
+            kind: match learn_more_url.filter(|url| !url.is_empty()) {
+                _ if prompt_type == Some("cta") => PromptKind::SeeConversation,
+                Some(url) => PromptKind::LearnMore {
+                    link_text: translate("learn_more_link", language).unwrap_or("Learn more"),
+                    url: url.to_string(),
+                },
+                None => PromptKind::Basic,
             },
-            learn_more_url: learn_more_url
-                .filter(|url| !url.is_empty())
-                .map(str::to_string),
         })
     }
 }
 
 impl DriftCheck {
-    pub(crate) fn run(&self, stats: Option<&dyn StatsReceiverExt>) -> Drift {
+    pub(crate) fn run(&self, metrics: &Metrics) -> Drift {
         let drift = match bundle_hash(&self.live_metadata) {
             Ok(live) if live == self.pinned_hash => Drift::Match,
             Ok(_) => Drift::Mismatch,
             Err(_) => Drift::Unreadable,
         };
-        if let Some(stats) = stats {
-            stats.incr(DRIFT_COUNTER, &[("result", drift.into())], 1);
-        }
+        metrics.count(&LIMITED_ACTIONS_COPY_DRIFT_CHECKS, [drift.into()], 1);
         drift
     }
 }
@@ -258,24 +251,25 @@ pub(crate) mod tests {
         use LimitedActionType as T;
         let copy = LimitedActionsCopy::from_json(BUNDLE);
         let prompt_copy = |namespace, prompt_type, url| {
-            PromptCopy::from_switches(namespace, prompt_type, url).unwrap()
+            PromptCopy::from_switches(namespace, prompt_type, url, "en").unwrap()
         };
         let limited_replies = prompt_copy(Some("LimitedReplies"), Some("cta"), Some(""));
         let blocked = prompt_copy(Some("BlockedViewer"), None, Some(""));
         let default = prompt_copy(None, Some("unknown"), None);
         let learn_more = prompt_copy(None, None, Some("https://example.com/rules"));
+        let learn_more_ja =
+            PromptCopy::from_switches(None, None, Some("https://example.com/rules"), "ja").unwrap();
         let prompt = |headline: &str, subtext: &str, kind| {
             Some(Prompt {
-                headline: headline.to_string(),
-                subtext: subtext.to_string(),
+                headline: headline.to_owned(),
+                subtext: subtext.to_owned(),
                 kind,
             })
         };
         let see_conversation =
             |headline, subtext| prompt(headline, subtext, PromptKind::SeeConversation);
         let basic = |headline, subtext| prompt(headline, subtext, PromptKind::Basic);
-        let learn_more_link = |language: &str, link_text| PromptKind::LearnMore {
-            language: language.to_string(),
+        let learn_more_link = |link_text| PromptKind::LearnMore {
             link_text,
             url: "https://example.com/rules".to_string(),
         };
@@ -283,25 +277,25 @@ pub(crate) mod tests {
             (
                 T::Reply,
                 &limited_replies,
-                Some("ja"),
+                "ja",
                 see_conversation("Who can reply?", "一部のアカウントのみが返信できます。"),
             ),
             (
                 T::Reply,
                 &limited_replies,
-                None,
+                "en",
                 see_conversation("Who can reply?", "Only some accounts can reply."),
             ),
             (
                 T::Reply,
                 &limited_replies,
-                Some("JA-jp"),
+                "JA-jp",
                 see_conversation("Who can reply?", "一部のアカウントのみが返信できます。"),
             ),
             (
                 T::Like,
                 &blocked,
-                Some("ja"),
+                "ja",
                 basic(
                     "いいねできない理由",
                     "この作成者はあなたをブロックしているため、この操作を実行できません",
@@ -310,7 +304,7 @@ pub(crate) mod tests {
             (
                 T::Like,
                 &blocked,
-                Some("en"),
+                "en",
                 basic(
                     "Why can’t you like this?",
                     "This author has blocked you, so you can't perform this action",
@@ -319,41 +313,41 @@ pub(crate) mod tests {
             (
                 T::Reply,
                 &default,
-                Some("ja"),
+                "ja",
                 basic("返信できません", "このポストには返信できません"),
             ),
             (
                 T::Reply,
                 &learn_more,
-                Some("en"),
+                "en",
                 prompt(
                     "You cannot reply",
                     "You cannot reply this post {learnmore}",
-                    learn_more_link("en", "Learn more"),
+                    learn_more_link("Learn more"),
                 ),
             ),
             (
                 T::Reply,
-                &learn_more,
-                Some("ja"),
+                &learn_more_ja,
+                "ja",
                 prompt(
                     "返信できません",
                     "このポストには返信できません {learnmore}",
-                    learn_more_link("ja", "詳細はこちら"),
+                    learn_more_link("詳細はこちら"),
                 ),
             ),
-            (T::Reply, &blocked, Some("en"), None),
-            (T::Like, &limited_replies, Some("en"), None),
+            (T::Reply, &blocked, "en", None),
+            (T::Like, &limited_replies, "en", None),
         ];
         for (action, prompt_copy, language, expected) in cases {
             assert_eq!(
-                copy.prompt(action, prompt_copy, language, None),
+                copy.prompts(prompt_copy, language, None)(action),
                 expected,
-                "{action:?} {} {language:?}",
+                "{action:?} {} {language}",
                 prompt_copy.namespace
             );
         }
-        assert!(PromptCopy::from_switches(Some("NoCopy"), Some("cta"), None).is_none());
+        assert!(PromptCopy::from_switches(Some("NoCopy"), Some("cta"), None, "en").is_none());
     }
 
     #[test]
@@ -369,13 +363,13 @@ pub(crate) mod tests {
         let live = dir.path().join("live.json");
         let (copy, drift) = LimitedActionsCopy::load(&bundle, &pinned, live.clone()).unwrap();
         assert_eq!(copy.bundle.len(), 6);
-        assert_eq!(drift.run(None), Drift::Unreadable);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Unreadable);
         write("live.json", r#"{"bundle_hash": "aaaa"}"#);
-        assert_eq!(drift.run(None), Drift::Match);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Match);
         write("live.json", r#"{"bundle_hash": "bbbb"}"#);
-        assert_eq!(drift.run(None), Drift::Mismatch);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Mismatch);
         write("live.json", "{");
-        assert_eq!(drift.run(None), Drift::Unreadable);
+        assert_eq!(drift.run(&Metrics::none()), Drift::Unreadable);
 
         let missing = dir.path().join("missing.json");
         assert!(LimitedActionsCopy::load(&missing, &pinned, live.clone()).is_err());
@@ -386,10 +380,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_image_layer_ships_the_paths_startup_loads() {
-        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/BUILD.bazel");
-        let ws = "crates/x-product/xai-visibility-filtering-service/BUILD.bazel";
-        let path = if Path::new(cargo).exists() { cargo } else { ws };
-        let build = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let build = std::fs::read_to_string(crate::pinned::crate_path("BUILD.bazel")).unwrap();
         for loaded in [BUNDLE_PATH, PINNED_METADATA_PATH] {
             assert!(build.contains(&format!("\"{loaded}\": ")), "{loaded}");
         }

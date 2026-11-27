@@ -123,6 +123,18 @@ pub struct Config {
     )]
     pub gizmoduck_client_id: String,
 
+    #[arg(long, env = "TEST_ACCOUNT_EMAIL_DOMAINS", value_delimiter = ',')]
+    pub test_account_email_domains: Vec<String>,
+
+    #[arg(long, env = "TEST_ACCOUNT_ROLES", value_delimiter = ',')]
+    pub test_account_roles: Vec<String>,
+
+    #[arg(long, env = "TEST_ACCOUNT_CREATION_CIDRS", value_delimiter = ',')]
+    pub test_account_creation_cidrs: Vec<String>,
+
+    #[arg(long, default_value = "atla", env = "POST_LABELS_ZONE")]
+    pub post_labels_zone: String,
+
     #[arg(
         long,
         default_value = "platform-manipulation/isHighPageRankV2.User",
@@ -143,6 +155,16 @@ pub struct Config {
         env = "UAS_COLUMN"
     )]
     pub uas_column: String,
+
+    #[arg(
+        long,
+        default_value = "tweetypie/federated/tweetForApiTweetV3.Tweet",
+        env = "REPLY_PARENT_COLUMN"
+    )]
+    pub reply_parent_column: String,
+
+    #[arg(long, default_value_t = 3000, env = "REPLY_PARENT_TIMEOUT_MS")]
+    pub reply_parent_timeout_ms: u64,
 
     #[arg(long, env = "GROWTHBOOK_URL")]
     pub growthbook_url: Option<String>,
@@ -256,6 +278,15 @@ impl Config {
             .clone()
             .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string())
     }
+
+    pub fn test_account_policy(&self) -> anyhow::Result<crate::safety_checks::TestAccountPolicy> {
+        crate::safety_checks::TestAccountPolicy::new(
+            &self.test_account_email_domains,
+            &self.test_account_roles,
+            &self.test_account_creation_cidrs,
+        )
+        .map_err(anyhow::Error::msg)
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +350,53 @@ mod tests {
         assert!(!crate::overturn_hold::startup_probe_requested(
             config.overturn_hold_startup_probe.as_deref()
         ));
+    }
+
+    #[test]
+    fn test_account_lists_default_empty_and_parse_commas() {
+        let config = Config::parse_from(["xai-abuse-enforcement-service"]);
+        assert!(config.test_account_email_domains.is_empty());
+        assert!(config.test_account_roles.is_empty());
+        assert!(config.test_account_creation_cidrs.is_empty());
+        assert!(config.test_account_policy().unwrap().is_empty());
+
+        let config = Config::parse_from([
+            "xai-abuse-enforcement-service",
+            "--test-account-email-domains=test.example.com,Other.Example.org",
+            "--test-account-roles=qa_test_role,test_role",
+            "--test-account-creation-cidrs=203.0.113.0/24,2001:db8::/32",
+        ]);
+        assert_eq!(
+            config.test_account_email_domains,
+            ["test.example.com", "Other.Example.org"]
+        );
+        assert_eq!(config.test_account_roles, ["qa_test_role", "test_role"]);
+        assert_eq!(config.test_account_policy().unwrap().sizes(), (2, 2, 2));
+    }
+
+    #[test]
+    fn a_bad_test_account_network_or_domain_fails_the_boot() {
+        for args in [
+            [
+                "xai-abuse-enforcement-service",
+                "--test-account-creation-cidrs=203.0.113.0/33",
+            ],
+            [
+                "xai-abuse-enforcement-service",
+                "--test-account-creation-cidrs=not-a-network",
+            ],
+            [
+                "xai-abuse-enforcement-service",
+                "--test-account-email-domains=@test.example.com",
+            ],
+            [
+                "xai-abuse-enforcement-service",
+                "--test-account-email-domains=test",
+            ],
+        ] {
+            let config = Config::parse_from(args);
+            assert!(config.test_account_policy().is_err(), "{args:?}");
+        }
     }
 
     #[test]

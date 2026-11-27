@@ -1,10 +1,10 @@
-use super::{Role, Row, Subject};
-use crate::hydration::Hydrators;
+use super::{CorpusCase, Judging, Role, Row, Subject};
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    AuthorLabel, AuthorProfile, NotificationFilters, QuoteFacts, UserCandidate, UserEntity,
-    Verdict, Viewer, ViewerFeatures, ViewerProfile, ViewerRelationship,
+    AuthorLabel, AuthorProfile, EdgeSet, NotificationFilters, NotificationKind, Placement,
+    PostCandidate, UserCandidate, UserEntity, Verdict, Viewer, ViewerFeatures, ViewerProfile,
 };
-use crate::rules::fixtures::{allow, dropped, AUTHOR_ID, VIEWER_ID};
+use crate::rules::fixtures::{allow, candidate, dropped, AUTHOR_ID, VIEWER_ID};
 use crate::rules::SafetyLevel::{self, NotificationsFollow, NotificationsWriterV2};
 use std::iter::once;
 use xai_visibility_filtering::models::FilteredReason;
@@ -12,7 +12,7 @@ use xai_visibility_filtering::models::FilteredReason;
 struct Case {
     name: &'static str,
     actor: UserEntity,
-    relationship: ViewerRelationship,
+    edges: EdgeSet,
     recipient: ViewerProfile,
     non_follower: Verdict,
     follower: Verdict,
@@ -41,7 +41,7 @@ fn filtering(set: fn(&mut NotificationFilters)) -> ViewerProfile {
     }
 }
 
-fn recipient(id: u64, profile: ViewerProfile) -> ViewerFeatures {
+pub(super) fn recipient(id: u64, profile: ViewerProfile) -> ViewerFeatures {
     ViewerFeatures {
         viewer: Viewer::LoggedIn {
             id,
@@ -76,7 +76,7 @@ fn non_follower_drop(
     Case {
         name,
         actor,
-        relationship: ViewerRelationship::default(),
+        edges: EdgeSet::default(),
         recipient,
         non_follower: unspecified(by),
         follower: allow(),
@@ -93,7 +93,7 @@ fn non_author_drop(
     Case {
         name,
         actor,
-        relationship: ViewerRelationship::default(),
+        edges: EdgeSet::default(),
         recipient,
         non_follower: verdict(),
         follower: verdict(),
@@ -101,13 +101,16 @@ fn non_author_drop(
     }
 }
 
-fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
+fn cases(
+    protected_non_follower: fn(Verdict) -> Verdict,
+    only_people_i_follow: &'static str,
+) -> Vec<Case> {
     let clean = ViewerProfile::default;
     let mut cases = vec![
         Case {
             name: "protected_actor",
             actor: actor(|actor| actor.features.is_protected = true),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: protected_non_follower(allow()),
             follower: allow(),
@@ -119,7 +122,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
                 actor.features.is_protected = true;
                 actor.features.is_suspended = true;
             }),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: protected_non_follower(suspended()),
             follower: suspended(),
@@ -128,7 +131,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "clean_actor",
             actor: actor(|_| {}),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: allow(),
             follower: allow(),
@@ -187,10 +190,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "recipient_blocks_actor",
             actor: actor(|_| {}),
-            relationship: ViewerRelationship {
-                blocks: true,
-                ..ViewerRelationship::default()
-            },
+            edges: EdgeSet::default().with(Hydrator::Blocks),
             recipient: clean(),
             non_follower: dropped(
                 FilteredReason::ViewerBlocksAuthor,
@@ -205,10 +205,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "recipient_mutes_actor",
             actor: actor(|_| {}),
-            relationship: ViewerRelationship {
-                mutes: true,
-                ..ViewerRelationship::default()
-            },
+            edges: EdgeSet::default().with(Hydrator::Mutes),
             recipient: clean(),
             non_follower: dropped(
                 FilteredReason::ViewerMutesAuthor,
@@ -260,10 +257,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "actor_following_recipient",
             actor: actor(|_| {}),
-            relationship: ViewerRelationship {
-                followed_by: true,
-                ..ViewerRelationship::default()
-            },
+            edges: EdgeSet::default().with(Hydrator::AuthorFollowsViewer),
             recipient: filtering(|filters| filters.not_followed_by = true),
             non_follower: allow(),
             follower: allow(),
@@ -276,7 +270,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
                 mention_filter_is_following: true,
                 ..clean()
             },
-            "only_people_i_follow/drop/unspecified",
+            only_people_i_follow,
         ),
         Case {
             name: "unfiltered_actor",
@@ -288,7 +282,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
                     is_new_account: true,
                 };
             }),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: allow(),
             follower: allow(),
@@ -316,7 +310,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         cases.push(Case {
             name: by,
             actor: labeled(label),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: unspecified(by),
             follower: unspecified(by),
@@ -361,7 +355,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "blink_worst_actor_recipient_without_uqf",
             actor: labeled(AuthorLabel::BlinkWorst),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: clean(),
             non_follower: allow(),
             follower: allow(),
@@ -370,7 +364,7 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
         Case {
             name: "blink_worst_actor_blink_labeled_recipient",
             actor: labeled(AuthorLabel::BlinkWorst),
-            relationship: ViewerRelationship::default(),
+            edges: EdgeSet::default(),
             recipient: ViewerProfile {
                 has_blink_label: true,
                 ..uqf()
@@ -385,24 +379,20 @@ fn cases(protected_non_follower: fn(Verdict) -> Verdict) -> Vec<Case> {
 
 impl Case {
     fn rows(self, level: SafetyLevel) -> [Row; 2] {
-        let subject = |viewer_relationship| {
-            Subject::User(UserCandidate {
-                user: self.actor.clone(),
-                viewer_relationship,
-                quote: QuoteFacts::default(),
-                failed: Hydrators::empty(),
-            })
+        let user = |edges| UserCandidate {
+            user: self.actor.clone(),
+            edges,
+            quote: None,
+            failed: Hydrators::empty(),
         };
         let as_recipient = |name, id| Role::As(name, recipient(id, self.recipient.clone()));
-        let follower = ViewerRelationship {
-            follows: true,
-            ..self.relationship
-        };
+        let follower = self.edges.with(Hydrator::Follows);
         [
             Row {
                 name: self.name,
-                subject: subject(self.relationship),
-                expect: once((
+                subject: Subject::User(user(self.edges)),
+                expect: vec![],
+                at: once((
                     level,
                     as_recipient("non_follower", VIEWER_ID),
                     self.non_follower,
@@ -415,8 +405,9 @@ impl Case {
             },
             Row {
                 name: self.name,
-                subject: subject(follower),
-                expect: vec![(level, as_recipient("follower", VIEWER_ID), self.follower)],
+                subject: Subject::User(user(follower)),
+                expect: vec![],
+                at: vec![(level, as_recipient("follower", VIEWER_ID), self.follower)],
             },
         ]
     }
@@ -432,9 +423,55 @@ pub(super) fn rows() -> Vec<Row> {
     ]
     .into_iter()
     .flat_map(|(level, protected_non_follower)| {
-        cases(protected_non_follower)
-            .into_iter()
-            .flat_map(move |case| case.rows(level))
+        cases(
+            protected_non_follower,
+            "only_people_i_follow/drop/unspecified",
+        )
+        .into_iter()
+        .flat_map(move |case| case.rows(level))
+    })
+    .collect()
+}
+
+pub(super) fn post_kind_cases(level: SafetyLevel, kind: NotificationKind) -> Vec<CorpusCase> {
+    cases(
+        |_| dropped(FilteredReason::AuthorIsProtected, "protected_author/drop"),
+        "only_people_i_follow_outside_community/drop/unspecified",
+    )
+    .into_iter()
+    .flat_map(|case| {
+        let post = |edges| {
+            Subject::Post(PostCandidate {
+                author: case.actor.clone(),
+                edges,
+                ..candidate().build()
+            })
+        };
+        let as_recipient = |role, id, edges, expected| CorpusCase {
+            name: format!("{}/{level:?}/{kind:?}/{role}", case.name),
+            level,
+            judging: Judging::PostKind(kind),
+            viewer: recipient(id, case.recipient.clone()),
+            subject: post(edges),
+            placement: Placement::Standalone,
+            expected,
+        };
+        let follower = case.edges.with(Hydrator::Follows);
+        let mut cases = vec![
+            as_recipient(
+                "non_follower",
+                VIEWER_ID,
+                case.edges,
+                case.non_follower.clone(),
+            ),
+            as_recipient("follower", VIEWER_ID, follower, case.follower.clone()),
+        ];
+        cases.extend(
+            case.actor_self
+                .clone()
+                .map(|verdict| as_recipient("self", AUTHOR_ID, case.edges, verdict)),
+        );
+        cases
     })
     .collect()
 }

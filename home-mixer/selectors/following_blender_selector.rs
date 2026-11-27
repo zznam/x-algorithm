@@ -1,9 +1,9 @@
-use super::build_non_selected;
+use super::{build_non_selected, select_ads_only};
 use crate::ads::{AdsBlender, FollowingAdBlender};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS, PROMPTS_POSITION,
-    WHO_TO_FOLLOW_POSITION,
+    AdsFollowingMinPosts, FOLLOWING_MAX_RESULT_SIZE, FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS,
+    PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
 };
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 use xai_home_mixer_proto::{feed_item, FeedItem, Prompt, ScoredPost, WhoToFollowModule};
@@ -20,9 +20,12 @@ impl FollowingBlenderSelector {
 impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
     fn select(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: Vec<FeedItem>,
     ) -> SelectResult<FeedItem> {
+        if query.is_ads_only_timeline() {
+            return select_ads_only(candidates);
+        }
         let PartitionedFeedItems {
             posts,
             ads,
@@ -35,8 +38,11 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
 
         let blender = FollowingAdBlender {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
+            min_posts: query.params.get(AdsFollowingMinPosts) as usize,
         };
-        let mut blended = blender.blend(posts, ads, &mut Vec::new());
+        let mut drops = Vec::new();
+        let mut blended = blender.blend(posts, ads, &mut drops);
+        query.ad_drops.extend(drops);
 
         insert_prompts(&mut blended, prompts);
         if input_post_count > FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS {

@@ -1,16 +1,18 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::content_features;
 use crate::models::query::ScoredPostsQuery;
+use crate::scorers::vm_ranker_engagement_labels::EngagementIneligible;
 use prost::Message;
 use xai_recsys_proto::{ContentFeatures, ProductSurface};
 use xai_vm_ranker_proto as pb;
-use xai_vm_ranker_proto::experiment::{CandidatePayload, RequestPayload};
+use xai_vm_ranker_proto::experiment::{CandidatePayload, PostTopics, RequestPayload};
 
 pub(crate) fn request_payload(
     query: &ScoredPostsQuery,
     candidates: &[PostCandidate],
     debias: bool,
     history_topics: bool,
+    post_topics: bool,
 ) -> Vec<u8> {
     let mut payload = RequestPayload::default();
     if debias {
@@ -27,10 +29,20 @@ pub(crate) fn request_payload(
     if history_topics {
         payload.history_topics = query.history_topics.clone();
     }
+    if post_topics {
+        payload.recent_views = query.recent_views.clone();
+        payload.recent_view_topics = query.recent_view_topics.clone();
+    }
     payload.encode_to_vec()
 }
 
-pub(crate) fn candidate_payload(candidate: &PostCandidate, debias: bool, pacing: bool) -> Vec<u8> {
+pub(crate) fn candidate_payload(
+    candidate: &PostCandidate,
+    debias: bool,
+    pacing: bool,
+    topics: Option<&PostTopics>,
+    ineligible: EngagementIneligible,
+) -> Vec<u8> {
     let mut payload = CandidatePayload::default();
     if debias {
         payload.content_features =
@@ -45,6 +57,10 @@ pub(crate) fn candidate_payload(candidate: &PostCandidate, debias: bool, pacing:
             .author_followers_count
             .and_then(|n| u64::try_from(n).ok());
     }
+    payload.topics = topics.cloned();
+    payload.reply_ineligible = ineligible.reply;
+    payload.share_ineligible = ineligible.share;
+    payload.click_ineligible = ineligible.click;
     payload.encode_to_vec()
 }
 

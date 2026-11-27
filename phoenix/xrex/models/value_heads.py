@@ -10,8 +10,8 @@ from jax.scipy.special import ndtr
 
 from xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID
 
-PURCHASE_VALUE_METRIC_PREFIX = "purchase-value_delayed_website_clicked"
-PURCHASE_VALUE_VT_METRIC_PREFIX = "purchase-value_delayed_website"
+PURCHASE_VALUE_METRIC_PREFIX = "WebPurchaseValue_delayed_website_clicked"
+PURCHASE_VALUE_VT_METRIC_PREFIX = "WebPurchaseValue_delayed_website"
 PURCHASE_VALUE_EMA_KEY = "purchase_value"
 
 VALUE_EMA_STATE_SIZE = 10
@@ -152,14 +152,11 @@ def _trained_loss(
 def value_ratio_stats(sums: jax.Array, metric_prefix: str) -> dict[str, jax.Array]:
     denominator = jnp.where(sums[4] > 0, sums[4], 1.0)
     return {
-        f"{metric_prefix}-loss": sums[0] / denominator,
-        f"{metric_prefix}-valid-count": sums[5],
-        f"{metric_prefix}-weight-sum": sums[4],
-        f"{metric_prefix}-ratio-mae": sums[1] / denominator,
-        f"{metric_prefix}-target-ratio": sums[2] / denominator,
-        f"{metric_prefix}-baseline-mean-usd": sums[3] / denominator,
-        f"{metric_prefix}-usd-mae": sums[7] / denominator,
-        f"{metric_prefix}-calib": sums[8] / (sums[2] + 1e-12),
+        f"{metric_prefix}_loss": sums[0] / denominator,
+        f"{metric_prefix}_num_tokens": sums[4],
+        f"{metric_prefix}_ratio_mae": sums[1] / denominator,
+        f"{metric_prefix}_usd_mae": sums[7] / denominator,
+        f"{metric_prefix}_calib": sums[8] / (sums[2] + 1e-12),
     }
 
 
@@ -212,10 +209,10 @@ def value_ratio_loss_compute(
 def value_binned_stats(sums: jax.Array, metric_prefix: str) -> dict[str, jax.Array]:
     denominator = jnp.where(sums[4] > 0, sums[4], 1.0)
     return {
-        f"{metric_prefix}-binned-ce": sums[0] / denominator,
-        f"{metric_prefix}-binned-entropy": sums[1] / denominator,
-        f"{metric_prefix}-binned-top-prob": sums[2] / denominator,
-        f"{metric_prefix}-binned-overflow-prob": sums[3] / denominator,
+        f"{metric_prefix}_binned_ce": sums[0] / denominator,
+        f"{metric_prefix}_binned_entropy": sums[1] / denominator,
+        f"{metric_prefix}_binned_top_prob": sums[2] / denominator,
+        f"{metric_prefix}_binned_overflow_prob": sums[3] / denominator,
     }
 
 
@@ -340,23 +337,107 @@ def value_smoothed_stats(
     new_ema: dict[str, jax.Array] = {}
     for i, ws in enumerate(smoothing_windows):
         new_ema[f"{ema_key}/{ws}"] = updated[i]
-        prefix = f"{metric_prefix}-smoothed"
-        for name, col in (
-            ("loss", 0),
-            ("ratio-mae", 1),
-            ("target-ratio", 2),
-            ("baseline-mean-usd", 3),
-            ("usd-mae", 7),
-        ):
-            stats[f"{prefix}-{name}-{ws}"] = jnp.where(
+        prefix = f"{metric_prefix}_smoothed"
+        for name, col in (("loss", 0), ("ratio_mae", 1), ("usd_mae", 7)):
+            stats[f"{prefix}_{name}_{ws}"] = jnp.where(
                 has_labels[i], updated[i, col] / weight[i], 0.0
             )
-        stats[f"{prefix}-mae-vs-prior-{ws}"] = jnp.where(
+        stats[f"{prefix}_mae_vs_advertiser_avg_{ws}"] = jnp.where(
             updated[i, 6] > 0, updated[i, 1] / jnp.maximum(updated[i, 6], 1e-12), 0.0
         )
-        stats[f"{prefix}-calib-{ws}"] = jnp.where(
+        stats[f"{prefix}_calib_{ws}"] = jnp.where(
             updated[i, 2] > 0, updated[i, 8] / jnp.maximum(updated[i, 2], 1e-12), 0.0
         )
-        stats[f"{prefix}-ratio-valid-{ws}"] = updated[i, 5] / jnp.maximum(updated[i, 9], 1.0)
-        stats[f"{prefix}-valid-count-{ws}"] = updated[i, 5]
+        stats[f"{prefix}_ratio_pos_{ws}"] = updated[i, 4] / jnp.maximum(updated[i, 9], 1.0)
+        stats[f"{prefix}_num_tokens_{ws}"] = updated[i, 4]
+    return stats, new_ema
+
+
+WITHIN_LI_SLICES = ("all", "clean", "ct", "vt")
+WITHIN_LI_STATE_COLS = 6
+WITHIN_LI_CLEAN_MIN_USD = 1.0
+
+
+def within_li_ema_key(ema_key: str, slice_name: str, window: int) -> str:
+    return f"{ema_key}/within_li/{slice_name}/{window}"
+
+
+def line_item_buckets(line_item_id: jax.Array, num_buckets: int) -> jax.Array:
+    bits = num_buckets.bit_length() - 1
+    hashed = line_item_id.astype(jnp.uint32) * jnp.uint32(2654435761)
+    return (hashed >> jnp.uint32(32 - bits)).astype(jnp.int32)
+
+
+def within_li_bucket_sums(
+    target_ratio: jax.Array,
+    pred_ratio: jax.Array,
+    weight: jax.Array,
+    bucket: jax.Array,
+    num_buckets: int,
+) -> jax.Array:
+    w = weight.astype(jnp.float32)
+    keep = w > 0
+    y = jnp.where(keep, jnp.log(jnp.maximum(target_ratio.astype(jnp.float32), 1e-6)), 0.0)
+    p = jnp.where(keep, jnp.log(jnp.maximum(pred_ratio.astype(jnp.float32), 1e-6)), 0.0)
+    rows = jnp.stack([w, w * y, w * p, w * y * y, w * p * p, w * y * p], axis=-1)
+    return jax.ops.segment_sum(
+        rows.reshape(-1, WITHIN_LI_STATE_COLS),
+        bucket.reshape(-1),
+        num_segments=num_buckets,
+    )
+
+
+def within_li_correlation(sums: jax.Array) -> jax.Array:
+    n = sums[:, 0]
+    inv = jnp.where(n > 0, 1.0 / jnp.maximum(n, 1e-12), 0.0)
+    ss_yy = jnp.sum(sums[:, 3] - sums[:, 1] ** 2 * inv)
+    ss_pp = jnp.sum(sums[:, 4] - sums[:, 2] ** 2 * inv)
+    ss_yp = jnp.sum(sums[:, 5] - sums[:, 1] * sums[:, 2] * inv)
+    ok = (ss_yy > 1e-9) & (ss_pp > 1e-9)
+    return jnp.where(ok, ss_yp / jnp.sqrt(jnp.maximum(ss_yy * ss_pp, 1e-18)), 0.0)
+
+
+def value_within_li_smoothed_stats(
+    raw_ratio: jax.Array,
+    baseline_mean_usd: jax.Array,
+    valid_mask: jax.Array,
+    pred_ratio: jax.Array,
+    line_item_id: jax.Array,
+    clicked: jax.Array,
+    rce_ema: dict[str, jax.Array],
+    batch_size: jax.Array,
+    windows: tuple[int, ...],
+    num_buckets: int,
+    ema_key: str,
+    metric_prefix: str,
+) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+    valid, _ = value_valid_weights(raw_ratio, baseline_mean_usd, valid_mask, None)
+    valid = valid & (line_item_id > 0)
+    usd = raw_ratio.astype(jnp.float32) * baseline_mean_usd.astype(jnp.float32)
+    clicked = clicked.astype(jnp.bool_)
+    masks = {
+        "all": valid,
+        "clean": valid & (usd >= WITHIN_LI_CLEAN_MIN_USD),
+        "ct": valid & clicked,
+        "vt": valid & ~clicked,
+    }
+    bucket = line_item_buckets(line_item_id, num_buckets)
+    batch_sums = {
+        name: within_li_bucket_sums(raw_ratio, pred_ratio, mask, bucket, num_buckets)
+        for name, mask in masks.items()
+    }
+    stats: dict[str, jax.Array] = {}
+    new_ema: dict[str, jax.Array] = {}
+    for ws in windows:
+        decay = 1.0 - jnp.minimum(1.0, batch_size / ws)
+        for name, sums in batch_sums.items():
+            key = within_li_ema_key(ema_key, name, ws)
+            old = rce_ema.get(key, jnp.zeros_like(sums))
+            updated = decay * old + sums
+            updated = jnp.where(jnp.isnan(updated), old, updated)
+            new_ema[key] = updated
+            slice_name = "" if name == "all" else f"_{name}"
+            stats[f"{metric_prefix}_smoothed_correlation{slice_name}_{ws}"] = within_li_correlation(
+                updated
+            )
     return stats, new_ema

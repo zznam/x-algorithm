@@ -1,8 +1,9 @@
 use super::inputs::Inputs;
+#[cfg(test)]
 use super::spelled_label;
 use super::Truth;
 use crate::hydration::{Hydrator, Hydrators};
-use crate::models::{AuthorLabel, PostCandidate, SafetyLabelType, VerifyBlurSupport};
+use crate::models::{AuthorLabel, ClientSwitch, PostCandidate, SafetyLabelType, VerifyBlurSupport};
 use crate::params::CountryList;
 use crate::rules::context::{At, CoreFacts};
 use crate::rules::rule_spec::engine::Candidate;
@@ -29,7 +30,7 @@ pub use author::{
 };
 pub use community::{CommunityModeratorLeaf, CommunityViewerRemovedLeaf, PostModerationLeaf};
 pub use compound::CompoundLeaf;
-pub use edges::{EdgeLeaf, PairEdgeLeaf, RelationshipLeaf};
+pub use edges::{PairEdgeLeaf, RelationshipLeaf};
 pub use post::{PostFactsLeaf, ReplyControlLeaf, SourceTweetIdLeaf, TweetSafetyLabelsLeaf};
 pub use reaction::{ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf};
 pub use request::RequestLeaf;
@@ -49,7 +50,6 @@ pub(in crate::rules) mod leaves {
     pub(in crate::rules) use super::CommunityModeratorLeaf::*;
     pub(in crate::rules) use super::CommunityViewerRemovedLeaf::*;
     pub(in crate::rules) use super::CompoundLeaf::*;
-    pub(in crate::rules) use super::EdgeLeaf::*;
     pub(in crate::rules) use super::NotificationFilterLeaf::*;
     pub(in crate::rules) use super::PairEdgeLeaf::*;
     pub(in crate::rules) use super::PostFactsLeaf::*;
@@ -80,9 +80,6 @@ pub(in crate::rules) trait Leaf:
 {
     type Feature: Reads<PostCandidate>;
     fn meaning<'a, M: Meaning<'a, Self::Feature>>(self, meaning: M) -> M::Out;
-    fn sentence(self, _truth: Truth) -> Option<String> {
-        None
-    }
 }
 
 pub(in crate::rules) trait Meaning<'a, F: Feature> {
@@ -96,53 +93,70 @@ pub(in crate::rules) trait Meaning<'a, F: Feature> {
 }
 
 pub(in crate::rules) trait Payload {
+    #[cfg(test)]
     fn spelled(self) -> String;
 }
 
 impl Payload for SafetyLabelType {
+    #[cfg(test)]
     fn spelled(self) -> String {
         spelled_label(self)
     }
 }
 
 impl Payload for u64 {
+    #[cfg(test)]
     fn spelled(self) -> String {
         self.to_string()
     }
 }
 
 impl Payload for &'static str {
+    #[cfg(test)]
     fn spelled(self) -> String {
         self.to_owned()
     }
 }
 
 impl Payload for AuthorLabel {
+    #[cfg(test)]
     fn spelled(self) -> String {
         format!("{self:?}")
     }
 }
 
 impl Payload for CountryList {
+    #[cfg(test)]
     fn spelled(self) -> String {
         format!("{self:?}")
     }
 }
 
 impl Payload for ConversationControlArm {
+    #[cfg(test)]
     fn spelled(self) -> String {
         format!("{self:?}")
+    }
+}
+
+impl Payload for ClientSwitch {
+    #[cfg(test)]
+    fn spelled(self) -> String {
+        <&str>::from(self).to_owned()
     }
 }
 
 impl Payload for VerifyBlurSupport {
+    #[cfg(test)]
     fn spelled(self) -> String {
         format!("{self:?}")
     }
 }
 
+#[cfg(test)]
 pub(super) struct Spelling;
 
+#[cfg(test)]
 impl<'a, F: Feature> Meaning<'a, F> for Spelling {
     type Out = Option<String>;
 
@@ -205,8 +219,8 @@ impl<const N: u8> EdgeFeature<N> {
 impl<const N: u8> Feature for EdgeFeature<N> {
     const REQUIRED: Hydrators = {
         assert!(
-            Self::NODE.is_edge(),
-            "EdgeFeature<N> names a node that is not an edge"
+            Self::NODE.is_viewer_edge(),
+            "EdgeFeature<N> names a node that is not a viewer edge"
         );
         Hydrators::of(Self::NODE)
     };

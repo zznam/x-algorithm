@@ -42,23 +42,38 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
     load_global_ids_from_parquet_file,
 )
-from xrex.data.recsys import id_list_features, reply_features
+from xrex.data.recsys import (
+    id_list_features,
+    long_term_author_profile,
+    reply_features,
+    teacher_distill,
+)
+from xrex.data.recsys.ad_side_ids import AD_SIDE_FIELD_COLUMNS
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
+    SAMPLE_WEIGHT_SEQ_COLUMN,
+    VIDEO_DURATION_COLUMN,
 )
 from xrex.data.recsys.recsys_batch import (
+    ADS_COUNT_COLUMNS,
+    ADS_CTR_COUNT_PAIRS,
     EMBEDDING_CONFIG,
+    HISTORY_RANKED_URL_ID_COLUMNS,
     HISTORY_URL_ID_COLUMN,
+    USER_ADS_COUNT_COLUMNS,
     CandidateNegativeMode,
     EmbeddingType,
     RecsysFeaturesBatch,
     from_record_batch,
 )
 from xrex.data.streaming.history_url_embedding import (
+    DEFAULT_MODEL_VERSION,
     URL_EMBEDDING_DIM,
     HistoryUrlEmbeddingLookup,
     UrlEmbeddingLookupStats,
+    post_embedding_key,
+    url_embedding_key,
 )
 from xrex.data.streaming.kafkaconsumer import (
     DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
@@ -71,9 +86,11 @@ from xrex.data.streaming.kafkaconsumer import (
     PartitionLagTracker,
     consume_messages,
     discover_partition_count,
+    set_expected_inner_list_widths,
     validate_offset_map,
     validate_seek_options,
 )
+from xrex.data.user_debias_feed import HISTORY_STATS_COLUMNS
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.utils import cluster
 
@@ -164,6 +181,8 @@ _kafka_empty_polls = None
 _kafka_partition_delivered_offset = None
 _kafka_history_url_embedding = None
 _kafka_history_url_embedding_mget_seconds = None
+_kafka_candidate_mm_embedding = None
+_kafka_candidate_mm_embedding_mget_seconds = None
 
 _training_metrics_initialized = False
 _training_histograms: dict[str, Any] = {}
@@ -294,6 +313,7 @@ def _init_otel_metrics(
     global _kafka_batch_processing_time, _kafka_queue_size, _kafka_empty_polls
     global _kafka_partition_delivered_offset
     global _kafka_history_url_embedding, _kafka_history_url_embedding_mget_seconds
+    global _kafka_candidate_mm_embedding, _kafka_candidate_mm_embedding_mget_seconds
     global _training_metrics_initialized, _training_histograms, _training_metric_values
     global _training_cluster_name, _TRAINER_KEY_MAP, _KNOWN_OTEL_KEYS
     global metrics_server_started
@@ -539,6 +559,18 @@ def _init_otel_metrics(
         unit="1",
     )
 
+    _kafka_candidate_mm_embedding = _meter.create_counter(
+        name="recsys_kafka_candidate_mm_embedding_total",
+        description="Candidate MM embedding lookup counts by outcome (UrlEmbeddingLookupStats)",
+        unit="1",
+    )
+
+    _kafka_candidate_mm_embedding_mget_seconds = _meter.create_counter(
+        name="recsys_kafka_candidate_mm_embedding_mget_seconds_total",
+        description="Time spent in candidate MM embedding Redis MGETs",
+        unit="1",
+    )
+
     _kafka_batch_processing_time = _meter.create_histogram(
         name="recsys_kafka_batch_processing_seconds",
         description="Time spent processing Kafka batches",
@@ -710,15 +742,21 @@ def report_training_metrics(
             _training_metric_values[(training_name, otel_key)] = fval
 
 
-def _record_history_url_embedding_stats(
-    stats: UrlEmbeddingLookupStats, attrs: Mapping[str, str]
+_CANDIDATE_MM_NEGATIVE_TTL_S = 900.0
+
+
+def _record_embedding_lookup_stats(
+    stats: UrlEmbeddingLookupStats,
+    attrs: Mapping[str, str],
+    counts: Any | None,
+    mget_seconds: Any | None,
 ) -> None:
-    if _kafka_history_url_embedding is not None:
+    if counts is not None:
         for outcome, count in dataclasses.asdict(stats).items():
             if outcome != "mget_seconds" and count:
-                _kafka_history_url_embedding.add(count, {**attrs, "outcome": outcome})
-    if _kafka_history_url_embedding_mget_seconds is not None and stats.mget_seconds:
-        _kafka_history_url_embedding_mget_seconds.add(stats.mget_seconds, dict(attrs))
+                counts.add(count, {**attrs, "outcome": outcome})
+    if mget_seconds is not None and stats.mget_seconds:
+        mget_seconds.add(stats.mget_seconds, dict(attrs))
 
 
 def _cast_column(arr: pa.Array, target_type: pa.DataType) -> pa.Array:
@@ -786,7 +824,7 @@ def _unify_record_batch_schemas(
 
     col_names: list[str] = list(required_columns)
     for opt_name in optional_columns:
-        if opt_name in all_batch_names:
+        if opt_name in all_batch_names and opt_name not in col_names:
             col_names.append(opt_name)
 
     canonical_types: dict[str, pa.DataType] = {}
@@ -1104,6 +1142,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     negative_downsample_positive_action_indices: str = (
         DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES
     )
+    drop_width_mismatched_messages: bool = True
     per_partition_poll: bool = True
     consumer_mode: ConsumerMode = ConsumerMode.PER_PARTITION
 
@@ -1138,10 +1177,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
 
     history_url_embedding_cache: str = ""
     history_url_embedding_dc: str = "atla"
+    history_url_ranked_pages: bool = False
     history_url_embedding_cache_entries: int = 200_000
     history_url_embedding_timeout_s: float = 0.1
     history_url_embedding_sample_rate: float = 1.0
     history_url_embedding_negative_ttl_s: float = 3600.0
+    history_url_embedding_model_version: str = DEFAULT_MODEL_VERSION
+    candidate_mm_embedding_model_version: str = ""
 
     exclude_required_columns: str = ""
 
@@ -1176,9 +1218,13 @@ class PhoenixKafkaDataset(PhoenixDataset):
         start_time = time.time()
 
         required_columns: list[str] = list(REQUIRED_COLUMNS)
+        if self.read_video_duration:
+            required_columns.append(VIDEO_DURATION_COLUMN)
         if self.exclude_required_columns:
             excluded = {c.strip() for c in self.exclude_required_columns.split(",") if c.strip()}
             required_columns = [c for c in required_columns if c not in excluded]
+        if self.user_history_stats_dim:
+            required_columns = list(dict.fromkeys(required_columns + HISTORY_STATS_COLUMNS))
 
         if not self._logged_schema and batch:
             first_rb = batch[0]
@@ -1200,13 +1246,33 @@ class PhoenixKafkaDataset(PhoenixDataset):
             )
         if self.id_list_specs:
             optional_columns = [*optional_columns, id_list_features.COLUMN]
+        if self.long_term_author_profile_size > 0:
+            optional_columns = [*optional_columns, *long_term_author_profile.COLUMNS]
+        if self.read_ads_engagement_counts:
+            optional_columns = [*optional_columns, *ADS_COUNT_COLUMNS, *USER_ADS_COUNT_COLUMNS]
+        if self.read_ads_ctr_features:
+            ctr_columns = [c for pair in ADS_CTR_COUNT_PAIRS for c in pair]
+            optional_columns = list(dict.fromkeys([*optional_columns, *ctr_columns]))
+        if self.per_candidate_sample_weight:
+            optional_columns = [*optional_columns, SAMPLE_WEIGHT_SEQ_COLUMN]
+        if self.read_ad_side_ids:
+            ad_columns = [c for f in self.ad_side_field_names for c in AD_SIDE_FIELD_COLUMNS[f]]
+            optional_columns = list(dict.fromkeys([*optional_columns, *ad_columns]))
+        if self.distill_teacher:
+            optional_columns = [*optional_columns, teacher_distill.COLUMN]
+        candidate_mm_lookup = self._candidate_mm_lookup
         embedding_col_name: str | None = None
-        if self.multimodal_embedding_type is not None:
+        if self.multimodal_embedding_type is not None and candidate_mm_lookup is None:
             embedding_col_name, _ = EMBEDDING_CONFIG[self.multimodal_embedding_type]
             optional_columns = [*optional_columns, embedding_col_name]
         history_url_lookup = self._history_url_lookup
+        url_id_columns = (
+            HISTORY_RANKED_URL_ID_COLUMNS
+            if self.history_url_ranked_pages
+            else (HISTORY_URL_ID_COLUMN,)
+        )
         if history_url_lookup is not None:
-            optional_columns = [*optional_columns, HISTORY_URL_ID_COLUMN]
+            optional_columns = [*optional_columns, *url_id_columns]
         unified_batches = _unify_record_batch_schemas(batch, required_columns, optional_columns)
 
         t = time.time()
@@ -1253,6 +1319,9 @@ class PhoenixKafkaDataset(PhoenixDataset):
             self.multimodal_embedding_type,
             search_query_embedding_dim=self.search_query_embedding_dim,
             aux_value_events=self.aux_value_events,
+            distill_teacher=self.distill_teacher,
+            distill_actions=self.distill_actions,
+            distill_bad_spans_ms=self.distill_bad_spans_ms,
             candidate_negative_filter=self.candidate_negative_filter,
             candidate_negative_mode=(
                 self.candidate_negative_mode
@@ -1262,17 +1331,28 @@ class PhoenixKafkaDataset(PhoenixDataset):
             global_post_sids=global_post_sids,
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
+            ld_label_exclude_clicks=self.ld_label_exclude_clicks,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
             stale_post_30d=self.enable_stale_post_30d,
             search_negative_clear_word_match=self.search_negative_clear_word_match,
             reply_parent_mode=self.reply_parent_mode,
             ads_head_masking=self.ads_head_masking,
             ads_pixel_head_masking=self.ads_pixel_head_masking,
+            ads_late_window_heads=self.ads_late_window_heads,
             page_records=self.page_records,
             id_list_specs=self.id_list_specs or None,
+            long_term_author_profile_size=self.long_term_author_profile_size,
             history_url_embedding_dim=self.history_url_embedding_dim,
             history_url_embedding_fn=history_url_lookup,
+            history_url_id_columns=url_id_columns,
+            candidate_embedding_fn=candidate_mm_lookup,
+            read_ads_engagement_counts=self.read_ads_engagement_counts,
+            read_ads_ctr_features=self.read_ads_ctr_features,
+            per_candidate_sample_weight=self.per_candidate_sample_weight,
+            user_history_stats_dim=self.user_history_stats_dim,
             alloc=self._alloc,
+            read_ad_side_ids=self.read_ad_side_ids,
+            ad_side_fields=self.ad_side_field_names,
         )
 
         cardinality = inspect_prepared_batch(
@@ -1310,7 +1390,19 @@ class PhoenixKafkaDataset(PhoenixDataset):
             if _kafka_embedding_zero_filled and embedding_col_name is not None:
                 _kafka_embedding_zero_filled.add(embedding_zero_filled, shard_attrs)
             if history_url_lookup is not None:
-                _record_history_url_embedding_stats(history_url_lookup.take_stats(), shard_attrs)
+                _record_embedding_lookup_stats(
+                    history_url_lookup.take_stats(),
+                    shard_attrs,
+                    _kafka_history_url_embedding,
+                    _kafka_history_url_embedding_mget_seconds,
+                )
+            if candidate_mm_lookup is not None:
+                _record_embedding_lookup_stats(
+                    candidate_mm_lookup.take_stats(),
+                    shard_attrs,
+                    _kafka_candidate_mm_embedding,
+                    _kafka_candidate_mm_embedding_mget_seconds,
+                )
 
         return example
 
@@ -1336,6 +1428,38 @@ class PhoenixKafkaDataset(PhoenixDataset):
             self.history_url_embedding_cache_entries,
             self.history_url_embedding_sample_rate,
             self.history_url_embedding_negative_ttl_s,
+            key_fn=partial(
+                url_embedding_key, model_version=self.history_url_embedding_model_version
+            ),
+        )
+
+    @cached_property
+    def _candidate_mm_lookup(self) -> HistoryUrlEmbeddingLookup | None:
+        if not self.candidate_mm_embedding_model_version:
+            return None
+        if not self.history_url_embedding_cache:
+            raise ValueError(
+                "candidate_mm_embedding_model_version needs history_url_embedding_cache"
+            )
+        if (
+            self.multimodal_embedding_type is None
+            or EMBEDDING_CONFIG[self.multimodal_embedding_type][1] != URL_EMBEDDING_DIM
+        ):
+            raise ValueError(
+                f"candidate_mm_embedding_model_version needs a {URL_EMBEDDING_DIM}-d "
+                f"multimodal_embedding_type, got {self.multimodal_embedding_type}"
+            )
+        return HistoryUrlEmbeddingLookup.from_cache(
+            self.history_url_embedding_cache,
+            self.history_url_embedding_dc,
+            self.history_url_embedding_timeout_s,
+            self.history_url_embedding_cache_entries,
+            1.0,
+            _CANDIDATE_MM_NEGATIVE_TTL_S,
+            key_fn=partial(
+                post_embedding_key, model_version=self.candidate_mm_embedding_model_version
+            ),
+            name="Candidate MM embeddings",
         )
 
     def exports_python_otel(self, shard_index: int, num_shards: int) -> bool:
@@ -1364,6 +1488,11 @@ class PhoenixKafkaDataset(PhoenixDataset):
             resume_position,
         )
         validate_seek_options(self.seek_to_timestamp_ms, self.seek_to_offset)
+        if self.per_candidate_sample_weight and self.negative_downsample_rate != 1:
+            raise ValueError(
+                "per_candidate_sample_weight requires negative_downsample_rate=1: the reader's "
+                "rate goes to sampleWeight, which sampleWeightSeq replaces on candidate slots"
+            )
         if type(self.native_checkpoint_restart) is not bool:
             raise ValueError("Native restart policy must be an exact Boolean")
         if self.native_checkpoint_restart:
@@ -1681,6 +1810,14 @@ class PhoenixKafkaDataset(PhoenixDataset):
                 rank_logger.error(f"Error in periodic reload task: {e}")
                 await asyncio.sleep(self.global_ids_reload_interval_seconds / 2)
 
+    def expected_inner_list_widths(self) -> dict[str, int]:
+        if not self.drop_width_mismatched_messages:
+            return {}
+        return {
+            "actionNameMultiHotSeqSeq": self.output_vocab_size,
+            "continuousActionValuesSeqSeq": self.num_continuous_actions,
+        }
+
     def _async_kafka_consumer_arrow(
         self,
         example_queue: queue.Queue[KafkaQueueItem],
@@ -1691,6 +1828,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
         stop_event: threading.Event | None = None,
         reset_event: threading.Event | None = None,
     ) -> None:
+        set_expected_inner_list_widths(self.expected_inner_list_widths())
         try:
             self._run_kafka_consumer_arrow(
                 example_queue,

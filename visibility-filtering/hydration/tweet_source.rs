@@ -1,18 +1,22 @@
-use crate::models::{MediaFeature, NsfwFeature, ReactionContext, TweetFeatures};
-use crate::thrift_read::{read_fields, skip_elements, SKIP_DEPTH};
-use anyhow::{anyhow, Result};
+use crate::clients::strato;
+use crate::models::{
+    Deletion, MediaFeature, NsfwFeature, PostText, ReactionContext, TweetFeatures,
+};
+use crate::thrift_read::{read_fields, skip_elements, string_range, SKIP_DEPTH};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::sync::Arc;
 use thrift::protocol::{TInputProtocol, TType};
 use xai_core_entities::entities::{
     EditControl, ExclusiveTweetControl, TakedownReason, TrustedFriendsControl,
 };
-use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead, StratoResult};
+use xai_strato::strato_thrift::{strato_decode, MValProtocol, StratoRead};
 use xai_strato::{encode, Bytes, MValCodec, StratoGrpc};
 
 const COLUMN: &str = "tweetypie/federated/tweetForVisibility.Tweet";
-const OPERATION: &str = "fetch";
+const STATE_COLUMN: &str = "tweetypie/federated/tweetState.Tweet";
 
 pub(crate) struct TweetSource {
     pub(crate) grpc_client: Arc<StratoGrpc>,
@@ -20,44 +24,79 @@ pub(crate) struct TweetSource {
 
 impl TweetSource {
     pub(crate) async fn get_tweet_values(&self, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
-        let calls = tweet_ids
-            .iter()
-            .map(|tweet_id| {
-                (
-                    COLUMN.to_string(),
-                    OPERATION.to_string(),
-                    vec![encode(&(*tweet_id, ()))],
-                )
-            })
-            .collect();
+        self.fetch(COLUMN, tweet_ids).await
+    }
 
-        let result_batch = self.grpc_client.batch_call(calls, None).await;
+    pub(crate) async fn get_tweet_states(&self, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
+        self.fetch(STATE_COLUMN, tweet_ids).await
+    }
+
+    async fn fetch(&self, column: &str, tweet_ids: &[u64]) -> HashMap<u64, Result<Bytes>> {
+        let keys = tweet_ids
+            .iter()
+            .map(|tweet_id| (column, encode(&(*tweet_id, ()))));
+        let result_batch = strato::fetch_each(&self.grpc_client, keys, None).await;
         tweet_ids.iter().copied().zip(result_batch).collect()
     }
 }
 
-pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
-    match std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
-        .map_err(|_| anyhow!("MVal decoder panicked"))?
-    {
-        Ok(StratoResult::Ok { value: None, .. }) => Ok(None),
-        Ok(StratoResult::Ok {
-            value: Some(tweet), ..
-        }) => tweet
-            .project()
-            .map(Some)
-            .ok_or_else(|| anyhow!("tweet value without coreData")),
-        Ok(StratoResult::Err { code, message }) => {
-            Err(anyhow!("Strato error code {code}: {message}"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum TweetState {
+    Found,
+    NotFound,
+    Deleted,
+    BounceDeleted,
+}
+
+impl TweetState {
+    pub(crate) fn deletion(self) -> Option<Deletion> {
+        match self {
+            Self::Deleted => Some(Deletion::Deleted),
+            Self::BounceDeleted => Some(Deletion::BounceDeleted),
+            Self::Found | Self::NotFound => None,
         }
-        Err(e) => Err(anyhow!("MVal decode error: {e}")),
     }
+}
+
+struct StatusState(i32);
+
+impl StratoRead for StatusState {
+    fn read(proto: &mut MValProtocol<'_>) -> thrift::Result<Self> {
+        proto.read_i32().map(Self)
+    }
+}
+
+pub(crate) fn decode_tweet_state(bytes: &Bytes) -> Result<Option<TweetState>> {
+    let Some(StatusState(state)) = strato::row(strato_decode(bytes)?)? else {
+        return Ok(None);
+    };
+    Ok(Some(match state {
+        0 => TweetState::Found,
+        1 => TweetState::NotFound,
+        14 => TweetState::Deleted,
+        15 => TweetState::BounceDeleted,
+        other => bail!("unexpected StatusState {other}"),
+    }))
+}
+
+pub(crate) fn decode_tweet(bytes: &Bytes) -> Result<Option<TweetFeatures>> {
+    let result = std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
+        .map_err(|_| anyhow!("MVal decoder panicked"))?
+        .map_err(|e| anyhow!("MVal decode error: {e}"))?;
+    let Some(tweet) = strato::row(result)? else {
+        return Ok(None);
+    };
+    tweet
+        .project(bytes)
+        .map(Some)
+        .ok_or_else(|| anyhow!("tweet value without coreData"))
 }
 
 #[derive(Default)]
 struct Tweet {
     core_data: Option<CoreData>,
-    media: Vec<Media>,
+    media: MediaFeature,
     takedown_reasons: Vec<TakedownReason>,
     community_id: Option<NonZeroU64>,
     exclusive_tweet_control: Option<ExclusiveTweetControl>,
@@ -73,6 +112,7 @@ struct Tweet {
 
 #[derive(Default)]
 struct CoreData {
+    text: Range<usize>,
     nsfw_user: bool,
     nsfw_admin: bool,
     nullcast: bool,
@@ -92,9 +132,15 @@ struct MediaRestrictions {
 }
 
 impl Tweet {
-    fn project(self) -> Option<TweetFeatures> {
+    fn project(self, bytes: &Bytes) -> Option<TweetFeatures> {
         let core_data = self.core_data?;
+        let text = if core_data.text.end <= bytes.len() {
+            PostText::new(bytes.slice(core_data.text))
+        } else {
+            PostText::default()
+        };
         Some(TweetFeatures {
+            text,
             is_nullcast: core_data.nullcast,
             nsfw: NsfwFeature {
                 user: core_data.nsfw_user,
@@ -104,11 +150,11 @@ impl Tweet {
             media: MediaFeature {
                 has_media: self.has_media_refs || self.has_card_reference,
                 has_uploaded_media: self.has_media_keys,
-                ..media_feature(self.media)
+                ..self.media
             },
             community_id: self.community_id,
             trusted_friends_list_id: self.trusted_friends_list_id,
-            edit_control: self.edit_control,
+            latest_edit_tweet_id: self.edit_control.as_ref().and_then(latest_edit_tweet_id),
             exclusive_conversation_author_id: self
                 .exclusive_tweet_control
                 .map(|control| control.conversation_author_id),
@@ -119,18 +165,21 @@ impl Tweet {
     }
 }
 
-fn media_feature(entities: Vec<Media>) -> MediaFeature {
-    let mut feature = MediaFeature::default();
-    for restrictions in entities
-        .into_iter()
-        .filter(|e| e.has_media_key)
-        .filter_map(|e| e.restrictions)
-    {
-        feature.has_dmca_media |= restrictions.is_dmca;
-        feature.geo_allow_list.extend(restrictions.geo_allow_list);
-        feature.geo_deny_list.extend(restrictions.geo_deny_list);
-    }
-    feature
+fn latest_edit_tweet_id(control: &EditControl) -> Option<u64> {
+    let initial = match control {
+        EditControl::Initial(initial) => initial,
+        EditControl::Edit(edit) => edit.edit_control_initial.as_ref()?,
+    };
+    initial.edit_tweet_ids.last().copied()
+}
+
+fn fold_media(feature: &mut MediaFeature, entity: Media) {
+    let Some(restrictions) = entity.restrictions.filter(|_| entity.has_media_key) else {
+        return;
+    };
+    feature.has_dmca_media |= restrictions.is_dmca;
+    feature.geo_allow_list.extend(restrictions.geo_allow_list);
+    feature.geo_deny_list.extend(restrictions.geo_deny_list);
 }
 
 impl StratoRead for Tweet {
@@ -141,9 +190,9 @@ impl StratoRead for Tweet {
                 Some(2) => tweet.core_data = Some(read_core_data(proto)?),
                 Some(7) => {
                     let list = proto.read_list_begin()?;
-                    let mut media = Vec::with_capacity(usize::try_from(list.size).unwrap_or(0));
+                    let mut media = MediaFeature::default();
                     for _ in 0..list.size {
-                        media.push(read_media(proto)?);
+                        fold_media(&mut media, read_media(proto)?);
                     }
                     proto.read_list_end()?;
                     tweet.media = media;
@@ -189,6 +238,7 @@ fn read_core_data(proto: &mut MValProtocol<'_>) -> thrift::Result<CoreData> {
     let mut core_data = CoreData::default();
     read_fields(proto, |proto, field| {
         match field.id {
+            Some(2) => core_data.text = string_range(proto)?,
             Some(9) => core_data.nsfw_user = proto.read_bool()?,
             Some(10) => core_data.nsfw_admin = proto.read_bool()?,
             Some(11) => core_data.nullcast = proto.read_bool()?,
@@ -330,13 +380,13 @@ fn read_id_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::strato_answer::Thrift::{self, Bool, List, Str, Struct, I64};
-    use crate::clients::strato_answer::{found, no_row};
+    use crate::clients::strato::answer::Thrift::{self, Bool, List, Str, Struct, I64};
+    use crate::clients::strato::answer::{found, no_row};
     use crate::thrift_read::tests::assert_skips_like_thrift;
     use std::collections::BTreeSet;
     use thrift::protocol::TType;
     use thrift::OrderedFloat;
-    use xai_core_entities::entities::{EditControlInitial, MediaEntity};
+    use xai_core_entities::entities::{EditControlEdit, EditControlInitial, MediaEntity};
     use xai_x_thrift::media_common::{MediaCategory, MediaKey, OwnershipInfo};
     use xai_x_thrift::media_entity::ColorValue;
     use xai_x_thrift::media_information::{
@@ -364,10 +414,25 @@ mod tests {
         (172, Struct(vec![(1, Str(id.into()))]))
     }
 
+    #[test]
+    fn a_tweet_state_decodes_from_its_status_state_value() {
+        use TweetState::{BounceDeleted, Deleted, Found, NotFound};
+        for (value, state) in [
+            (0, Found),
+            (1, NotFound),
+            (14, Deleted),
+            (15, BounceDeleted),
+        ] {
+            let decoded = decode_tweet_state(&Bytes::from(found(Thrift::I32(value)))).unwrap();
+            assert_eq!(decoded, Some(state), "{value}");
+        }
+        assert_eq!(decode_tweet_state(&Bytes::from(no_row())).unwrap(), None);
+        let failed = 4;
+        assert!(decode_tweet_state(&Bytes::from(found(Thrift::I32(failed)))).is_err());
+    }
+
     fn encode_tweet(core_data: Vec<(i16, Thrift)>, rest: Vec<(i16, Thrift)>) -> Vec<u8> {
-        let core_data = [(1, I64(AUTHOR_ID)), (2, Str("tweet text".into()))]
-            .into_iter()
-            .chain(core_data);
+        let core_data = [(1, I64(AUTHOR_ID))].into_iter().chain(core_data);
         let tweet = [(1, I64(TWEET_ID)), (2, Struct(core_data.collect()))]
             .into_iter()
             .chain(rest);
@@ -419,7 +484,9 @@ mod tests {
     }
 
     fn decode_fixture(bytes: &[u8]) -> TweetFeatures {
-        decode_tweet(bytes).unwrap().unwrap()
+        decode_tweet(&Bytes::copy_from_slice(bytes))
+            .unwrap()
+            .unwrap()
     }
 
     fn media_id(tweet_id: i64, index: i64) -> i64 {
@@ -623,6 +690,7 @@ mod tests {
             ),
         ]));
         let features = TweetFeatures {
+            text: PostText::from(text),
             media: MediaFeature {
                 has_media: true,
                 has_uploaded_media: true,
@@ -633,12 +701,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
-            edit_control: Some(EditControl::Initial(EditControlInitial {
-                edit_tweet_ids: vec![tweet_id.cast_unsigned()],
-                editable_until_msecs: Some(editable_until_msecs),
-                edits_remaining: Some(5),
-                is_edit_eligible: Some(true),
-            })),
+            latest_edit_tweet_id: Some(tweet_id.cast_unsigned()),
             ..Default::default()
         };
         (bytes, features)
@@ -674,7 +737,12 @@ mod tests {
             (3, I64(4)),
         ]);
         let bytes = encode_tweet(
-            vec![(9, Bool(true)), (10, Bool(false)), (11, Bool(true))],
+            vec![
+                (2, Str("tweet text".into())),
+                (9, Bool(true)),
+                (10, Bool(false)),
+                (11, Bool(true)),
+            ],
             vec![
                 (7, List(TType::Struct, vec![media])),
                 (
@@ -705,15 +773,11 @@ mod tests {
             has_dmca_media: true,
             ..Default::default()
         };
-        let edit_control = Some(EditControl::Initial(EditControlInitial {
-            edit_tweet_ids: vec![TWEET_ID as u64],
-            edits_remaining: Some(4),
-            ..Default::default()
-        }));
 
         assert_eq!(
             decode_fixture(&bytes),
             TweetFeatures {
+                text: PostText::from("tweet text"),
                 media,
                 takedown_reasons: vec![TakedownReason::Dmca],
                 nsfw: NsfwFeature {
@@ -723,7 +787,7 @@ mod tests {
                 is_nullcast: true,
                 community_id: NonZeroU64::new(500),
                 trusted_friends_list_id: Some(TRUSTED_FRIENDS_LIST_ID as u64),
-                edit_control,
+                latest_edit_tweet_id: Some(TWEET_ID as u64),
                 exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
                 article_id: NonZeroU64::new(ARTICLE_ID as u64),
                 narrowcast_place_id: Some(0x7f00_0000_0000_0001),
@@ -996,16 +1060,25 @@ mod tests {
             .unwrap()
             + 4;
 
-        let error = decode_tweet(&bytes[..end]).unwrap_err();
+        let error = decode_tweet(&Bytes::copy_from_slice(&bytes[..end])).unwrap_err();
         assert_eq!(error.to_string(), "MVal decoder panicked");
     }
 
     #[test]
+    fn a_text_that_is_not_utf8_decodes_and_reads_lossily() {
+        let mut bytes = encode_tweet(vec![(2, Str("a spoiler ~~".into()))], vec![]);
+        let at = bytes.windows(2).position(|pair| pair == b"~~").unwrap();
+        bytes[at..at + 2].copy_from_slice(&[0xc3, 0x28]);
+
+        assert_eq!(decode_fixture(&bytes).text.lossy(), "a spoiler \u{fffd}(");
+    }
+
+    #[test]
     fn an_absent_value_is_missing_and_a_value_without_core_data_is_an_error() {
-        assert!(decode_tweet(&no_row()).unwrap().is_none());
+        assert!(decode_tweet(&Bytes::from(no_row())).unwrap().is_none());
 
         let without_core_data = found(Struct(vec![(1, I64(TWEET_ID))]));
-        let error = decode_tweet(&without_core_data).unwrap_err();
+        let error = decode_tweet(&Bytes::from(without_core_data)).unwrap_err();
         assert_eq!(error.to_string(), "tweet value without coreData");
     }
 
@@ -1094,10 +1167,44 @@ mod tests {
         ];
         for (name, latest_edit, expected) in rows {
             let mut features = decode_fixture(&recorded(name));
-            assert_eq!(features.latest_edit_tweet_id(), Some(latest_edit), "{name}");
-            features.edit_control = None;
+            assert_eq!(features.latest_edit_tweet_id, Some(latest_edit), "{name}");
+            features.latest_edit_tweet_id = None;
+            assert!(
+                !std::mem::take(&mut features.text).lossy().is_empty(),
+                "{name}"
+            );
             assert_eq!(features, expected, "{name}");
         }
-        assert_eq!(decode_tweet(&recorded("deleted")).unwrap(), None);
+        assert_eq!(
+            decode_tweet(&Bytes::from(recorded("deleted"))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_latest_edit_is_the_last_id_of_the_initial_edit_chain() {
+        let initial = |ids: Vec<u64>| EditControlInitial {
+            edit_tweet_ids: ids,
+            ..Default::default()
+        };
+        for (control, latest) in [
+            (EditControl::Initial(initial(vec![20])), Some(20)),
+            (
+                EditControl::Edit(EditControlEdit {
+                    initial_tweet_id: 10,
+                    edit_control_initial: Some(initial(vec![10, 20, 30])),
+                }),
+                Some(30),
+            ),
+            (
+                EditControl::Edit(EditControlEdit {
+                    initial_tweet_id: 10,
+                    edit_control_initial: None,
+                }),
+                None,
+            ),
+        ] {
+            assert_eq!(latest_edit_tweet_id(&control), latest, "{control:?}");
+        }
     }
 }

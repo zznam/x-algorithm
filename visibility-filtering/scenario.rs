@@ -2,18 +2,16 @@ use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};
 use crate::hydration::fallback_cache::FallbackCaches;
 use crate::hydration::sources::Sources;
 use crate::hydration::{HydratedTweet, Hydration, HydrationPlan, Hydrators, Unresolved};
-use crate::metrics::{RetweetSources, Rpc};
+use crate::metrics::{Endpoint, Metrics, RequestLevel, RequestMetrics, RetweetSources};
 use crate::models::{
     ClientCapability, Evaluation, PlacedCandidate, PostCandidate, RawCandidate, ReactionContext,
-    SafetyLabelType, TweetFeatures, TweetId, ViewerFeatures,
+    RequestFacts, RequestViewer, RetweetMerge, SafetyLabelType, TweetFeatures, TweetId,
+    ViewerFeatures,
 };
-use crate::params::limited_actions_copy::tests::BUNDLE;
-use crate::params::limited_actions_copy::LimitedActionsCopy;
 use crate::params::ClientSwitches;
-use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator};
-use crate::quote::QuotePassMode;
-use crate::retweet::hydrate_and_evaluate;
-use crate::rules::{RuleEngine, SafetyLevel};
+use crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator, PostObserver};
+use crate::quote::{QuotePassMode, QuotePassRunner};
+use crate::rules::{NoTrace, RuleEngine, SafetyLevel};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tonic::{Request, Status};
@@ -72,8 +70,9 @@ pub(crate) struct Scenario<S> {
     viewer_id: Option<u64>,
     country_code: Option<String>,
     client_capability: ClientCapability,
-    rpc: Rpc,
+    retweet_merge: RetweetMerge,
     fallback_caches: Arc<FallbackCaches>,
+    metrics: Metrics,
 }
 
 pub(crate) struct InRequestOrder {
@@ -107,8 +106,9 @@ impl<S: Sources + 'static> Scenario<S> {
             viewer_id: None,
             country_code: None,
             client_capability: ClientCapability::default(),
-            rpc: Rpc::FilterTweets,
+            retweet_merge: RetweetMerge::Unmerged,
             fallback_caches: Arc::default(),
+            metrics: Metrics::none(),
         }
     }
 
@@ -127,13 +127,18 @@ impl<S: Sources + 'static> Scenario<S> {
         self
     }
 
-    pub(crate) fn rpc(mut self, rpc: Rpc) -> Self {
-        self.rpc = rpc;
+    pub(crate) fn retweet_merge(mut self, retweet_merge: RetweetMerge) -> Self {
+        self.retweet_merge = retweet_merge;
         self
     }
 
     pub(crate) fn fallback_caches(mut self, fallback_caches: FallbackCaches) -> Self {
         self.fallback_caches = Arc::new(fallback_caches);
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -151,8 +156,10 @@ impl<S: Sources + 'static> Scenario<S> {
         plan: &HydrationPlan,
         raw: &[RawCandidate],
     ) -> InRequestOrder {
-        let mut request = self.request(raw);
-        let request = request.hydration_request(Some(self.rpc), &self.fallback_caches);
+        let metrics = self.request_metrics();
+        let request = self
+            .request(raw)
+            .hydration_request(&self.fallback_caches, &metrics);
         let hydration = plan.hydrate(&*self.sources, request).await;
         InRequestOrder::of(&hydration, raw)
     }
@@ -166,28 +173,49 @@ impl<S: Sources + 'static> Scenario<S> {
         rule_engine: RuleEngine,
         raw: &[RawCandidate],
     ) -> Evaluated {
+        self.evaluate_observed(rule_engine, raw, &mut NoTrace).await
+    }
+
+    pub(crate) async fn evaluate_observed<O: PostObserver>(
+        &self,
+        rule_engine: RuleEngine,
+        raw: &[RawCandidate],
+        observer: &mut O,
+    ) -> Evaluated {
         let sources = Arc::clone(&self.sources) as Arc<dyn Sources>;
         let caches = Arc::clone(&self.fallback_caches);
-        let post_evaluator = PostEvaluator::new(sources, rule_engine, caches);
-        let (hydrated, outcomes) = hydrate_and_evaluate(&post_evaluator, self.request(raw)).await;
+        let post_evaluator = PostEvaluator::new(sources, rule_engine, caches, self.metrics.clone());
+        let (hydrated, outcomes) = post_evaluator
+            .run(self.request(raw), &self.request_metrics(), observer)
+            .await;
         Evaluated {
             outcomes,
             retweet_sources: hydrated.retweet_sources(),
         }
     }
 
+    fn request_metrics(&self) -> RequestMetrics {
+        let endpoint = match self.retweet_merge {
+            RetweetMerge::Merged => Endpoint::EvaluateTweets,
+            RetweetMerge::Unmerged => Endpoint::FilterTweets,
+        };
+        self.metrics
+            .request(endpoint, RequestLevel::Named(self.level))
+    }
+
     fn request(&self, raw: &[RawCandidate]) -> PostBatch {
         PostBatch {
-            viewer_id: self.viewer_id,
-            country_code: self.country_code.clone(),
-            client_capability: self.client_capability,
+            facts: RequestFacts::new(
+                RequestViewer::new(self.viewer_id, self.country_code.clone()),
+                self.client_capability,
+            ),
             safety_level: self.level,
             candidates: raw
                 .iter()
                 .copied()
                 .map(PlacedCandidate::standalone)
                 .collect(),
-            rpc: self.rpc,
+            retweet_merge: self.retweet_merge,
         }
     }
 }
@@ -199,37 +227,37 @@ pub(crate) struct Wire {
 
 impl Wire {
     pub(crate) fn new(sources: Arc<dyn Sources>) -> Self {
-        Self::serving(sources, FallbackCaches::default(), None, QuotePassMode::Off)
+        Self::serving(
+            sources,
+            FallbackCaches::default(),
+            None,
+            QuotePassRunner::new(QuotePassMode::Off),
+            Metrics::none(),
+        )
     }
 
     pub(crate) fn serving(
         sources: Arc<dyn Sources>,
         fallback_caches: FallbackCaches,
         comparator: Option<Box<dyn EntryComparator>>,
-        quote_pass: QuotePassMode,
+        quote_pass: QuotePassRunner,
+        metrics: Metrics,
     ) -> Self {
         let post_evaluator = Arc::new(PostEvaluator::new(
             sources,
             RuleEngine::for_tests(),
             Arc::new(fallback_caches),
+            metrics,
         ));
         let endpoint = EvaluateTweetsEndpoint::new(
             Arc::clone(&post_evaluator),
             ClientSwitches::for_tests(),
-            LimitedActionsCopy::from_json(BUNDLE),
             comparator,
             quote_pass,
         );
         Self {
             post_evaluator,
             endpoint,
-        }
-    }
-
-    pub(crate) fn quote_pass_permits(self, permits: usize) -> Self {
-        Self {
-            endpoint: self.endpoint.with_quote_pass_permits(permits),
-            ..self
         }
     }
 

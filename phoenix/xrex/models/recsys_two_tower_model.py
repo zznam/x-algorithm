@@ -21,7 +21,7 @@ from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
 from xrex.cuda.top_k_by_key import top_k_by_key
 from xrex.data.cold_pool_filter import DEFAULT_COLD_START_MAX_AGE_SECONDS
-from xrex.data.recsys.constants import action_type_map
+from xrex.data.recsys.constants import VIDEO_CREATIVE_BIT, LineItemObjective, action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType
 from xrex.data.recsys.safety_filter import (
     SafetyFilterMode,
@@ -72,6 +72,60 @@ QUERY_HEAD_RECENCY_SCALE_TOKENS = 16.0
 EPS = 1e-12
 INF = 1e12
 
+BLEND_HEAD_ORDER: tuple[str, ...] = ("ld", "tweet_click")
+CREATIVE_FORMATS = ("video", "nonvideo")
+
+
+def blend_heads(head_names: typing.Sequence[str]) -> list[str]:
+    return [name for name in BLEND_HEAD_ORDER if name in head_names]
+
+
+def objective_slot_multipliers(
+    spec: str, serving_weights: typing.Sequence[float]
+) -> dict[tuple[int, str | None], npt.NDArray[np.float64]]:
+    base = np.asarray(serving_weights, dtype=np.float64)
+    multipliers: dict[tuple[int, str | None], npt.NDArray[np.float64]] = {}
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        name, _, values = entry.partition(":")
+        obj_name, _, fmt = name.strip().partition("@")
+        if obj_name not in LineItemObjective.__members__ or fmt not in ("", *CREATIVE_FORMATS):
+            raise ValueError(f"objective_head_weights entry {entry!r} is not OBJECTIVE[@FORMAT]:w")
+        w = np.array([float(v) for v in values.split("/")])
+        if w.shape != base.shape or not np.all(w >= 0) or np.any((base == 0) & (w > 0)):
+            raise ValueError(
+                f"objective_head_weights {name}: need {len(base)} weights >= 0, zero where the "
+                f"serving weights {tuple(base)} are zero"
+            )
+        key = (LineItemObjective[obj_name].value, fmt or None)
+        if key in multipliers:
+            raise ValueError(f"objective_head_weights lists {name} twice")
+        multipliers[key] = np.divide(w, base, out=np.ones_like(w), where=base != 0)
+    return multipliers
+
+
+def objective_slot_scales(
+    objective_bits: npt.ArrayLike,
+    multipliers: typing.Mapping[tuple[int, str | None], npt.ArrayLike],
+    num_slots: int,
+) -> npt.NDArray[np.float32]:
+    raw = np.asarray(objective_bits, dtype=np.int64).reshape(-1)
+    is_video = (raw & VIDEO_CREATIVE_BIT) != 0
+    bits = raw & ~VIDEO_CREATIVE_BIT
+    scales = np.ones((len(bits), num_slots), dtype=np.float32)
+    for (objective, fmt), m in sorted(multipliers.items(), key=lambda kv: kv[0][1] is not None):
+        rows = bits == (1 << objective)
+        if fmt is not None:
+            rows &= is_video == (fmt == "video")
+        scales[rows] = m
+    return scales
+
+
+def scale_post_table_slots(table: jax.Array, slot_scales: jax.Array) -> jax.Array:
+    rows, width = table.shape
+    num_slots = slot_scales.shape[1]
+    slots = table.reshape(rows, num_slots, width // num_slots).astype(jnp.float32)
+    return (slots * slot_scales[:, :, None]).reshape(rows, width).astype(table.dtype)
+
 
 def user_tower_segment_ids(
     batch: int,
@@ -121,6 +175,50 @@ def score_over_slots(
         total = score if total is None else total + score
     assert total is not None, "every slot weight is zero"
     return total.astype(jnp.bfloat16)
+
+
+INT8_GEMM_FAST_MIN_ROWS = 32
+
+
+def int8_dot_padded(users: jax.Array, posts: jax.Array, pad_rows: int) -> jax.Array:
+    b = users.shape[0]
+    if b < INT8_GEMM_FAST_MIN_ROWS <= pad_rows:
+        users = jnp.zeros((pad_rows, users.shape[1]), users.dtype).at[:b].set(users)
+    acc = jax.lax.dot_general(
+        users, posts, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
+    )
+    return acc[:b]
+
+
+def strided_dataset_top_k(
+    scores: jax.Array,
+    dataset_ranges: jax.Array,
+    dataset_capacities: tuple[int, ...],
+    top_k: int,
+    axis_name: str,
+    num_shards: int,
+    shard_top_k: typing.Callable[[jax.Array, int], tuple[jax.Array, jax.Array]],
+) -> tuple[tuple[jax.Array, jax.Array], ...]:
+    rows_local = scores.shape[1]
+    shard = jax.lax.axis_index(axis_name)
+    results = []
+    for d, capacity in enumerate(dataset_capacities):
+        width = min(-(-capacity // num_shards), rows_local)
+        start = (dataset_ranges[d, 0] - shard + num_shards - 1) // num_shards
+        end = (dataset_ranges[d, 1] - shard + num_shards - 1) // num_shards
+        window_start = jnp.minimum(start, rows_local - width)
+        window = jax.lax.dynamic_slice_in_dim(scores, window_start, width, axis=1)
+        row = window_start + jnp.arange(width, dtype=jnp.int32)
+        masked = jnp.where(
+            ((row >= start) & (row < end))[None, :], window, jnp.finfo(scores.dtype).min
+        )
+        shard_scores, shard_rows = shard_top_k(masked, top_k)
+        shard_rows = shard_rows + window_start + shard * rows_local
+        all_scores = jax.lax.all_gather(shard_scores, axis_name, axis=1, tiled=True)
+        all_rows = jax.lax.all_gather(shard_rows, axis_name, axis=1, tiled=True)
+        merged, picked = jax.lax.top_k(all_scores.astype(jnp.float32), min(top_k, capacity))
+        results.append((jnp.take_along_axis(all_rows, picked, axis=1), merged))
+    return tuple(results)
 
 
 class RecsysCandidateTower(hk.Module):
@@ -978,6 +1076,13 @@ def positive_log_denominator(
     return jnp.logaddexp(numerator_logits, shared)
 
 
+def _same_negative_group(
+    first_row: jax.Array, num_users: int, pool_rows: int, group_rows: int
+) -> jax.Array:
+    own_group = (first_row + jnp.arange(num_users)) // group_rows
+    return own_group[:, None] == (jnp.arange(pool_rows) // group_rows)[None, :]
+
+
 def retrieval_loss(
     batch: RecsysFeaturesBatch,
     user_representation: jax.Array,
@@ -1004,10 +1109,18 @@ def retrieval_loss(
     candidate_tables: tuple[jax.Array, jax.Array | None] | None = None,
     mask_in_batch_false_negatives: bool = False,
     loss_normalizers: dict[str, jax.Array] | None = None,
+    negative_pool_rows: int = 0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     _, L, _ = candidate_representation.shape
     N = num_global_negatives_per_example
     C = candidate_seq_len
+    if negative_pool_rows < 0:
+        raise ValueError(f"negative_pool_rows ({negative_pool_rows}) must not be negative")
+    if negative_pool_rows > 0 and apply_u2u_and_i2i_loss:
+        raise ValueError(
+            "negative_pool_rows groups the user x candidate negatives only; the u2u and i2i "
+            "terms would still use every row on the device. Turn apply_u2u_and_i2i_loss off."
+        )
     assert L == C + N, (
         f"candidate_representation.shape[1] ({candidate_representation.shape[1]}) must be candidate_seq_len ({C}) + num_global_negatives_per_example ({N})"
     )
@@ -1031,6 +1144,16 @@ def retrieval_loss(
         scorer,
     ) -> tuple[jax.Array, jax.Array]:
         local_P = local_candidate.shape[0]
+        same_group = None
+        if negative_pool_rows > 0:
+            if local_P % negative_pool_rows != 0:
+                raise ValueError(
+                    f"a device's {local_P} pool rows do not divide into groups of "
+                    f"negative_pool_rows ({negative_pool_rows})"
+                )
+            same_group = _same_negative_group(
+                pool_offset[0], local_user.shape[0], local_P, negative_pool_rows
+            )
 
         def slots(x, index):
             return None if x is None else x[index].reshape((-1, *x.shape[2:]))
@@ -1050,6 +1173,8 @@ def retrieval_loss(
                 inbatch_scores = local_user @ inbatch_cand.T
 
             inbatch_pad = padding_mask[:, :C].reshape((1, local_P * C))
+            if same_group is not None:
+                inbatch_pad = inbatch_pad & jnp.repeat(same_group, C, axis=1)
             inbatch_scores = jnp.where(inbatch_pad, inbatch_scores, -INF)
         else:
             rows = pool_offset[0] + jnp.arange(local_user.shape[0])
@@ -1084,6 +1209,8 @@ def retrieval_loss(
             global_neg_scores = local_user @ global_cand.T
 
         global_pad = padding_mask[:, C:].reshape((1, local_P * N))
+        if same_group is not None:
+            global_pad = global_pad & jnp.repeat(same_group, N, axis=1)
         global_neg_scores = jnp.where(global_pad, global_neg_scores, -INF)
 
         return inbatch_scores, global_neg_scores
@@ -1493,6 +1620,7 @@ def compute_retrieval_loss(
     mol_fused_gate: bool = False,
     candidate_tables: tuple[jax.Array, jax.Array | None] | None = None,
     mask_in_batch_false_negatives: bool = False,
+    negative_pool_rows: int = 0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     (pool,) = retrieval_pools(
         [batch["candidate_seq"]],
@@ -1530,6 +1658,7 @@ def compute_retrieval_loss(
         mol_fused_gate=mol_fused_gate,
         candidate_tables=candidate_tables,
         mask_in_batch_false_negatives=mask_in_batch_false_negatives,
+        negative_pool_rows=negative_pool_rows,
     )
     metrics = retrieval_metrics(
         batch,
@@ -2240,7 +2369,9 @@ class RecsysTwoTowerModel(hk.Module):
         post_scales: jax.Array | None = None,
         dataset_capacities: tuple[int, ...] | None = None,
         mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
-        query_head_weights: tuple[float, float] | None = None,
+        query_head_weights: tuple[float, ...] | None = None,
+        int8_score_pad_rows: int = 0,
+        shard_local_top_k: bool = False,
     ) -> tuple[tuple[jax.Array, jax.Array], ...]:
         saxis = "expert"
 
@@ -2292,9 +2423,11 @@ class RecsysTwoTowerModel(hk.Module):
 
         slot_weights = (
             (1.0,)
-            if self.config.ld_head is None
+            if self.config.num_table_slots == 1
             else (query_head_weights or self.config.query_head_weights)
         )
+        if len(slot_weights) != self.config.num_table_slots:
+            raise ValueError(f"{slot_weights=} needs {self.config.num_table_slots} slot weights")
 
         def _over_slots(score_slot, posts: jax.Array, side, full_rows: bool = False) -> jax.Array:
             return score_over_slots(score_slot, posts, side, slot_weights, full_rows)
@@ -2384,6 +2517,21 @@ class RecsysTwoTowerModel(hk.Module):
 
         if post_scales is not None:
 
+            def _int8_dot_scores(
+                post_q8: jax.Array, user_embedding: jax.Array, scales: jax.Array
+            ) -> jax.Array:
+                uf = user_embedding.astype(jnp.float32)
+                us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
+                uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
+
+                def _int8_dot(p, _):
+                    acc = int8_dot_padded(uq, p, int8_score_pad_rows)
+                    return (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
+                        jnp.bfloat16
+                    )
+
+                return _over_slots(_int8_dot, post_q8, None)
+
             @shard_map_unless_manual(
                 mesh=mesh,
                 in_specs=(P(saxis), P(), P(saxis), P(), side_spec, side_spec),
@@ -2420,21 +2568,42 @@ class RecsysTwoTowerModel(hk.Module):
                     return jax.lax.all_to_all(
                         scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
                     )
-                uf = user_embedding.astype(jnp.float32)
-                us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
-                uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
-
-                def _int8_dot(p, _):
-                    acc = jax.lax.dot_general(
-                        uq, p, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
-                    )
-                    return (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
-                        jnp.bfloat16
-                    )
-
-                scores = _over_slots(_int8_dot, post_q8, None)
+                scores = _int8_dot_scores(post_q8, user_embedding, scales)
                 return jax.lax.all_to_all(
                     scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
+                )
+
+            if shard_local_top_k:
+                assert (
+                    not use_mol
+                    and dataset_capacities is not None
+                    and isinstance(dataset_ranges, jax.Array)
+                    and len(dataset_capacities) == len(target_dataset_types)
+                    and eligible_mask is None
+                    and not use_topic_filter
+                    and not skip_dataset_mask
+                ), "shard_local_top_k needs dot scoring, dataset_capacities and no per-post filter"
+
+                @shard_map_unless_manual(
+                    mesh=mesh,
+                    in_specs=(P(saxis), P(), P(saxis), P()),
+                    out_specs=tuple((P(), P()) for _ in dataset_capacities),
+                    check_vma=False,
+                )
+                def shard_top_k_int8(post_q8, user_embedding, scales, ranges):
+                    scores = _int8_dot_scores(post_q8, _trim_eval_users(user_embedding), scales)
+                    return strided_dataset_top_k(
+                        scores,
+                        ranges,
+                        dataset_capacities,
+                        top_k,
+                        saxis,
+                        mesh.shape[saxis],
+                        local_top_k,
+                    )
+
+                return shard_top_k_int8(
+                    post_embeddings, user_representation, post_scales, dataset_ranges
                 )
 
             all_scores = compute_top_k_int8(
@@ -2445,6 +2614,7 @@ class RecsysTwoTowerModel(hk.Module):
                 *side_args,
             )
         else:
+            assert not shard_local_top_k, "shard_local_top_k needs the int8 post table"
             all_scores = compute_top_k(
                 post_embeddings, user_representation, mol_scorer if use_mol else (), *side_args
             )
@@ -2735,6 +2905,7 @@ class RecsysTwoTowerModel(hk.Module):
                 candidate_tables=candidate_pool[h].mol_tables,
                 mask_in_batch_false_negatives=self.config.mask_in_batch_false_negatives,
                 loss_normalizers=None if loss_normalizers is None else loss_normalizers[str(h)],
+                negative_pool_rows=self.config.negative_pool_rows if is_training else 0,
             )
             total_loss = total_loss + head_loss
             prefix = f"{head_names[h]}/" if num_heads > 1 else ""
@@ -2835,6 +3006,7 @@ class RecsysTwoTowerModelConfig(Config):
     mol_serving_kernel: bool = False
     mol_side_table_in_checkpoint: bool = False
     mask_in_batch_false_negatives: bool = False
+    negative_pool_rows: int = 0
 
     positive_actions: list[int] = field(
         default_factory=lambda: [
@@ -2904,24 +3076,42 @@ class RecsysTwoTowerModelConfig(Config):
         default_factory=lambda: RecsysTwoTowerModelConfig.get_soft_negative_actions()
     )
 
+    tweet_click_positive_actions: list[int] = field(
+        default_factory=lambda: [recsys_pb2.ActionName.CLIENT_TWEET_CLICK]
+    )
+
     head_dataset_mapping: dict[str, int] | None = None
 
     head_names: list[str] = field(default_factory=lambda: ["home"])
 
     w_fav: float = 1.0
     w_ld: float = 0.0
+    w_tweet_click: float = 0.0
+
+    objective_head_weights: str = ""
 
     @property
-    def ld_head(self) -> int | None:
-        return self.head_names.index("ld") if "ld" in self.head_names else None
+    def blend_heads(self) -> list[str]:
+        return blend_heads(self.head_names)
 
     @property
     def num_table_slots(self) -> int:
-        return 1 + (self.ld_head is not None)
+        return 1 + len(self.blend_heads)
 
     @property
-    def query_head_weights(self) -> tuple[float, float]:
-        return (self.w_fav, self.w_ld)
+    def query_head_weights(self) -> tuple[float, ...]:
+        weights = {"ld": self.w_ld, "tweet_click": self.w_tweet_click}
+        return (self.w_fav, *(weights[name] for name in self.blend_heads))
+
+    @property
+    def serving_slot_weights(self) -> tuple[float, ...]:
+        return (1.0,) if self.num_table_slots == 1 else self.query_head_weights
+
+    def objective_slot_scales(self, objective_bits: npt.ArrayLike) -> npt.NDArray[np.float32]:
+        multipliers = objective_slot_multipliers(
+            self.objective_head_weights, self.serving_slot_weights
+        )
+        return objective_slot_scales(objective_bits, multipliers, self.num_table_slots)
 
     @property
     def mol_side_table_width(self) -> int:
@@ -2962,6 +3152,11 @@ class RecsysTwoTowerModelConfig(Config):
                 self.ld_positive_actions,
                 self.ld_hard_negative_actions,
                 self.ld_soft_negative_actions,
+            ),
+            "tweet_click": (
+                self.tweet_click_positive_actions,
+                self.hard_negative_actions,
+                self.soft_negative_actions,
             ),
         }
         return [actions[name] for name in self.head_names]
@@ -3044,13 +3239,17 @@ class RecsysTwoTowerModelConfig(Config):
                 f"head_names {self.head_names} must name each of the "
                 f"{self.candidate_tower_config.num_candidate_heads} candidate heads"
             )
-        if self.ld_head == 0:
-            raise ValueError("'ld' must not be the first head; head 0 fills slot 0 of HOME rows")
-        if self.ld_head is not None and self.ld_head in (self.head_dataset_mapping or {}).values():
-            raise ValueError(
-                f"ld_head={self.ld_head} fills the second table slot; it must not own a dataset "
-                "in head_dataset_mapping"
-            )
+        if self.objective_head_weights:
+            if self.mol_item_components > 0:
+                raise ValueError("objective_head_weights needs linear (non-MoL) scoring")
+            objective_slot_multipliers(self.objective_head_weights, self.serving_slot_weights)
+        dataset_heads = set((self.head_dataset_mapping or {}).values())
+        for name in self.blend_heads:
+            head = self.head_names.index(name)
+            if head == 0 or head in dataset_heads:
+                raise ValueError(
+                    f"{name!r} fills its own table slot; it cannot be head 0 or own a dataset"
+                )
 
         user_tower = self.user_tower_config.make(sharding_context)
 

@@ -68,7 +68,6 @@ use crate::filters::age_filter::AgeFilter;
 use crate::filters::ancestor_video_filter::AncestorVideoFilter;
 use crate::filters::ancillary_vf_filter::AncillaryVFFilter;
 use crate::filters::author_socialgraph_filter::AuthorSocialgraphFilter;
-use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
 use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
@@ -108,13 +107,18 @@ use crate::query_hydrators::ip_query_hydrator::IpQueryHydrator;
 use crate::query_hydrators::muted_user_ids_query_hydrator::MutedUserIdsQueryHydrator;
 use crate::query_hydrators::mutual_follow_query_hydrator::MutualFollowQueryHydrator;
 use crate::query_hydrators::recent_search_queries_query_hydrator::RecentSearchQueriesQueryHydrator;
+use crate::query_hydrators::recent_views_query_hydrator::RecentViewsQueryHydrator;
 use crate::query_hydrators::retrieval_sequence_query_hydrator::RetrievalSequenceQueryHydrator;
 use crate::query_hydrators::scoring_sequence_query_hydrator::ScoringSequenceQueryHydrator;
 use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserIdsQueryHydrator;
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
+use crate::query_hydrators::video_carousel_ctr_model_query_hydrator::VideoCarouselCtrModelQueryHydrator;
+use crate::query_hydrators::video_carousel_seen_query_hydrator::VideoCarouselSeenQueryHydrator;
 use crate::scorers::immersive_video_scorer::ImmersiveVideoScorer;
+use crate::scorers::page_decode_rerank_scorer::PageDecodeRerankScorer;
+use crate::scorers::page_rl_exploration_scorer::PageRlExplorationScorer;
 use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::vm_ranker::VMRanker;
 use crate::selectors::TopKScoreSelector;
@@ -129,11 +133,13 @@ use crate::side_effects::response_diversity_stats_side_effect::ResponseDiversity
 use crate::side_effects::retrieval_candidates_kafka_side_effect::RetrievalCandidatesKafkaSideEffect;
 use crate::side_effects::scored_stats_side_effect::ScoredStatsSideEffect;
 use crate::side_effects::serendipity_stats_side_effect::SerendipityStatsSideEffect;
+use crate::side_effects::teacher_score_side_effect::TeacherScoreSideEffect;
 use crate::sources::cached_posts_source::CachedPostsSource;
 use crate::sources::phoenix_moe_source::PhoenixMOESource;
 use crate::sources::phoenix_source::PhoenixSource;
 use crate::sources::phoenix_topics_source::PhoenixTopicsSource;
 use crate::sources::popular_posts_source::PopularPostsSource;
+use crate::sources::popular_video_source::PopularVideoSource;
 use crate::sources::sid_source::SidSource;
 use crate::sources::simclusters_source::SimclustersSource;
 use crate::sources::thunder_source::ThunderSource;
@@ -211,7 +217,7 @@ use xai_candidate_pipeline::side_effect::SideEffect;
 use xai_candidate_pipeline::source::Source;
 use xai_feature_switches::FeatureSwitches;
 use xai_geo_ip::GeoIpLocationClient;
-use xai_redis_client::{XdsRedisClient, XdsRedisConfig};
+use xai_redis_client::{NoopRedisClient, XdsRedisClient, XdsRedisConfig};
 use xai_visibility_filtering::tweet_safety_label::{
     MockTweetSafetyLabelClient, TweetSafetyLabelClient,
 };
@@ -256,6 +262,7 @@ impl PhoenixCandidatePipeline {
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
         phoenix_request_cache_redis_atla_client: Arc<dyn RedisClient + Send + Sync>,
         phoenix_request_cache_redis_pdxa_client: Arc<dyn RedisClient + Send + Sync>,
+        teacher_cache_redis_client: Arc<dyn RedisClient + Send + Sync>,
         impression_bloom_filter_client: Arc<dyn ImpressionBloomFilterClient>,
         ip_client: Arc<GeoIpLocationClient>,
         user_demographics_client: Arc<dyn UserDemographicsClient>,
@@ -277,6 +284,7 @@ impl PhoenixCandidatePipeline {
         popular_posts: Arc<PopularPostsCache>,
         author_brand_safety_client: Arc<dyn AuthorBrandSafetyClient>,
         post_v8_search_embedding_client: Arc<dyn PostV8SearchEmbeddingClient>,
+        video_carousel_seen_redis_client: Arc<dyn RedisClient + Send + Sync>,
     ) -> PhoenixCandidatePipeline {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ScoringSequenceQueryHydrator::new(
@@ -288,6 +296,10 @@ impl PhoenixCandidatePipeline {
             Box::new(RetrievalSequenceQueryHydrator::new(
                 user_action_aggregation_client.clone(),
             )),
+            Box::new(RecentViewsQueryHydrator {
+                user_action_aggregation_client: user_action_aggregation_client.clone(),
+                strato_client: strato_client.clone(),
+            }),
             Box::new(BlockedUserIdsQueryHydrator {
                 socialgraph_client: socialgraph_client.clone(),
             }),
@@ -318,6 +330,9 @@ impl PhoenixCandidatePipeline {
             Box::new(UserInstalledAppsQueryHydrator::new(
                 user_installed_apps_client,
             )),
+            Box::new(VideoCarouselCtrModelQueryHydrator::new(
+                vm_ranker_client.clone(),
+            )),
             Box::new(RecentSearchQueriesQueryHydrator::new(
                 recent_search_queries_client,
             )),
@@ -331,6 +346,9 @@ impl PhoenixCandidatePipeline {
                 client: impression_bloom_filter_client,
             }),
             Box::new(IpQueryHydrator { client: ip_client }),
+            Box::new(VideoCarouselSeenQueryHydrator {
+                redis_client: video_carousel_seen_redis_client,
+            }),
             Box::new(UserInferredGenderQueryHydrator::new(
                 user_inferred_gender_store_client,
                 user_inferred_gender_grpc_client,
@@ -348,6 +366,9 @@ impl PhoenixCandidatePipeline {
             phoenix_retrieval_client: phoenix_retrieval_client.clone(),
         });
         let phoenix_moe_source = Box::new(PhoenixMOESource {
+            phoenix_retrieval_client: phoenix_retrieval_client.clone(),
+        });
+        let popular_video_source = Box::new(PopularVideoSource {
             phoenix_retrieval_client,
         });
         let popular_posts_source = Box::new(PopularPostsSource { popular_posts });
@@ -375,19 +396,12 @@ impl PhoenixCandidatePipeline {
             phoenix_source,
             phoenix_topics_source,
             phoenix_moe_source,
+            popular_video_source,
             sid_source,
             cached_posts_source,
         ];
 
         let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![
-            Box::new(InNetworkCandidateHydrator),
-            Box::new(BidirectionalFollowHydrator {
-                socialgraph_client: socialgraph_client.clone(),
-            }),
-            Box::new(core_data_hydrator),
-            Box::new(PhoenixReplyAncestorsHydrator {
-                tes_client: tes_client.clone(),
-            }),
             Box::new(
                 QuoteHydrator::new(
                     tes_client.clone(),
@@ -396,20 +410,26 @@ impl PhoenixCandidatePipeline {
                 )
                 .await,
             ),
-            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
-            Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
-            Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
-            Box::new(BlockedByHydrator::new(socialgraph_client).await),
-            Box::new(FilteredTopicsHydrator {
-                strato_client: strato_client.clone(),
+            Box::new(core_data_hydrator),
+            Box::new(PhoenixReplyAncestorsHydrator {
+                tes_client: tes_client.clone(),
             }),
+            Box::new(BidirectionalFollowHydrator {
+                socialgraph_client: socialgraph_client.clone(),
+            }),
+            Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
+            Box::new(BlockedByHydrator::new(socialgraph_client).await),
+            Box::new(FilteredTopicsHydrator::new(strato_client.clone())),
+            Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
             Box::new(LanguageCodeHydrator::new(tes_client.clone()).await),
             Box::new(EngagementCountsHydrator::new(engagement_counts_client).await),
+            Box::new(SemanticIdHydrator::new(sid_client.clone())),
             Box::new(PostEngagersHydrator::new(post_engagers_client)),
-            Box::new(SemanticIdHydrator::new(sid_client)),
             Box::new(NewUserSoftNsfwLabelHydrator {
                 client: vf_safety_labels_client.clone(),
             }),
+            Box::new(InNetworkCandidateHydrator),
         ];
 
         let author_rules = Arc::new(xai_feature_switches::AuthorRulesEvaluator::new(
@@ -434,16 +454,6 @@ impl PhoenixCandidatePipeline {
             Box::new(PreviouslyServedPostsFilter),
             Box::new(ViewerMutedKeywordFilter::new()),
             Box::new(AuthorSocialgraphFilter),
-            // Brazil 2026 election filter
-
-            // Application providers that use a recommendation system for users must exclude from the
-            // results the channels and profiles reported to the Electoral Court under the terms of
-            // § 1º of this article and, except in cases of paid boosting, the content posted on them.
-
-            // https://dadosabertos.tse.jus.br/dataset/candidatos-2026
-
-            // OmarAzizSenador deleted his account at the time this code was written.
-            Box::new(Brazil2026ElectionFilter),
             Box::new(VideoFilter),
             Box::new(TopicIdsFilter),
             Box::new(NewUserMinEngagementFilter),
@@ -456,6 +466,7 @@ impl PhoenixCandidatePipeline {
             dispatch: crate::util::egress::PredictionDispatch {
                 client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                uncompressed_clusters_key: "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
             },
         });
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
@@ -465,15 +476,23 @@ impl PhoenixCandidatePipeline {
             client: vm_ranker_client,
             xds_client: xds_vm_ranker_client,
             author_cold_start,
+            strato_client: strato_client.clone(),
+            safety_label_client: vf_safety_labels_client.clone(),
         });
         let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
             dispatch: crate::util::egress::PredictionDispatch {
                 client: phoenix_client.clone(),
                 max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                uncompressed_clusters_key: "rust_home_mixer_phoenix_xds_uncompressed_clusters_list",
             },
         });
-        let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
-            vec![phoenix_scorer, immersive_video_scorer, vm_ranker];
+        let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> = vec![
+            phoenix_scorer,
+            immersive_video_scorer,
+            vm_ranker,
+            Box::new(PageDecodeRerankScorer),
+            Box::new(PageRlExplorationScorer),
+        ];
 
         let selector = TopKScoreSelector;
 
@@ -493,9 +512,7 @@ impl PhoenixCandidatePipeline {
             Box::new(TopicFeedbackContextHydrator {
                 strato_client: strato_client.clone(),
             }),
-            Box::new(AiTrendFeedbackContextHydrator {
-                strato_client: strato_client.clone(),
-            }),
+            Box::new(AiTrendFeedbackContextHydrator::new(strato_client.clone())),
             Box::new(VideoMediaHydrator::new(tes_client.clone())),
             Box::new(VideoEmbeddingHydrator::new(post_v8_search_embedding_client)),
             Box::new(AncestorVideoHydrator {
@@ -526,7 +543,7 @@ impl PhoenixCandidatePipeline {
                 )),
                 Box::new(RedisPostCandidateCacheSideEffect::new(redis_client)),
                 Box::new(ScoredStatsSideEffect),
-                Box::new(ResponseDiversityStatsSideEffect),
+                Box::new(ResponseDiversityStatsSideEffect { sid_client }),
                 Box::new(SerendipityStatsSideEffect),
                 Box::new(AuthorServedMetricsSideEffect { popular_authors }),
                 Box::new(MutualFollowStatsSideEffect),
@@ -535,6 +552,7 @@ impl PhoenixCandidatePipeline {
                     phoenix_request_cache_redis_atla_client,
                     phoenix_request_cache_redis_pdxa_client,
                 )),
+                Box::new(TeacherScoreSideEffect::new(teacher_cache_redis_client)),
             ]);
 
         PhoenixCandidatePipeline {
@@ -560,8 +578,6 @@ impl PhoenixCandidatePipeline {
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
     ) -> PhoenixCandidatePipeline {
         let local_cache_eds = format!("");
-        let atla_phoenix_cache_eds = "";
-        let pdxa_phoenix_cache_eds = "";
 
         let (
             flock_socialgraph_client,
@@ -578,8 +594,8 @@ impl PhoenixCandidatePipeline {
             gizmoduck_client,
             strato_vf_client,
             redis_client,
-            phoenix_request_cache_redis_atla_client,
-            phoenix_request_cache_redis_pdxa_client,
+            (phoenix_request_cache_redis_atla_client, phoenix_request_cache_redis_pdxa_client),
+            teacher_cache_redis_client,
             phoenix_kafka_client,
             logged_scored_candidates_kafka_client,
             reranking_kafka_client,
@@ -707,24 +723,8 @@ impl PhoenixCandidatePipeline {
                     .expect("Failed to create xDS Redis client for local cache"),
                 ) as Arc<dyn RedisClient + Send + Sync>
             },
-            async {
-                Arc::new(
-                    XdsRedisClient::new(XdsRedisConfig {
-                        eds_resource_name: atla_phoenix_cache_eds.into(),
-                    })
-                    .await
-                    .expect("Failed to create xDS Redis client for atla phoenix cache"),
-                ) as Arc<dyn RedisClient + Send + Sync>
-            },
-            async {
-                Arc::new(
-                    XdsRedisClient::new(XdsRedisConfig {
-                        eds_resource_name: pdxa_phoenix_cache_eds.into(),
-                    })
-                    .await
-                    .expect("Failed to create xDS Redis client for pdxa phoenix cache"),
-                ) as Arc<dyn RedisClient + Send + Sync>
-            },
+            super::shared_phoenix_request_cache_redis_clients(),
+            super::teacher_cache_redis_client(),
             async {
                 Arc::new(
                     ProdKafkaPublisherClient::new(PHOENIX_SCORES_TOPIC, KafkaCluster::Aiml).await,
@@ -936,6 +936,26 @@ impl PhoenixCandidatePipeline {
                     Arc::new(NoopPostV8SearchEmbeddingClient)
                 }
             };
+        let video_carousel_seen_redis_client: Arc<dyn RedisClient + Send + Sync> =
+            match XdsRedisClient::new_with_response_timeout(
+                XdsRedisConfig {
+                    eds_resource_name: format!(
+                        "xdstp://discovery-{datacenter}/envoy.config.endpoint.v3.ClusterLoadAssignment/redis-global.video-carousel-seen-cache.prod.cache:redis"
+                    ),
+                },
+                Duration::from_millis(30),
+            )
+            .await
+            {
+                Ok(client) => Arc::new(client),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "video carousel seen cache unavailable; carousel seen filter is a no-op"
+                    );
+                    Arc::new(NoopRedisClient)
+                }
+            };
 
         PhoenixCandidatePipeline::build_with_clients(
             user_action_aggregation_client,
@@ -962,6 +982,7 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
+            teacher_cache_redis_client,
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,
@@ -983,6 +1004,7 @@ impl PhoenixCandidatePipeline {
             popular_posts,
             author_brand_safety_client,
             post_v8_search_embedding_client,
+            video_carousel_seen_redis_client,
         )
         .await
     }
@@ -1072,6 +1094,7 @@ impl PhoenixCandidatePipeline {
             vf_safety_labels_client,
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
+            Arc::new(MockRedisClient::default()),
             impression_bloom_filter_client,
             ip_client,
             user_demographics_client,
@@ -1097,6 +1120,7 @@ impl PhoenixCandidatePipeline {
             ))),
             Arc::new(MockAuthorBrandSafetyClient::default()) as Arc<dyn AuthorBrandSafetyClient>,
             Arc::new(NoopPostV8SearchEmbeddingClient) as Arc<dyn PostV8SearchEmbeddingClient>,
+            Arc::new(MockRedisClient::default()),
         )
         .await
     }
@@ -1142,7 +1166,15 @@ impl CandidatePipeline<ScoredPostsQuery, PostCandidate> for PhoenixCandidatePipe
     fn result_size(&self) -> usize {
         params::RESULT_SIZE
     }
+
+    fn retain_retrieved_candidates(&self, query: &ScoredPostsQuery) -> bool {
+        query.is_debug_request
+    }
 }
+
+#[cfg(test)]
+#[path = "performance_tests.rs"]
+mod performance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1183,6 +1215,16 @@ mod tests {
             .last()
             .map(|filter| filter.name());
         assert_eq!(last, Some("VideoCarouselFilter"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn retrieved_candidates_are_retained_only_for_debug_requests() {
+        xai_init_utils::init().rustls();
+        let pipeline = PhoenixCandidatePipeline::mock().await;
+        let mut query = ScoredPostsQuery::default();
+        assert!(!pipeline.retain_retrieved_candidates(&query));
+        query.is_debug_request = true;
+        assert!(pipeline.retain_retrieved_candidates(&query));
     }
 
     #[test]

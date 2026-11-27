@@ -8,6 +8,7 @@ import jax
 import numpy as np
 
 from xai_configlib import Config, configclass
+from xrex.data.recsys import long_term_author_profile
 from xrex.data.recsys.array_allocator import ArrayAllocator
 from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 
@@ -198,6 +199,7 @@ class SequencePackedLayout:
     token_to_source: np.ndarray | None = None
     source_to_token: np.ndarray | None = None
     dropped_candidate_slots: np.ndarray | None = None
+    value_scale: np.ndarray | None = None
 
 
 PACK_BLOCK_SIZE = 128
@@ -446,6 +448,14 @@ def pack_batch(
         ) is not None:
             out["user_id_list_hashes"] = il.reshape(D, B, *il.shape[1:])
             out["user_id_list_mask"] = ilm.reshape(D, B, *ilm.shape[1:])
+        cast(dict[str, np.ndarray], out).update(
+            {
+                key: arr.reshape(D, B, *arr.shape[1:])
+                for key, arr in long_term_author_profile.present(batch).items()
+            }
+        )
+        if (stats := batch.get("user_history_stats")) is not None:
+            out["user_history_stats"] = stats.reshape(D, B, *stats.shape[1:])
         return out
 
     history_post_hashes = batch["history_seq"]["post_hashes"]

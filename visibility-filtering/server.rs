@@ -3,13 +3,15 @@ use crate::evaluate_tweets::EvaluateTweetsEndpoint;
 use crate::filter_notifications::FilterNotificationsEndpoint;
 use crate::filter_tweets::FilterTweetsEndpoint;
 use crate::get_safety_labels::{GetSafetyLabelsCodec, GetSafetyLabelsEndpoint};
-use crate::server_deps::{self, Comparators};
+use crate::hydration::sources::test_users_metadata;
+use crate::server_deps;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::Body;
 use tonic::codec::CompressionEncoding;
 use tonic::codegen::{http, BoxFuture, Service};
+use tonic::metadata::MetadataMap;
 use tonic::server::{Grpc, NamedService};
 use tonic::{Request, Response, Status};
 use xai_dark_traffic::RejectDarkTrafficLayer;
@@ -28,9 +30,16 @@ pub struct ServeArgs {
     datacenter: String,
     #[arg(long, default_value = "")]
     otel_endpoint: String,
+    #[arg(long)]
+    test_users: bool,
 }
 
-pub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::Result<()> {
+pub async fn serve<S: XService<Config = Option<MetadataMap>>>(
+    args: ServeArgs,
+) -> anyhow::Result<()> {
+    if args.test_users {
+        crate::config::refuse_test_users_in_prod();
+    }
     XServiceBuilder::new("visibility-filtering-service")
         .grpc_port(args.grpc_port)
         .metrics_port(args.metrics_port)
@@ -42,7 +51,7 @@ pub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::R
         .with_layer(RejectDarkTrafficLayer::from_env())
         .with_layer(GrpcZstdLayer)
         .http_routes(xai_profiling::profiling_router())
-        .run::<S>(config)
+        .run::<S>(args.test_users.then(test_users_metadata))
         .await
 }
 
@@ -55,10 +64,10 @@ pub struct VFServer {
 
 #[tonic::async_trait]
 impl XService for VFServer {
-    type Config = ();
+    type Config = Option<MetadataMap>;
 
-    async fn build(ctx: xai_x_service_builder::ServiceContext<()>) -> Self {
-        VFServer::new(&ctx.datacenter).await
+    async fn build(ctx: xai_x_service_builder::ServiceContext<Option<MetadataMap>>) -> Self {
+        VFServer::new(&ctx.datacenter, ctx.config.as_ref()).await
     }
 
     fn register(self: Arc<Self>, routes: &mut tonic::service::RoutesBuilder) {
@@ -118,11 +127,11 @@ impl Service<http::Request<Body>> for VFRouter {
 }
 
 impl VFServer {
-    pub(crate) async fn new(datacenter: &str) -> Self {
+    pub(crate) async fn new(datacenter: &str, metadata: Option<&MetadataMap>) -> Self {
         crate::config::refuse_reference();
-        server_deps::build(datacenter, None)
+        server_deps::build(datacenter, metadata)
             .await
-            .into_server(Comparators::default())
+            .into_server(None)
     }
 }
 
@@ -154,56 +163,25 @@ impl vf_pb::VisibilityFilteringService for VFServer {
 mod tests {
     use super::*;
     use crate::hydration::sources::InMemorySources;
+    use crate::metrics::Metrics;
     use crate::params::ClientSwitches;
-    use crate::safety_label_source::lookup::{
-        LookupResults, ManhattanLookup, RemoteSource, TwemcacheLookup,
-    };
-    use crate::safety_label_source::types::FailureKind;
-    use crate::safety_label_source::types::TwemcacheOutcome;
-    use crate::safety_label_source::LookupError;
-    use crate::safety_label_source::SafetyLabelSource;
     use crate::scenario::{tweet_data, Wire};
-    use rustc_hash::FxHashMap;
     use std::collections::HashMap;
+    use xai_safety_label_source::testing::FakeLabels;
     use xai_visibility_filtering::vf_client::XaiVfClient;
     use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;
     use xai_x_thrift::safety_result::FilteredReason;
+    use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
     use xai_x_thrift::tweet_service::{
         TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,
         TweetFieldsResultState,
     };
 
-    struct NoLabels;
-
-    #[tonic::async_trait]
-    impl TwemcacheLookup for NoLabels {
-        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
-            ids.iter().map(|&id| (id, TwemcacheOutcome::Miss)).collect()
-        }
-    }
-
-    #[tonic::async_trait]
-    impl ManhattanLookup for NoLabels {
-        async fn get(&self, ids: &[u64]) -> LookupResults {
-            ids.iter().map(|&id| (id, Ok(Default::default()))).collect()
-        }
-    }
-
-    struct LabelsForPostOne;
-
-    #[tonic::async_trait]
-    impl ManhattanLookup for LabelsForPostOne {
-        async fn get(&self, ids: &[u64]) -> LookupResults {
-            ids.iter()
-                .map(|&id| {
-                    let result = if id == 1 {
-                        Ok(post_one_labels())
-                    } else {
-                        Err(LookupError::new(FailureKind::ManhattanFetch, "down"))
-                    };
-                    (id, result)
-                })
-                .collect()
+    fn post_one_label() -> SafetyLabel {
+        SafetyLabel {
+            score: Some(0.5.into()),
+            source: Some("botmaker".to_owned()),
+            ..Default::default()
         }
     }
 
@@ -223,19 +201,17 @@ mod tests {
     fn server(sources: InMemorySources) -> VFServer {
         let wire = Wire::new(Arc::new(sources));
         let post_evaluator = Arc::clone(wire.post_evaluator());
-        let labels = Arc::new(NoLabels);
         VFServer {
             evaluate_tweets: wire.into_endpoint(),
-            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(&post_evaluator)),
-            filter_tweets: FilterTweetsEndpoint::new(
-                post_evaluator,
+            filter_notifications: FilterNotificationsEndpoint::new(
+                Arc::clone(&post_evaluator),
                 ClientSwitches::for_tests(),
-                None,
             ),
-            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
-                Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),
-                Some(1024),
-            ))),
+            filter_tweets: FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests()),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(
+                Arc::new(FakeLabels::default().into_source()),
+                Metrics::none(),
+            ),
         }
     }
 
@@ -276,11 +252,13 @@ mod tests {
         };
         let deleted =
             || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));
+        let not_found =
+            TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(false, false, None));
         let cases = [
             (tweet_data(1, None), found(), Some(found())),
             (tweet_data(1, None), protected(), Some(protected())),
             (tweet_data(1, Some(2)), found(), None),
-            (tweet_data(2, None), found(), None),
+            (tweet_data(2, None), found(), Some(not_found)),
             (tweet_data(2, None), deleted(), Some(deleted())),
         ];
         let home = client
@@ -309,13 +287,15 @@ mod tests {
     #[tokio::test]
     async fn get_safety_labels_loopback() {
         let (channel, handle) = serve(VFServer {
-            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(
-                Arc::new(RemoteSource::new(
-                    Arc::new(NoLabels),
-                    Arc::new(LabelsForPostOne),
-                )),
-                Some(1024),
-            ))),
+            get_safety_labels: GetSafetyLabelsEndpoint::new(
+                Arc::new(
+                    FakeLabels::default()
+                        .label(1, SafetyLabelType::from(3), post_one_label())
+                        .failing(2)
+                        .into_source(),
+                ),
+                Metrics::none(),
+            ),
             ..server(InMemorySources::default())
         })
         .await;

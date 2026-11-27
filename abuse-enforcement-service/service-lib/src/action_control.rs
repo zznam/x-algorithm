@@ -14,8 +14,9 @@ pub use xai_abuse_enforcement_types::action_control::{
     ActionControlListResponse, ActionControlPutRequest, ActionControlRecord, ActionControlSeen,
     ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,
     ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,
-    PageAction, PodActionControlView, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION, RowSetting, RowView,
-    RowsRequest, SafetyChecksByEntity, UnreadableRecord, in_rollout, rollout_bucket,
+    PageAction, PodActionControlView, PostLabelName, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION,
+    RowSetting, RowView, RowsRequest, SafetyChecksByEntity, SuspensionPolicy, UnreadableRecord,
+    in_rollout, rollout_bucket,
 };
 
 mod levels;
@@ -28,6 +29,7 @@ use crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};
 use crate::growthbook::DynamicConfig;
 use crate::metrics;
 use crate::off_switch::valid_name;
+use crate::safety_checks::AuthorSkips;
 
 pub const MH_PKEY: &str = "action_control";
 pub const SEEN_PKEY: &str = "action_control_seen";
@@ -69,6 +71,8 @@ pub const CONFIRM_WORD: &str = "ENFORCE";
 pub const PAGE_RULE_ID: &str = "page";
 pub const STATUS_NO_ACTIONS: &str = "no_actions";
 pub const FORCED_RECORDING_KEY: &str = "action_control_forced_recording";
+pub const FOLLOWER_THRESHOLD_KEY: &str = "action_control_follower_threshold";
+pub const SKIP_HIGH_CREDIBILITY_KEY: &str = "action_control_skip_high_credibility";
 
 pub fn lkey_for(
     entity: ControlEntity,
@@ -142,9 +146,10 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
         PageAction::SpamHighRecall { .. }
         | PageAction::PhoenixSkip { .. }
         | PageAction::PostSpamHighRecall { .. }
-        | PageAction::HideReply { .. } => 0,
+        | PageAction::HideReply { .. }
+        | PageAction::PostLabel { .. } => 0,
         PageAction::LivenessCheck {} => 1,
-        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,
+        PageAction::Suspend { .. } | PageAction::SuspendAuthor { .. } => 2,
     };
     let mut sorted: Vec<PageAction> = actions.to_vec();
     sorted.sort_by_key(rank);
@@ -167,10 +172,15 @@ pub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {
                 labels: vec![RISKY_HIGH_VIZ_REPLY.into()],
                 ttl_msec: lifetime.ttl_msec(),
             },
+            PageAction::PostLabel { label, lifetime } => ActionSpec::AddPostLabelsV2 {
+                labels: vec![label.as_str().into()],
+                ttl_msec: lifetime.ttl_msec(),
+            },
             PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,
-            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {
-                perm: false,
-                policy: "PlatformManipulation".into(),
+            PageAction::Suspend { permanent, policy }
+            | PageAction::SuspendAuthor { permanent, policy } => ActionSpec::SuspendUser {
+                perm: permanent,
+                policy: policy.as_str().into(),
             },
         })
         .collect()
@@ -182,6 +192,22 @@ pub fn label_only(actions: &[PageAction]) -> Option<&'static str> {
         [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),
         _ => None,
     }
+}
+
+pub fn post_labels_only(actions: &[PageAction]) -> Option<Vec<&'static str>> {
+    let mut labels = actions
+        .iter()
+        .map(|a| match a {
+            PageAction::PostSpamHighRecall { .. } => Some(SPAM_HIGH_RECALL),
+            PageAction::HideReply { .. } => Some(RISKY_HIGH_VIZ_REPLY),
+            PageAction::PostLabel { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|l| !l.is_empty())?;
+    labels.sort_unstable();
+    labels.dedup();
+    Some(labels)
 }
 
 fn ttl_days(ttl_msec: i64) -> Value {
@@ -446,6 +472,8 @@ pub struct Resolved {
             pub by_row: bool,
             pub factory: bool,
                 pub unlisted: bool,
+            pub unknown: bool,
+            pub author_skips: AuthorSkips,
 }
 
 impl Default for Resolved {
@@ -461,6 +489,8 @@ impl Default for Resolved {
             by_row: false,
             factory: false,
             unlisted: false,
+            unknown: false,
+            author_skips: AuthorSkips::default(),
         }
     }
 }
@@ -473,10 +503,10 @@ impl Resolved {
     }
 
             pub fn rules_unread(&self) -> bool {
-        self.factory || self.unlisted
+        self.factory || self.unlisted || self.unknown
     }
 
-                        pub fn admit_unlisted(mut self) -> Option<Self> {
+                            pub fn admit_unlisted(mut self) -> Option<Self> {
         if self.factory || self.mode == ControlMode::Rules {
             return None;
         }
@@ -509,6 +539,13 @@ impl Resolved {
         self.dedup_class.unwrap_or_else(rules)
     }
 
+                    pub fn dedup_labels(&self) -> Option<Vec<&'static str>> {
+        if !self.page_driven() {
+            return None;
+        }
+        post_labels_only(&self.page_actions)
+    }
+
             pub fn info_keys(&self) -> Vec<(String, String)> {
         let mut keys = vec![(
             "action_control_mode".to_owned(),
@@ -537,6 +574,14 @@ impl Resolved {
         }
         if let Some(f) = self.forced {
             keys.push((FORCED_RECORDING_KEY.to_owned(), f.to_owned()));
+        }
+        if self.page_driven() {
+            if let Some(n) = self.author_skips.follower_threshold {
+                keys.push((FOLLOWER_THRESHOLD_KEY.to_owned(), n.to_string()));
+            }
+            if let Some(on) = self.author_skips.skip_high_credibility {
+                keys.push((SKIP_HIGH_CREDIBILITY_KEY.to_owned(), on.to_string()));
+            }
         }
         if let Some(r) = &self.row {
             keys.extend(r.info_keys(self.mode == ControlMode::Recording, self.forced));
@@ -568,6 +613,16 @@ impl Snapshot {
             return Some(Hit::Record(k, r));
         }
         self.unreadable.get(lkey).map(|_| Hit::Unreadable)
+    }
+
+            fn names_head(&self, entity: ControlEntity, names: &[&str]) -> bool {
+        let e = entity.as_str();
+        self.records.keys().chain(self.unreadable.keys()).any(|k| {
+            let mut parts = k.split('/');
+            parts.next() == Some(e)
+                && parts.next().is_some()
+                && parts.next().is_some_and(|h| names.contains(&h))
+        })
     }
 
                     fn levels(
@@ -616,6 +671,19 @@ impl Snapshot {
         bands: &[&str],
     ) -> Option<Hit<'_>> {
         self.find(&Self::levels(entity, head, alias, classifier, bands))
+    }
+
+                fn author_skips(&self, entity: ControlEntity, names: &[&str], factory: bool) -> AuthorSkips {
+        if factory {
+            return AuthorSkips::default();
+        }
+        names
+            .iter()
+            .find_map(|n| self.at(&lkey_for(entity, n, None, None)))
+            .map_or_else(AuthorSkips::default, |hit| match hit {
+                Hit::Record(_, r) => AuthorSkips::of(r),
+                Hit::Unreadable | Hit::Ambiguous => AuthorSkips::default(),
+            })
     }
 
             fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {
@@ -687,8 +755,8 @@ fn effective(
 #[derive(Debug, PartialEq)]
 pub enum SetError {
         Invalid(&'static str, String),
-            Conflict(Option<ActionControlRecord>, Option<u64>),
-        LostRace(Option<ActionControlRecord>),
+            Conflict(Option<Box<ActionControlRecord>>, Option<u64>),
+        LostRace(Option<Box<ActionControlRecord>>),
         Ignored,
         Store(String),
 }
@@ -752,7 +820,8 @@ fn label_days(a: &PageAction) -> Option<i64> {
         PageAction::SpamHighRecall { lifetime }
         | PageAction::PhoenixSkip { lifetime }
         | PageAction::PostSpamHighRecall { lifetime }
-        | PageAction::HideReply { lifetime } => {
+        | PageAction::HideReply { lifetime }
+        | PageAction::PostLabel { lifetime, .. } => {
             Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))
         }
         _ => None,
@@ -806,13 +875,26 @@ pub fn harsher_because(
         }
         for a in &after.actions {
             let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());
-            match (a, same_kind) {
-                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {
-                    why.push("adds suspend".into())
+            match (a.suspension(), same_kind) {
+                (Some(_), None) => why.push("adds suspend".into()),
+                (Some((permanent, policy)), Some(b)) => {
+                    let (was_permanent, was_policy) = b.suspension().unwrap_or_default();
+                    if permanent && !was_permanent {
+                        why.push("makes the suspension permanent".into());
+                    }
+                    if policy != was_policy {
+                        why.push(format!(
+                            "changes the suspension policy ({} to {})",
+                            was_policy.as_str(),
+                            policy.as_str()
+                        ));
+                    }
                 }
-                (PageAction::LivenessCheck {}, None) => why.push("adds liveness check".into()),
-                (_, None) => why.push("adds a label".into()),
-                (_, Some(b)) => {
+                (None, None) if matches!(a, PageAction::LivenessCheck {}) => {
+                    why.push("adds liveness check".into())
+                }
+                (None, None) => why.push("adds a label".into()),
+                (None, Some(b)) => {
                     if let (Some(new), Some(old)) = (label_days(a), label_days(b))
                         && new > old
                     {
@@ -828,20 +910,60 @@ pub fn harsher_because(
 pub(crate) fn admits_unlisted_after(
     req: &ActionControlPutRequest,
     before: Option<&ActionControlRecord>,
+    unknown: bool,
 ) -> bool {
     req.classifier.is_none()
         && req.band.is_none()
         && req.confidence.is_none()
         && req
             .admit_unlisted_labels
-            .unwrap_or_else(|| before.is_some_and(|b| b.admit_unlisted_labels))
+            .unwrap_or_else(|| unknown || before.is_some_and(|b| b.admit_unlisted_labels))
+}
+
+pub(crate) fn first_save_of_unknown_head(
+    req: &ActionControlPutRequest,
+    unknown: bool,
+) -> Result<(), SetError> {
+    if unknown && (req.classifier.is_some() || req.band.is_some()) {
+        return Err(SetError::Invalid(
+            "unknown_head_needs_head_record",
+            "save the whole head first, so its decisions keep getting past the topic's label list"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn author_skips_after(
+    req: &ActionControlPutRequest,
+    before: Option<&ActionControlRecord>,
+) -> AuthorSkips {
+    if req.classifier.is_some() || req.band.is_some() || req.confidence.is_some() {
+        return AuthorSkips::default();
+    }
+    let kept = before.map_or_else(AuthorSkips::default, AuthorSkips::of);
+    AuthorSkips {
+        follower_threshold: req.follower_threshold.unwrap_or(kept.follower_threshold),
+        skip_high_credibility: req
+            .skip_high_credibility
+            .unwrap_or(kept.skip_high_credibility),
+    }
+}
+
+pub(crate) fn author_skips_harsher(
+    before: Option<&ActionControlRecord>,
+    record: &ActionControlRecord,
+) -> Vec<String> {
+    let was = before.map_or_else(AuthorSkips::default, AuthorSkips::of);
+    AuthorSkips::of(record).harsher_than(was)
 }
 
 pub(crate) fn admits_unlisted_harsher(
     before: Option<&ActionControlRecord>,
     after: &ActionControlRecord,
+    unknown: bool,
 ) -> Option<&'static str> {
-    (after.admit_unlisted_labels && !before.is_some_and(|b| b.admit_unlisted_labels))
+    (after.admit_unlisted_labels && !unknown && !before.is_some_and(|b| b.admit_unlisted_labels))
         .then_some("decides this head's decisions that the topic's label list drops")
 }
 
@@ -919,11 +1041,6 @@ impl ActionControl {
         Some(age)
     }
 
-        pub fn has_records(&self) -> bool {
-        let snap = self.snapshot();
-        !snap.records.is_empty() || !snap.unreadable.is_empty()
-    }
-
             pub fn admits_unlisted(&self, entity: EntityType, head: &str) -> bool {
         let lkey = lkey_for(entity_of(entity), head, None, None);
         self.snapshot()
@@ -983,8 +1100,20 @@ impl ActionControl {
             return out;
         }
         let snap = self.snapshot();
-        if !input.factory && snap.records.is_empty() && snap.unreadable.is_empty() {
-            return out;
+        if !input.factory {
+            let names: Vec<&str> = std::iter::once(input.head)
+                .chain(cfg.aliases.get(input.head).map(String::as_str))
+                .collect();
+            if !snap.names_head(entity_of(input.entity), &names) {
+                if valid_name(input.head) {
+                    out.mode = ControlMode::Recording;
+                    out.row = Some(RowOutcome::new(&claim()));
+                    out.by_row = true;
+                    out.unknown = true;
+                    out.dedup_class = Some(page_class(&[]));
+                }
+                return out;
+            }
         }
         let mut safety_ok = Some(safety_ok);
         let mut safety_seen: Option<bool> = None;
@@ -1062,6 +1191,10 @@ impl ActionControl {
             }
         }
         out.dedup_class = out.page_driven().then(|| page_class(&out.page_actions));
+        let names: Vec<&str> = std::iter::once(input.head)
+            .chain(cfg.aliases.get(input.head).map(String::as_str))
+            .collect();
+        out.author_skips = snap.author_skips(entity, &names, input.factory);
         if let Some(m) = &out.matched {
             metrics::ACTION_CONTROL_DECISIONS_TOTAL
                 .with_label_values(&[
@@ -1129,30 +1262,6 @@ impl ActionControl {
             .get(MH_PKEY, lkey)
             .await?
             .map(|b| raw_version(&b)))
-    }
-
-            pub fn weak_rows(
-        &self,
-        entity: EntityType,
-        head: &str,
-        classifier: Option<&str>,
-        rows: &[LevelRow],
-        cfg: &ControlConfig,
-        now_ms: i64,
-    ) -> Vec<LevelRow> {
-        let snap = self.snapshot();
-        let names: Vec<&str> = std::iter::once(head)
-            .chain(cfg.aliases.get(head).map(String::as_str))
-            .collect();
-        levels::weak_rows(
-            &snap,
-            entity_of(entity),
-            &names,
-            classifier,
-            rows,
-            cfg,
-            now_ms,
-        )
     }
 
 
@@ -1649,6 +1758,7 @@ impl ActionControl {
             },
             cse: CseLists::default(),
             confidence: Some(levels::view(cfg)),
+            follower_skip: Some(crate::safety_checks::follower_skip_view()),
         }
     }
 
@@ -1790,17 +1900,83 @@ impl ActionControl {
                     .into(),
             );
         }
-        if !head_rows
-            .iter()
-            .any(|s| s.factory && s.entity_type == entity)
+        let sets_skips = req.follower_threshold.is_some() || req.skip_high_credibility.is_some();
+        if sets_skips
+            && (req.classifier.is_some() || req.band.is_some() || req.confidence.is_some())
         {
-            return Ok(());
+            return bad(
+                "author_skips_scope",
+                "the follower threshold and the credibility skip are set on the head record (no classifier, band or row)"
+                    .into(),
+            );
         }
-        if admits {
+        let factory = head_rows
+            .iter()
+            .any(|s| s.factory && s.entity_type == entity);
+        if factory && admits {
             return bad(
                 "factory_admit_unlisted_labels",
                 "a Model Factory head's decisions keep the topic's label list".into(),
             );
+        }
+        if factory && sets_skips {
+            return bad(
+                "factory_author_skips",
+                "a Model Factory head keeps the default follower and credibility skips".into(),
+            );
+        }
+        let skips = crate::safety_checks::follower_skip_view();
+        let threshold = req.follower_threshold.flatten().map(u64::from);
+        if threshold == Some(0) {
+            return bad(
+                "follower_threshold_missing",
+                format!(
+                    "state a follower limit: {} or more (the standard skip is {})",
+                    skips.today_threshold, skips.today_threshold
+                ),
+            );
+        }
+        if threshold.is_some_and(|n| n < skips.today_threshold) {
+            return bad(
+                "follower_threshold_below_today",
+                format!(
+                    "a threshold below today's rule ({} or more followers) isn't supported yet; send {} or more",
+                    skips.today_threshold, skips.today_threshold
+                ),
+            );
+        }
+        if threshold.is_some_and(|n| n > skips.max_threshold) {
+            return bad(
+                "follower_threshold_too_high",
+                format!("follower_threshold must be at most {}", skips.max_threshold),
+            );
+        }
+        let raised = threshold.filter(|&n| n >= skips.ceiling);
+        match (raised, req.confirm_follower_limit.map(u64::from)) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return bad(
+                    "confirm_follower_limit_unexpected",
+                    format!(
+                        "confirm_follower_limit goes only with a follower_threshold of {} or more",
+                        skips.ceiling
+                    ),
+                );
+            }
+            (Some(n), repeated) => {
+                if repeated != Some(n) || req.confirm.as_deref() != Some(CONFIRM_WORD) {
+                    return bad(
+                        "follower_limit_unconfirmed",
+                        format!(
+                            "a follower limit of {n} acts on accounts with {} or more followers, which every other head skips; send confirm_follower_limit: {n} and confirm: \"{CONFIRM_WORD}\"",
+                            skips.ceiling
+                        ),
+                    );
+                }
+            }
+        }
+        if !factory {
+            return Ok(());
         }
         let settings = || {
             req.rows
@@ -1836,7 +2012,7 @@ impl ActionControl {
         if req.evidence.is_some() || settings().any(|s| s.evidence.is_some()) {
             return bad(
                 "factory_evidence",
-                "a Model Factory decision carries its own evidence from its policy; send no evidence on its rows (an override is allowed)"
+                "a Model Factory decision carries its own evidence from its policy; send no evidence on its rows"
                     .into(),
             );
         }
@@ -1893,7 +2069,7 @@ impl ActionControl {
                 let lkey = record_lkey_of(&req);
                 match self.get_record(&lkey).await {
                     Ok(stored) => Err(SetError::Conflict(
-                        stored.as_ref().and_then(|(r, _)| r.clone()),
+                        stored.as_ref().and_then(|(r, _)| r.clone()).map(Box::new),
                         stored.map(|(_, v)| v),
                     )),
                     Err(e) => Err(e),
@@ -2050,8 +2226,22 @@ impl ActionControl {
         let stored_version = stored.as_ref().map(|(_, v)| *v);
         let before = stored.and_then(|(r, _)| r);
         if stored_version != req.expected_version {
-            return Err(SetError::Conflict(before, stored_version));
+            return Err(SetError::Conflict(before.map(Box::new), stored_version));
         }
+        let alias = cfg.aliases.get(&req.head).map(String::as_str);
+        let names: Vec<&str> = std::iter::once(req.head.as_str()).chain(alias).collect();
+        let factory = seen
+            .iter()
+            .any(|s| s.factory && s.head == req.head && s.entity_type == req.entity_type);
+        let rows = match stored_version {
+            None => Some(self.scan_rows().await?),
+            Some(_) => None,
+        };
+        let unknown = !factory
+            && rows.as_deref().is_some_and(|rows| {
+                !Snapshot::of_rows(rows, &[&lkey]).names_head(req.entity_type, &names)
+            });
+        first_save_of_unknown_head(&req, unknown)?;
         let mut rec = ActionControlRecord {
             v: ACTION_CONTROL_RECORD_VERSION,
             entity_type: req.entity_type,
@@ -2068,10 +2258,15 @@ impl ActionControl {
             write_nonce: new_nonce(),
             confidence: req.confidence,
             evidence: req.evidence.clone().map(Box::new),
-            evidence_override: req.evidence_override.clone().map(Box::new),
-            admit_unlisted_labels: admits_unlisted_after(&req, before.as_ref()),
+            evidence_override: None,
+            admit_unlisted_labels: admits_unlisted_after(&req, before.as_ref(), unknown),
             rollout_bp: None,
+            follower_threshold: None,
+            skip_high_credibility: None,
         };
+        let skips = author_skips_after(&req, before.as_ref());
+        rec.follower_threshold = skips.follower_threshold;
+        rec.skip_high_credibility = skips.skip_high_credibility;
         rec.v = rec.schema_version();
         let recording = || ActionControlRecord {
             mode: ControlMode::Recording,
@@ -2082,9 +2277,9 @@ impl ActionControl {
             (Some(b), _) => vec![Some(b.clone())],
             (None, Some(_)) => vec![Some(recording())],
             (None, None) => {
-                let rows = self.scan_rows().await?;
-                let snap = Snapshot::of_rows(&rows, &[&lkey]);
-                let alias = cfg.aliases.get(&req.head).map(String::as_str);
+                let rows = rows.as_deref().unwrap_or_default();
+                let snap = Snapshot::of_rows(rows, &[&lkey]);
+                let uncovered = || (!snap.names_head(req.entity_type, &names)).then(recording);
                 let exact = match req.band.as_deref() {
                     Some(band) => Some(
                         match snap.plain_decider(
@@ -2096,7 +2291,7 @@ impl ActionControl {
                         ) {
                             Some(Hit::Record(_, r)) => Some(r.clone()),
                             Some(_) => Some(recording()),
-                            None => None,
+                            None => uncovered(),
                         },
                     ),
                     None => None,
@@ -2104,7 +2299,7 @@ impl ActionControl {
                 match exact {
                     Some(p) => vec![p],
                     None => {
-                        let shadowed = Self::shadowed(&lkey, &req, cfg, &rows);
+                        let shadowed = Self::shadowed(&lkey, &req, cfg, rows);
                         let head_covers = shadowed.iter().flatten().any(|r| {
                             r.classifier.is_none() && r.band.is_none() && r.confidence.is_none()
                         });
@@ -2113,7 +2308,7 @@ impl ActionControl {
                             .map(|r| Some(r.unwrap_or_else(recording)))
                             .collect();
                         if !head_covers {
-                            all.push(None);
+                            all.push(uncovered());
                         }
                         all
                     }
@@ -2154,22 +2349,20 @@ impl ActionControl {
                     .as_ref(),
                 &levels::for_compare(&rec),
                 rules_specs.as_deref(),
-            )
-            .into_iter()
-            .chain(levels::evidence_harsher(
-                prior.as_ref(),
-                &rec,
-                now_ms,
-                cfg.confidence.evidence_max_age_ms,
-            ));
+            );
             for w in why {
                 if !harsher.contains(&w) {
                     harsher.push(w);
                 }
             }
         }
-        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec) {
+        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec, unknown) {
             harsher.push(why.to_owned());
+        }
+        for why in author_skips_harsher(before.as_ref(), &rec) {
+            if !harsher.contains(&why) {
+                harsher.push(why);
+            }
         }
         if !harsher.is_empty() && req.confirm.as_deref() != Some(CONFIRM_WORD) {
             return Err(SetError::Invalid(
@@ -2218,7 +2411,7 @@ impl ActionControl {
             }
         };
         if readback.write_nonce != rec.write_nonce {
-            return Err(SetError::LostRace(Some(readback)));
+            return Err(SetError::LostRace(Some(Box::new(readback))));
         }
         self.apply_local(lkey.clone(), rec.clone());
         info!(
@@ -2504,7 +2697,51 @@ pub(crate) mod test_support {
             evidence_override: None,
             admit_unlisted_labels: false,
             rollout_bp: None,
+            follower_threshold: None,
+            skip_high_credibility: None,
         }
+    }
+
+            pub(crate) fn parse_as_older_image(bytes: &[u8]) -> Result<ActionControlRecord, String> {
+        let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if let Some(k) = value.as_object().and_then(|o| {
+            o.keys()
+                .find(|k| *k == "follower_threshold" || *k == "skip_high_credibility")
+        }) {
+            return Err(format!("unknown field `{k}`"));
+        }
+        let rec = parse_record(bytes)?;
+        if rec.v > xai_abuse_enforcement_types::action_control::ROLLOUT_RECORD_VERSION {
+            return Err(format!("record version {} is newer than this pod", rec.v));
+        }
+        Ok(rec)
+    }
+
+                        pub(crate) async fn refresh_as_older_image(ac: &ActionControl) {
+        let rows = ac.store.scan(MH_PKEY).await.unwrap();
+        let prev = ac.snapshot();
+        let mut records = HashMap::new();
+        let mut unreadable = HashMap::new();
+        for (lkey, value) in rows {
+            match parse_as_older_image(&value) {
+                Ok(rec) => {
+                    records.insert(record_lkey(&rec), rec);
+                }
+                Err(err) => match prev.records.get(&lkey).filter(|r| {
+                    !r.sets_author_skips()
+                        && r.v
+                            <= xai_abuse_enforcement_types::action_control::ROLLOUT_RECORD_VERSION
+                }) {
+                    Some(old) => {
+                        records.insert(lkey, old.clone());
+                    }
+                    None => {
+                        unreadable.insert(lkey, (err, raw_version(&value)));
+                    }
+                },
+            }
+        }
+        ac.publish(records, unreadable, true);
     }
 
     pub(crate) async fn loaded(
@@ -2529,8 +2766,12 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use xai_abuse_enforcement_types::action_control::{
+        AUTHOR_SKIPS_RECORD_VERSION, POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+        RAISED_FOLLOWER_LIMIT_RECORD_VERSION, SUSPENSION_OPTIONS_RECORD_VERSION,
+    };
 
-    const SUSPEND: PageAction = PageAction::Suspend {};
+    const SUSPEND: PageAction = PageAction::SUSPEND;
     const LIVENESS: PageAction = PageAction::LivenessCheck {};
     const SHR7: PageAction = PageAction::SpamHighRecall {
         lifetime: Lifetime::Days7,
@@ -2618,14 +2859,64 @@ mod tests {
         assert_eq!(r.mode, ControlMode::Live);
     }
 
-    #[tokio::test]
-    async fn no_record_follows_the_rules() {
-        let (ac, _) = loaded(&[live("Other", None, None, vec![SUSPEND])]).await;
-        let r = resolve(&ac, "H", "c", &["x"]);
-        assert_eq!(r, Resolved::default());
-        assert!(!r.record_only());
-        assert_eq!(r.incoming_dedup_class(|| 2), 2);
-        assert_eq!(resolve(&ac, "", "c", &[]).matched, None);
+            #[tokio::test]
+    async fn a_head_no_record_names_records_only() {
+        for store in [vec![], vec![live("Other", None, None, vec![SUSPEND])]] {
+            let (ac, _) = loaded(&store).await;
+            let r = resolve(&ac, "H", "c", &["x"]);
+            assert_eq!(
+                (r.mode, r.forced, r.matched.as_ref()),
+                (ControlMode::Recording, None, None)
+            );
+            assert!(r.unknown && r.by_row && r.page_driven() && r.rules_unread());
+            assert!(r.record_only() && r.page_actions.is_empty());
+            assert_eq!(r.incoming_dedup_class(|| 2), page_class(&[]));
+            assert_eq!(logged_because(&r).as_deref(), Some("no_selection"));
+        }
+        let (ac, _) = loaded(&[]).await;
+        for head in ["", "not a head"] {
+            assert_eq!(
+                resolve(&ac, head, "c", &[]),
+                Resolved::default(),
+                "{head:?}"
+            );
+        }
+        let ls = labels(&[]);
+        let ignore = ControlConfig {
+            ignore_store: true,
+            ..on()
+        };
+        assert_eq!(
+            ac.resolve(&input("H", "c", &ls), &ignore, |_| true),
+            Resolved::default()
+        );
+        for rules in [
+            record("H", None, None, ControlMode::Rules, vec![]),
+            record("H", Some("other"), None, ControlMode::Rules, vec![]),
+            record("H", None, Some("other"), ControlMode::Rules, vec![]),
+        ] {
+            let (ac, _) = loaded(&[rules]).await;
+            let r = resolve(&ac, "H", "c", &["x"]);
+            assert_eq!(r.mode, ControlMode::Rules);
+            assert!(!r.unknown && !r.record_only() && !r.rules_unread());
+            assert!(r.admit_unlisted().is_none());
+        }
+        let post = ActionControlRecord {
+            entity_type: ControlEntity::Post,
+            ..record("H", None, None, ControlMode::Rules, vec![])
+        };
+        let (ac, _) = loaded(&[post]).await;
+        assert!(
+            resolve(&ac, "H", "c", &[]).unknown,
+            "another entity's record"
+        );
+        let (ac, store) = loaded(&[]).await;
+        store.put_raw("user/c/H/c", b"{not json");
+        ac.refresh().await.unwrap();
+        assert!(
+            !resolve(&ac, "H", "other", &[]).unknown,
+            "an unreadable record names it"
+        );
     }
 
     #[tokio::test]
@@ -2665,10 +2956,11 @@ mod tests {
             "user/h/New",
             br#"{"v":1,"entity_type":"user","head":"New","mode":"live","version":1,"future":1}"#,
         );
-        store.put_raw(
-            "user/h/Newer",
-            br#"{"v":9,"entity_type":"user","head":"Newer","mode":"rules","version":1}"#,
+        let newer = format!(
+            r#"{{"v":{},"entity_type":"user","head":"Newer","mode":"rules","version":1}}"#,
+            ACTION_CONTROL_RECORD_VERSION + 1
         );
+        store.put_raw("user/h/Newer", newer.as_bytes());
         ac.refresh().await.unwrap();
         assert_eq!(
             resolve(&ac, "H", "c", &[]).mode,
@@ -3009,8 +3301,9 @@ mod tests {
         assert_eq!(r.matched.unwrap().lkey, "user/l/New/missing");
     }
 
-                #[tokio::test]
-    async fn a_factory_level_is_judged_on_its_own_evidence_and_the_factory_age() {
+                        #[tokio::test]
+    async fn a_level_row_acts_whatever_its_evidence_and_records_what_it_supports() {
+        use ConfidenceLevel::High;
         const DAY: i64 = 86_400_000;
         let now = crate::now_millis();
         let (ac, _) = loaded(&[
@@ -3026,7 +3319,10 @@ mod tests {
             row_rec("G", LevelRow::High, ControlMode::Live, vec![SUSPEND]),
         ])
         .await;
-        let decide = |head: &str, evidence: Option<ConfidenceEvidence>, factory: bool| {
+        let decide_with = |head: &str,
+                           evidence: Option<ConfidenceEvidence>,
+                           factory: bool,
+                           cfg: &ControlConfig| {
             let claim = crate::confidence::Claim {
                 row: LevelRow::High,
                 unknown: false,
@@ -3035,48 +3331,56 @@ mod tests {
             };
             let mut i = factory_input(head, "c", Some(claim));
             i.factory = factory;
-            let r = ac.resolve(&i, &on(), |_| true);
-            (r.mode, r.forced)
+            let r = ac.resolve(&i, cfg, |_| true);
+            assert_eq!(
+                (r.mode, r.forced, r.page_actions.clone()),
+                (ControlMode::Live, None, vec![SUSPEND]),
+                "{head} factory={factory}"
+            );
+            r.row.unwrap().evidence_supports.unwrap()
         };
-        let at =
-            |evidence: Option<ConfidenceEvidence>, factory: bool| decide("F", evidence, factory);
+        let decide = |head: &str, evidence: Option<ConfidenceEvidence>, factory: bool| {
+            decide_with(head, evidence, factory, &on())
+        };
         let aged = |days: i64| ConfidenceEvidence {
             read_at_ms: now - days * DAY,
             ..read(0.96, 59, 0)
         };
-        assert_eq!(at(Some(aged(364)), true), (ControlMode::Live, None));
+        assert_eq!(decide("F", Some(aged(364)), true), Some(High));
+        assert_eq!(decide("F", Some(aged(366)), true), None, "too old");
         assert_eq!(
-            at(Some(aged(366)), true),
-            (ControlMode::Recording, Some("evidence_below_floor"))
-        );
-        assert_eq!(
-            at(None, true),
-            (ControlMode::Recording, Some("evidence_missing")),
+            decide("F", None, true),
+            None,
             "the row's own evidence doesn't count for a factory head"
         );
-        assert_eq!(at(None, false), (ControlMode::Live, None));
-        assert_eq!(
-            decide("G", Some(aged(29)), false),
-            (ControlMode::Live, None)
-        );
-        assert_eq!(
-            decide("G", Some(aged(31)), false),
-            (ControlMode::Recording, Some("evidence_below_floor"))
-        );
+        let weak = ConfidenceEvidence {
+            read_at_ms: now - DAY,
+            ..read(0.40, 10, 6)
+        };
+        assert_eq!(decide("F", Some(weak.clone()), true), None, "weak");
+        assert_eq!(decide("F", None, false), Some(High));
+        assert_eq!(decide("G", Some(aged(29)), false), Some(High));
+        assert_eq!(decide("G", Some(aged(31)), false), None, "expired");
+        assert_eq!(decide("G", Some(weak), false), None, "weak");
+        assert_eq!(decide("G", None, false), None, "no evidence");
         let short = ControlConfig {
             confidence: crate::confidence::ConfidenceConfig::from_value(Some(
                 &serde_json::json!({"factory_evidence_max_age_days": 30}),
             )),
             ..on()
         };
-        let claim = crate::confidence::Claim {
-            row: LevelRow::High,
-            unknown: false,
-            evidence: Some(aged(31)),
-            now_ms: now,
+        assert_eq!(decide_with("F", Some(aged(31)), true, &short), None);
+        let unreadable = ControlConfig {
+            confidence: crate::confidence::ConfidenceConfig::from_value(Some(
+                &serde_json::json!({"label_map": {}}),
+            )),
+            ..on()
         };
-        let r = ac.resolve(&factory_input("F", "c", Some(claim)), &short, |_| true);
-        assert_eq!(r.forced, Some("evidence_below_floor"));
+        assert_eq!(
+            decide_with("G", Some(aged(1)), false, &unreadable),
+            None,
+            "an unreadable confidence config makes no evidence current, and the row still acts"
+        );
     }
 
     #[tokio::test]
@@ -3093,12 +3397,11 @@ mod tests {
             (ControlMode::Live, vec![SUSPEND])
         );
         let post = ac.resolve(&post_input(&[]), &on(), |_| true);
-        assert_eq!(
-            post,
-            Resolved::default(),
+        assert!(
+            post.unknown && post.matched.is_none() && post.page_actions.is_empty(),
             "a user record never touches post decisions"
         );
-        let author = PageAction::SuspendAuthor {};
+        let author = PageAction::SUSPEND_AUTHOR;
         let (ac, _) = loaded(&[
             live(head, None, None, vec![SUSPEND]),
             live(head, None, None, vec![author]),
@@ -3145,10 +3448,8 @@ mod tests {
         .await;
         let ls = labels(&[]);
         let mut cfg = on();
-        assert_eq!(
-            ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true).mode,
-            ControlMode::Rules
-        );
+        let unaliased = ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true);
+        assert!(unaliased.unknown && unaliased.matched.is_none());
         cfg.aliases.insert("NewName".into(), "OldName".into());
         let r = ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true);
         assert_eq!(r.mode, ControlMode::Recording);
@@ -3214,7 +3515,9 @@ mod tests {
         let a = resolve(&ac, "A", "c", &[]);
         assert_eq!((a.dedup_class, a.incoming_dedup_class(|| 3)), (Some(2), 2));
         assert_eq!(resolve(&ac, "R", "c", &[]).incoming_dedup_class(|| 3), 1);
-        for head in ["G", "E", "None"] {
+        let unknown = resolve(&ac, "None", "c", &[]);
+        assert_eq!(unknown.incoming_dedup_class(|| 3), page_class(&[]));
+        for head in ["G", "E"] {
             let r = resolve(&ac, head, "c", &[]);
             assert_eq!(r.dedup_class, None, "{head}");
             assert_eq!(
@@ -3303,7 +3606,7 @@ mod tests {
     fn hide_reply_sends_the_risky_high_viz_reply_post_label() {
         let hide = |lifetime| PageAction::HideReply { lifetime };
         assert_eq!(
-            page_specs(&[PageAction::SuspendAuthor {}, hide(Lifetime::Permanent)]),
+            page_specs(&[PageAction::SUSPEND_AUTHOR, hide(Lifetime::Permanent)]),
             vec![
                 ActionSpec::AddPostLabelsV2 {
                     labels: vec!["RiskyHighVizReply".into()],
@@ -3558,6 +3861,7 @@ mod tests {
             reason: "because".into(),
             expected_version: None,
             confirm: Some(CONFIRM_WORD.into()),
+            confirm_follower_limit: None,
             entity_type: ControlEntity::User,
             updated_by: None,
             confidence: None,
@@ -3566,6 +3870,8 @@ mod tests {
             rows: None,
             admit_unlisted_labels: None,
             rollout_bp: None,
+            follower_threshold: None,
+            skip_high_credibility: None,
         }
     }
 
@@ -3664,7 +3970,7 @@ mod tests {
                 put(
                     "H",
                     ControlMode::Live,
-                    vec![SUSPEND, PageAction::SuspendAuthor {}],
+                    vec![SUSPEND, PageAction::SUSPEND_AUTHOR],
                 ),
                 "wrong_entity_actions",
             ),
@@ -3763,6 +4069,13 @@ mod tests {
                 },
                 "confirm_required",
             ),
+            (
+                ActionControlPutRequest {
+                    evidence_override: Some(person(1_791_000_000_000 + 86_400_000)),
+                    ..row_put("Factory", LevelRow::Low, ControlMode::Live, vec![SHR7])
+                },
+                "invalid_override",
+            ),
         ];
         for (req, want) in cases {
             assert_eq!(code(set(&ac, req.clone()).await), want, "{req:?}");
@@ -3776,10 +4089,7 @@ mod tests {
                 ControlMode::Recording,
                 vec![LIVENESS],
             ),
-            ActionControlPutRequest {
-                evidence_override: Some(person(1_791_000_000_000 + 86_400_000)),
-                ..row_put("Factory", LevelRow::Low, ControlMode::Live, vec![SHR7])
-            },
+            row_put("Factory", LevelRow::Low, ControlMode::Live, vec![SHR7]),
         ] {
             let got = set(&ac, req.clone()).await;
             assert!(got.is_ok(), "{req:?}: {got:?}");
@@ -3806,13 +4116,11 @@ mod tests {
             |_| true,
         );
         assert_eq!(
-            (r.mode, r.page_actions.clone()),
-            (ControlMode::Live, vec![SHR7])
+            (r.mode, r.forced, r.page_actions.clone()),
+            (ControlMode::Live, None, vec![SHR7]),
+            "a live row acts with no evidence"
         );
-        assert_eq!(
-            r.row.unwrap().override_by.as_deref(),
-            Some("operator@example.com")
-        );
+        assert_eq!(r.row.unwrap().evidence_supports, Some(None));
         for req in [
             put("Factory", ControlMode::Recording, vec![]),
             ActionControlPutRequest {
@@ -3833,6 +4141,9 @@ mod tests {
             let got = set(&ac, req.clone()).await;
             assert!(got.is_ok(), "{req:?}: {got:?}");
         }
+        set(&ac, put("H", ControlMode::Rules, vec![]))
+            .await
+            .unwrap();
         for req in [
             put(
                 "NearDupEmbeddingCseNcmecMatch",
@@ -3854,7 +4165,7 @@ mod tests {
                 ..put(
                     "PostHead",
                     ControlMode::Live,
-                    vec![PageAction::SuspendAuthor {}],
+                    vec![PageAction::SUSPEND_AUTHOR],
                 )
             },
         )
@@ -3877,6 +4188,11 @@ mod tests {
             ("NearDupEmbeddingCseMatch", None),
             ("AnchorHead", Some("anchor_campaign_suspend_cse")),
         ] {
+            if band.is_some() {
+                set(&ac, put(head, ControlMode::Rules, vec![]))
+                    .await
+                    .unwrap();
+            }
             let recording = ActionControlPutRequest {
                 band: band.map(Into::into),
                 ..put(head, ControlMode::Recording, vec![])
@@ -3898,7 +4214,7 @@ mod tests {
         }
     }
 
-            #[tokio::test]
+                #[tokio::test]
     async fn an_unlisted_decision_is_admitted_only_by_a_record_that_decides() {
         let (ac, _) = loaded(&[
             record("Moved", None, None, ControlMode::Rows, vec![]),
@@ -3909,7 +4225,7 @@ mod tests {
             row_rec("RulesRow", LevelRow::Missing, ControlMode::Rules, vec![]),
         ])
         .await;
-        for head in ["Moved", "Recording", "Live"] {
+        for head in ["Moved", "Recording", "Live", "None"] {
             let r = resolve(&ac, head, "c", &[]);
             let page = r.page_actions.clone();
             let r = r
@@ -3925,7 +4241,7 @@ mod tests {
         assert_eq!(moved.mode, ControlMode::Recording);
         assert!(moved.page_actions.is_empty());
         assert_eq!(logged_because(&moved).as_deref(), Some("no_selection"));
-        for head in ["None", "OnRules", "RulesRow"] {
+        for head in ["OnRules", "RulesRow"] {
             assert!(
                 resolve(&ac, head, "c", &[]).admit_unlisted().is_none(),
                 "{head}"
@@ -4145,7 +4461,7 @@ mod tests {
             set(&ac, put("H", ControlMode::Recording, vec![])).await,
             Err(SetError::Store(_))
         ));
-        assert_eq!(resolve(&ac, "H", "c", &[]).mode, ControlMode::Rules);
+        assert!(resolve(&ac, "H", "c", &[]).matched.is_none());
     }
 
     #[tokio::test]
@@ -4156,7 +4472,7 @@ mod tests {
             set(&ac, put("H", ControlMode::Recording, vec![])).await,
             Err(SetError::Store(_))
         ));
-        assert_eq!(resolve(&ac, "H", "c", &[]).mode, ControlMode::Rules);
+        assert!(resolve(&ac, "H", "c", &[]).matched.is_none());
         store.fail_put.store(false, Ordering::Relaxed);
         store.fail_get.store(true, Ordering::Relaxed);
         assert!(matches!(
@@ -4407,7 +4723,7 @@ mod tests {
 
                 #[tokio::test]
     async fn the_unlisted_opt_in_is_saved_on_the_head_record_only() {
-        let (ac, store) = loaded(&[]).await;
+        let (ac, store) = loaded(&[record("H", Some("c"), None, ControlMode::Rules, vec![])]).await;
         let opt_in = |confirm: Option<&str>| ActionControlPutRequest {
             admit_unlisted_labels: Some(true),
             confirm: confirm.map(Into::into),
@@ -4462,6 +4778,685 @@ mod tests {
             code(set(&ac, factory).await),
             "factory_admit_unlisted_labels"
         );
+    }
+
+                    #[tokio::test]
+    async fn a_first_save_of_an_unknown_head_keeps_its_decisions_admitted() {
+        let unconfirmed = |req| ActionControlPutRequest {
+            confirm: None,
+            ..req
+        };
+        for first in [
+            put("H", ControlMode::Recording, vec![]),
+            move_put("H", RowsRequest::default()),
+        ] {
+            let (ac, store) = loaded(&[]).await;
+            let out = set(&ac, unconfirmed(first.clone())).await.unwrap();
+            assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+            assert!(out.view.record.admit_unlisted_labels);
+            assert!(ac.admits_unlisted(EntityType::User, "H"));
+            assert!(!ac.admits_unlisted(EntityType::Post, "H"));
+            assert!(stored(&store, "user/h/H").admit_unlisted_labels);
+
+            let (ac, _) = loaded(&[]).await;
+            let off = ActionControlPutRequest {
+                admit_unlisted_labels: Some(false),
+                ..unconfirmed(first)
+            };
+            set(&ac, off).await.unwrap();
+            assert!(!ac.admits_unlisted(EntityType::User, "H"));
+        }
+
+        let (ac, _) = loaded(&[record("H", Some("c"), None, ControlMode::Rules, vec![])]).await;
+        set(&ac, put("H", ControlMode::Recording, vec![]))
+            .await
+            .unwrap();
+        assert!(!ac.admits_unlisted(EntityType::User, "H"), "a known head");
+
+        let (ac, _) = loaded(&[]).await;
+        for narrow in [
+            ActionControlPutRequest {
+                classifier: Some("c".into()),
+                ..put("H", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                band: Some("b".into()),
+                ..put("H", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                classifier: Some("c".into()),
+                ..move_put("H", RowsRequest::default())
+            },
+        ] {
+            assert_eq!(
+                code(set(&ac, narrow).await),
+                "unknown_head_needs_head_record"
+            );
+        }
+        assert!(resolve(&ac, "H", "c", &[]).unknown, "nothing written");
+
+        let (ac, store) = loaded(&[]).await;
+        seen_factory(&store, "F");
+        let factory_classifier = ActionControlPutRequest {
+            classifier: Some("c".into()),
+            ..put("F", ControlMode::Recording, vec![])
+        };
+        let got = set(&ac, factory_classifier).await;
+        assert!(got.is_ok(), "a factory head is never unknown: {got:?}");
+    }
+
+    fn stored(store: &MemControlStore, lkey: &str) -> ActionControlRecord {
+        let rows = store.pkey_rows(MH_PKEY);
+        let (_, v) = rows.iter().find(|(k, _)| k == lkey).expect(lkey);
+        parse_record(v).unwrap()
+    }
+
+    fn no_skip() -> u32 {
+        xai_abuse_enforcement_types::action_control::stored_off_follower_threshold()
+    }
+
+    fn skips_of(r: &ActionControlRecord) -> (Option<u32>, Option<bool>) {
+        (r.follower_threshold, r.skip_high_credibility)
+    }
+
+            #[tokio::test]
+    async fn the_author_skips_are_kept_when_left_out_and_cleared_by_null() {
+        let more = crate::safety_checks::follower_skip_view().today_threshold as u32 * 3;
+        let (ac, store) = loaded(&[]).await;
+        let first = ActionControlPutRequest {
+            follower_threshold: Some(Some(no_skip())),
+            skip_high_credibility: Some(Some(false)),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        let out = set(&ac, first).await.unwrap();
+        assert_eq!(skips_of(&out.view.record), (Some(no_skip()), Some(false)));
+        assert_eq!(out.view.record.v, AUTHOR_SKIPS_RECORD_VERSION);
+        assert_eq!(out.harsher_because.len(), 2, "{:?}", out.harsher_because);
+
+        let leave = ActionControlPutRequest {
+            expected_version: Some(1),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        set(&ac, leave).await.unwrap();
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(no_skip()), Some(false))
+        );
+
+        let change = ActionControlPutRequest {
+            expected_version: Some(2),
+            follower_threshold: Some(Some(more)),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        set(&ac, change).await.unwrap();
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(more), Some(false))
+        );
+
+        let clear = ActionControlPutRequest {
+            expected_version: Some(3),
+            follower_threshold: Some(None),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        let out = set(&ac, clear).await.unwrap();
+        assert_eq!(skips_of(&out.view.record), (None, Some(false)));
+        assert_eq!(out.view.record.v, AUTHOR_SKIPS_RECORD_VERSION);
+        let clear = ActionControlPutRequest {
+            expected_version: Some(4),
+            skip_high_credibility: Some(None),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        let out = set(&ac, clear).await.unwrap();
+        assert_eq!(skips_of(&out.view.record), (None, None));
+        assert_eq!(
+            out.view.record.v,
+            xai_abuse_enforcement_types::action_control::BAND_RECORD_VERSION,
+            "an older image reads it again"
+        );
+        assert_eq!(out.view.record.version, 5);
+
+        let mut history: Vec<ActionControlHistoryEntry> = store
+            .pkey_rows(&format!("{HISTORY_PKEY_PREFIX}H"))
+            .iter()
+            .map(|(_, v)| serde_json::from_slice(v).unwrap())
+            .collect();
+        history.sort_by_key(|e| e.version);
+        let trail: Vec<_> = history
+            .iter()
+            .map(|e| (e.before.as_ref().map(skips_of), skips_of(&e.after)))
+            .collect();
+        assert_eq!(
+            trail,
+            [
+                (None, (Some(no_skip()), Some(false))),
+                (
+                    Some((Some(no_skip()), Some(false))),
+                    (Some(no_skip()), Some(false))
+                ),
+                (
+                    Some((Some(no_skip()), Some(false))),
+                    (Some(more), Some(false))
+                ),
+                (Some((Some(more), Some(false))), (None, Some(false))),
+                (Some((None, Some(false))), (None, None)),
+            ]
+        );
+    }
+
+                #[tokio::test]
+    async fn lifting_a_skip_needs_the_confirm_on_every_head_record() {
+        let d = crate::safety_checks::follower_skip_view().today_threshold as u32;
+        let (ac, store) = loaded(&[]).await;
+        for (head, mode, actions) in [
+            ("Live", ControlMode::Live, vec![SUSPEND]),
+            ("Recording", ControlMode::Recording, vec![]),
+            ("Rules", ControlMode::Rules, vec![]),
+        ] {
+            set(&ac, put(head, mode, actions.clone())).await.unwrap();
+            let change =
+                |version: u64, threshold: Option<Option<u32>>, cred: Option<Option<bool>>| {
+                    ActionControlPutRequest {
+                        expected_version: Some(version),
+                        confirm: None,
+                        follower_threshold: threshold,
+                        skip_high_credibility: cred,
+                        ..put(head, mode, actions.clone())
+                    }
+                };
+            match set(&ac, change(1, Some(Some(no_skip())), None)).await {
+                Err(SetError::Invalid("confirm_required", msg)) => assert!(
+                    msg.contains(&format!(
+                        "skips fewer high-follower accounts ({d}+ to {}+)",
+                        no_skip()
+                    )),
+                    "{head}: {msg}"
+                ),
+                other => panic!("{head}: {other:?}"),
+            }
+            match set(&ac, change(1, None, Some(Some(false)))).await {
+                Err(SetError::Invalid("confirm_required", msg)) => assert!(
+                    msg.contains("stops skipping high-credibility accounts"),
+                    "{head}: {msg}"
+                ),
+                other => panic!("{head}: {other:?}"),
+            }
+            assert_eq!(
+                code(set(&ac, change(1, Some(Some(d * 5)), None)).await),
+                "confirm_required",
+                "{head}: from today's count to a higher one"
+            );
+
+            let same = set(&ac, change(1, Some(Some(d)), None)).await.unwrap();
+            assert!(same.harsher_because.is_empty(), "{head}: today's count");
+            let kept = set(&ac, change(2, None, None)).await.unwrap();
+            assert!(kept.harsher_because.is_empty(), "{head}: left out");
+            let confirmed = ActionControlPutRequest {
+                confirm: Some(CONFIRM_WORD.into()),
+                ..change(3, Some(Some(d * 5)), Some(Some(false)))
+            };
+            let out = set(&ac, confirmed).await.unwrap();
+            assert_eq!(
+                out.harsher_because.len(),
+                2,
+                "{head}: {:?}",
+                out.harsher_because
+            );
+            for (version, threshold, cred) in [
+                (4, Some(Some(d * 2)), None),
+                (5, Some(None), None),
+                (6, None, Some(Some(true))),
+                (7, Some(Some(no_skip())), None),
+            ] {
+                let out = set(&ac, change(version, threshold, cred)).await;
+                if version == 7 {
+                    assert_eq!(code(out), "confirm_required", "{head}: back to off");
+                    continue;
+                }
+                let out = out.unwrap();
+                assert!(
+                    out.harsher_because.is_empty(),
+                    "{head} v{version}: {:?}",
+                    out.harsher_because
+                );
+            }
+            assert_eq!(
+                skips_of(&stored(&store, &format!("user/h/{head}"))),
+                (None, Some(true))
+            );
+        }
+        let to_zero = ActionControlPutRequest {
+            confirm: None,
+            follower_threshold: Some(Some(no_skip())),
+            skip_high_credibility: Some(Some(false)),
+            ..put("Fresh", ControlMode::Rules, vec![])
+        };
+        set(&ac, to_zero.clone()).await.unwrap_err();
+        let stricter = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            follower_threshold: Some(Some(d)),
+            skip_high_credibility: Some(Some(true)),
+            ..put("Fresh", ControlMode::Rules, vec![])
+        };
+        set(
+            &ac,
+            ActionControlPutRequest {
+                confirm: Some(CONFIRM_WORD.into()),
+                ..to_zero
+            },
+        )
+        .await
+        .unwrap();
+        let out = set(&ac, stricter).await.unwrap();
+        assert!(
+            out.harsher_because.is_empty(),
+            "from off back to today's skips"
+        );
+    }
+
+            #[tokio::test]
+    async fn lifting_a_skip_on_a_renamed_heads_old_record_needs_the_confirm() {
+        let mut cfg = on();
+        cfg.aliases.insert("NewName".into(), "OldName".into());
+        let safety = baked_safety();
+        for shadowed in [false, true] {
+            let (ac, _) = loaded(&[]).await;
+            let save = |req: ActionControlPutRequest| {
+                ac.set(req, "operator@example.com", "pv2", NOW_MS, &cfg, &safety)
+            };
+            if shadowed {
+                save(put("NewName", ControlMode::Rules, vec![]))
+                    .await
+                    .unwrap();
+            }
+            save(put("OldName", ControlMode::Rules, vec![]))
+                .await
+                .unwrap();
+            let lift = ActionControlPutRequest {
+                expected_version: Some(1),
+                confirm: None,
+                follower_threshold: Some(Some(no_skip())),
+                ..put("OldName", ControlMode::Rules, vec![])
+            };
+            assert_eq!(
+                code(save(lift.clone()).await),
+                "confirm_required",
+                "{shadowed}"
+            );
+            let confirmed = ActionControlPutRequest {
+                confirm: Some(CONFIRM_WORD.into()),
+                ..lift
+            };
+            save(confirmed).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_move_carries_the_author_skips_on_the_head_record_only() {
+        let (ac, store) = loaded(&[]).await;
+        let off = ActionControlPutRequest {
+            confirm: None,
+            follower_threshold: Some(Some(no_skip())),
+            ..move_put("H", all_rows(ControlMode::Recording, vec![]))
+        };
+        assert_eq!(
+            code(set(&ac, off.clone()).await),
+            "confirm_required",
+            "even with every row recording only"
+        );
+        let off = ActionControlPutRequest {
+            confirm: Some(CONFIRM_WORD.into()),
+            ..off
+        };
+        set(&ac, off).await.unwrap();
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(no_skip()), None)
+        );
+        assert_eq!(stored(&store, "user/h/H").v, AUTHOR_SKIPS_RECORD_VERSION);
+        for row in LevelRow::ALL {
+            let r = stored(&store, &format!("user/l/H/{}", row.as_str()));
+            assert_eq!(skips_of(&r), (None, None));
+            assert_eq!(r.v, ROWS_RECORD_VERSION);
+        }
+
+        let high = ActionControlPutRequest {
+            expected_version: Some(1),
+            ..row_put("H", LevelRow::High, ControlMode::Live, vec![SUSPEND])
+        };
+        set(&ac, high).await.unwrap();
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(no_skip()), None),
+            "a row's save leaves the head record alone"
+        );
+
+        let with_versions = |mode: ControlMode, actions: Vec<PageAction>, v: u64| RowSetting {
+            expected_version: Some(v),
+            ..setting(mode, actions)
+        };
+        let cred = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            skip_high_credibility: Some(Some(false)),
+            ..move_put(
+                "H",
+                RowsRequest {
+                    low: Some(with_versions(ControlMode::Recording, vec![], 1)),
+                    mid: Some(with_versions(ControlMode::Recording, vec![], 1)),
+                    high: Some(with_versions(ControlMode::Live, vec![SUSPEND], 2)),
+                    missing: Some(with_versions(ControlMode::Recording, vec![], 1)),
+                },
+            )
+        };
+        match set(&ac, cred.clone()).await {
+            Err(SetError::Invalid("confirm_required", msg)) => {
+                assert!(
+                    msg.contains("stops skipping high-credibility accounts"),
+                    "{msg}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let confirmed = ActionControlPutRequest {
+            confirm: Some(CONFIRM_WORD.into()),
+            ..cred
+        };
+        set(&ac, confirmed).await.unwrap();
+        assert_eq!(
+            skips_of(&stored(&store, "user/h/H")),
+            (Some(no_skip()), Some(false)),
+            "the threshold left out is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_author_skips_refusals() {
+        let ceiling = crate::safety_checks::follower_ceiling() as u32;
+        let today = crate::safety_checks::follower_skip_view().today_threshold as u32;
+        let (ac, store) = loaded(&[]).await;
+        let at = |threshold: u32| ActionControlPutRequest {
+            follower_threshold: Some(Some(threshold)),
+            ..put("H", ControlMode::Recording, vec![])
+        };
+        for below in [1, today / 2, today - 1] {
+            assert_eq!(
+                code(set(&ac, at(below)).await),
+                "follower_threshold_below_today",
+                "{below}"
+            );
+        }
+        match set(&ac, at(0)).await {
+            Err(SetError::Invalid("follower_threshold_missing", msg)) => {
+                assert!(msg.starts_with("state a follower limit"), "{msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let max = xai_abuse_enforcement_types::action_control::FOLLOWER_THRESHOLD_MAX;
+        for over in [max + 1, u32::MAX] {
+            let req = ActionControlPutRequest {
+                confirm_follower_limit: Some(over),
+                ..at(over)
+            };
+            assert_eq!(code(set(&ac, req).await), "follower_threshold_too_high");
+        }
+        for stray in [Some(Some(ceiling - 1)), None, Some(None)] {
+            let req = ActionControlPutRequest {
+                follower_threshold: stray,
+                confirm_follower_limit: Some(ceiling - 1),
+                ..put("H", ControlMode::Recording, vec![])
+            };
+            assert_eq!(
+                code(set(&ac, req).await),
+                "confirm_follower_limit_unexpected",
+                "{stray:?}"
+            );
+        }
+        set(&ac, at(ceiling - 1)).await.unwrap();
+        let v = |n: u64| ActionControlPutRequest {
+            expected_version: Some(n),
+            ..at(today)
+        };
+        set(&ac, v(1)).await.unwrap();
+        let off = ActionControlPutRequest {
+            follower_threshold: Some(Some(no_skip())),
+            ..v(2)
+        };
+        set(&ac, off).await.unwrap();
+
+        for narrow in [
+            ActionControlPutRequest {
+                classifier: Some("c".into()),
+                follower_threshold: Some(Some(no_skip())),
+                ..put("H2", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                band: Some("b".into()),
+                skip_high_credibility: Some(Some(false)),
+                ..put("H2", ControlMode::Recording, vec![])
+            },
+            ActionControlPutRequest {
+                follower_threshold: Some(None),
+                ..row_put("H2", LevelRow::High, ControlMode::Recording, vec![])
+            },
+        ] {
+            assert_eq!(code(set(&ac, narrow).await), "author_skips_scope");
+        }
+
+        seen_factory(&store, "Factory");
+        for factory in [
+            ActionControlPutRequest {
+                follower_threshold: Some(Some(no_skip())),
+                ..move_put("Factory", RowsRequest::default())
+            },
+            ActionControlPutRequest {
+                skip_high_credibility: Some(None),
+                ..move_put("Factory", RowsRequest::default())
+            },
+            ActionControlPutRequest {
+                follower_threshold: Some(Some(1)),
+                ..move_put("Factory", RowsRequest::default())
+            },
+            ActionControlPutRequest {
+                follower_threshold: Some(Some(ceiling)),
+                ..move_put("Factory", RowsRequest::default())
+            },
+        ] {
+            assert_eq!(code(set(&ac, factory).await), "factory_author_skips");
+        }
+    }
+
+                #[tokio::test]
+    async fn a_raised_follower_limit_needs_the_number_twice_and_the_confirm() {
+        use xai_abuse_enforcement_types::action_control::RAISED_FOLLOWER_LIMIT_RECORD_VERSION;
+        let ceiling = crate::safety_checks::follower_ceiling() as u32;
+        let (ac, store) = loaded(&[]).await;
+        let raise = |n: u32, repeated: Option<u32>, confirm: Option<&str>, version: Option<u64>| {
+            ActionControlPutRequest {
+                expected_version: version,
+                confirm: confirm.map(Into::into),
+                follower_threshold: Some(Some(n)),
+                confirm_follower_limit: repeated,
+                ..put("H", ControlMode::Live, vec![SUSPEND])
+            }
+        };
+        let n = ceiling * 5 / 2;
+        for (repeated, confirm) in [
+            (None, Some(CONFIRM_WORD)),
+            (Some(n), None),
+            (Some(n), Some("enforce")),
+            (Some(n - 1), Some(CONFIRM_WORD)),
+        ] {
+            match set(&ac, raise(n, repeated, confirm, None)).await {
+                Err(SetError::Invalid("follower_limit_unconfirmed", msg)) => assert!(
+                    msg.contains(&format!("{ceiling} or more followers")),
+                    "{msg}"
+                ),
+                other => panic!("{repeated:?} {confirm:?}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            code(set(&ac, raise(ceiling, None, Some(CONFIRM_WORD), None)).await),
+            "follower_limit_unconfirmed",
+            "the ceiling itself counts as raised"
+        );
+
+        let out = set(&ac, raise(n, Some(n), Some(CONFIRM_WORD), None))
+            .await
+            .unwrap();
+        assert!(
+            out.harsher_because
+                .iter()
+                .any(|w| w == &format!("raises the follower ceiling ({ceiling}+ to {n}+), acting on accounts every other head skips")),
+            "{:?}",
+            out.harsher_because
+        );
+        let rec = stored(&store, "user/h/H");
+        assert_eq!(rec.follower_threshold, Some(n));
+        assert_eq!(rec.v, RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+        let rows = store.pkey_rows(MH_PKEY);
+        let (_, bytes) = rows.iter().find(|(k, _)| k == "user/h/H").unwrap();
+        let mut newer: Value = serde_json::from_slice(bytes).unwrap();
+        newer["v"] = (ACTION_CONTROL_RECORD_VERSION + 1).into();
+        assert!(
+            parse_record(&serde_json::to_vec(&newer).unwrap()).is_err(),
+            "a reader refuses a record version above its own"
+        );
+
+        let leave = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, leave).await.unwrap();
+        assert!(out.harsher_because.is_empty());
+        assert_eq!(stored(&store, "user/h/H").follower_threshold, Some(n));
+        assert_eq!(
+            stored(&store, "user/h/H").v,
+            RAISED_FOLLOWER_LIMIT_RECORD_VERSION
+        );
+
+        assert_eq!(
+            code(set(&ac, raise(ceiling * 2, None, None, Some(2))).await),
+            "follower_limit_unconfirmed",
+            "lowering a raised limit still sends it twice"
+        );
+        set(
+            &ac,
+            raise(ceiling * 2, Some(ceiling * 2), Some(CONFIRM_WORD), Some(2)),
+        )
+        .await
+        .unwrap();
+
+        let back = ActionControlPutRequest {
+            expected_version: Some(3),
+            confirm: None,
+            follower_threshold: Some(Some(no_skip())),
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, back).await.unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        let rec = stored(&store, "user/h/H");
+        assert_eq!(rec.follower_threshold, Some(no_skip()));
+        assert!(rec.v < RAISED_FOLLOWER_LIMIT_RECORD_VERSION, "{}", rec.v);
+    }
+
+                #[tokio::test]
+    async fn a_stored_zero_threshold_is_rewritten_as_one_below_the_ceiling() {
+        let old = ActionControlRecord {
+            follower_threshold: Some(0),
+            ..live("H", None, None, vec![SUSPEND])
+        };
+        let (ac, store) = loaded(&[old]).await;
+        let r = resolve(&ac, "H", "c", &[]);
+        assert!(r.page_driven());
+        assert_eq!(r.author_skips.follower_threshold, Some(no_skip()));
+        let leave = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: None,
+            ..put("H", ControlMode::Live, vec![SUSPEND])
+        };
+        let out = set(&ac, leave).await.unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+        assert_eq!(
+            stored(&store, "user/h/H").follower_threshold,
+            Some(no_skip())
+        );
+    }
+
+                #[tokio::test]
+    async fn a_decision_takes_the_head_records_skips() {
+        let holder = |head: &str| ActionControlRecord {
+            follower_threshold: Some(0),
+            skip_high_credibility: Some(false),
+            ..record(head, None, None, ControlMode::Rules, vec![])
+        };
+        let (ac, _) = loaded(&[
+            holder("H"),
+            live("H", Some("c"), None, vec![SUSPEND]),
+            live("Plain", None, None, vec![SUSPEND]),
+            holder("OldName"),
+            live("NewName", Some("c"), None, vec![SUSPEND]),
+        ])
+        .await;
+        let want = AuthorSkips {
+            follower_threshold: Some(no_skip()),
+            skip_high_credibility: Some(false),
+        };
+        let r = resolve(&ac, "H", "c", &[]);
+        assert!(r.page_driven());
+        assert_eq!(r.author_skips, want);
+        assert!(
+            r.info_keys()
+                .contains(&(FOLLOWER_THRESHOLD_KEY.into(), no_skip().to_string()))
+        );
+        assert!(
+            r.info_keys()
+                .contains(&(SKIP_HIGH_CREDIBILITY_KEY.into(), "false".into()))
+        );
+        let rules = resolve(&ac, "H", "other", &[]);
+        assert!(!rules.page_driven());
+        assert!(
+            !rules
+                .info_keys()
+                .iter()
+                .any(|(k, _)| k == FOLLOWER_THRESHOLD_KEY)
+        );
+        let plain = resolve(&ac, "Plain", "c", &[]);
+        assert_eq!(plain.author_skips, AuthorSkips::default());
+        assert!(
+            !plain
+                .info_keys()
+                .iter()
+                .any(|(k, _)| k == FOLLOWER_THRESHOLD_KEY)
+        );
+
+        let mut cfg = on();
+        cfg.aliases.insert("NewName".into(), "OldName".into());
+        let ls = labels(&[]);
+        let renamed = ac.resolve(&input("NewName", "c", &ls), &cfg, |_| true);
+        assert_eq!(renamed.author_skips, want);
+
+        let factory = ac.resolve(
+            &ResolveInput {
+                factory: true,
+                ..input("H", "c", &ls)
+            },
+            &on(),
+            |_| true,
+        );
+        assert_eq!(factory.author_skips, AuthorSkips::default());
+    }
+
+    #[tokio::test]
+    async fn the_list_says_the_service_takes_the_skips_and_their_default() {
+        let (ac, _) = loaded(&[]).await;
+        let list = ac.list(&on(), baked_safety()).await;
+        assert_eq!(list.feature_version, 10);
+        let view = list.follower_skip.unwrap();
+        assert_eq!(view, crate::safety_checks::follower_skip_view());
+        assert!(view.today_threshold < view.ceiling);
     }
 
     #[tokio::test]
@@ -4611,9 +5606,22 @@ mod tests {
             ),
             (
                 ActionControlPutRequest {
-                    evidence_override: Some(person(PUT_NOW + 8 * 86_400_000)),
+                    evidence_override: Some(person(PUT_NOW + 86_400_000)),
                     ..edit(LevelRow::High, ControlMode::Live, vec![SUSPEND])
                 },
+                "invalid_override",
+            ),
+            (
+                move_put(
+                    "H",
+                    RowsRequest {
+                        mid: Some(RowSetting {
+                            evidence_override: Some(person(PUT_NOW + 86_400_000)),
+                            ..setting(ControlMode::Live, vec![SUSPEND])
+                        }),
+                        ..Default::default()
+                    },
+                ),
                 "invalid_override",
             ),
             (
@@ -4684,11 +5692,7 @@ mod tests {
             unconfirmed(LevelRow::Mid, vec![SUSPEND], Some(2)),
         )
         .await;
-        assert_eq!(
-            code(got),
-            "confirm_required",
-            "unreadable confidence config"
-        );
+        assert!(got.is_ok(), "unreadable confidence config: {got:?}");
     }
 
                 #[tokio::test]
@@ -4771,8 +5775,13 @@ mod tests {
         assert_eq!(out.view.effective_mode, ControlMode::Rows);
         assert_eq!(
             out.harsher_because,
-            vec!["high row: turns the scope live"],
-            "judged like any other head"
+            vec![
+                "low row: hands the scope back to the GrowthBook rules, which act",
+                "mid row: hands the scope back to the GrowthBook rules, which act",
+                "high row: turns the scope live",
+                "missing row: hands the scope back to the GrowthBook rules, which act",
+            ],
+            "judged like any other head no record names"
         );
         let mut cfg = on();
         cfg.aliases
@@ -4783,6 +5792,9 @@ mod tests {
                 .is_ok(),
             "a rename onto a child-safety head"
         );
+        set(&ac, put("CseRtScoreHiV2DryRun", ControlMode::Rules, vec![]))
+            .await
+            .unwrap();
         let label_row = ActionControlPutRequest {
             classifier: Some("c".into()),
             ..move_put("CseRtScoreHiV2DryRun", all_rules())
@@ -5023,9 +6035,19 @@ mod tests {
             confirm: None,
             ..move_put("H", rows)
         };
-        let (ac, _) = loaded(&[]).await;
-        let out = set(&ac, unconfirmed(all_rules())).await.unwrap();
+        let (ac, _) = loaded(&[record("H", None, None, ControlMode::Rules, vec![])]).await;
+        let req = ActionControlPutRequest {
+            expected_version: Some(1),
+            ..unconfirmed(all_rules())
+        };
+        let out = set(&ac, req).await.unwrap();
         assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
+
+        let (ac, _) = loaded(&[]).await;
+        assert_eq!(
+            code(set(&ac, unconfirmed(all_rules())).await),
+            "confirm_required"
+        );
 
         let (ac, _) = loaded(&[]).await;
         assert!(
@@ -5130,7 +6152,8 @@ mod tests {
         weak[1].evidence = Some(Box::new(read(0.88, 50, 2)));
         let (ac, store) = loaded(&weak).await;
         covered_seen(&store);
-        assert_eq!(code(set(&ac, back(None)).await), "confirm_required");
+        let out = set(&ac, back(None)).await.unwrap();
+        assert!(out.harsher_because.is_empty(), "{:?}", out.harsher_because);
 
         let (ac, _) = loaded(&stored()).await;
         let mid_live = ActionControlPutRequest {
@@ -6324,5 +7347,287 @@ mod tests {
         );
         let later = set_at(&ac, rollout_after_log_only(2), NOW_MS + 90_000).await;
         assert!(later.is_ok(), "{later:?}");
+    }
+
+    const SUSPEND_PERMANENT_CSE: PageAction = PageAction::Suspend {
+        permanent: true,
+        policy: SuspensionPolicy::Cse,
+    };
+
+    #[test]
+    fn a_page_suspend_maps_to_its_permanence_and_policy() {
+        assert_eq!(
+            page_specs(&[SUSPEND]),
+            vec![ActionSpec::SuspendUser {
+                perm: false,
+                policy: "PlatformManipulation".into()
+            }]
+        );
+        assert_eq!(
+            page_specs(&[PageAction::SUSPEND_AUTHOR]),
+            page_specs(&[SUSPEND]),
+            "the plain author suspend is unchanged"
+        );
+        for permanent in [false, true] {
+            for policy in SuspensionPolicy::ALL {
+                assert_eq!(
+                    page_specs(&[PageAction::SuspendAuthor { permanent, policy }]),
+                    page_specs(&[PageAction::Suspend { permanent, policy }]),
+                    "{permanent} {policy:?}: the author suspend sends what the account suspend does"
+                );
+            }
+        }
+        assert_eq!(
+            page_specs(&[
+                PageAction::SuspendAuthor {
+                    permanent: true,
+                    policy: SuspensionPolicy::Cse,
+                },
+                PageAction::PostSpamHighRecall {
+                    lifetime: Lifetime::Permanent,
+                },
+            ]),
+            vec![
+                ActionSpec::AddPostLabelsV2 {
+                    labels: vec!["SpamHighRecall".into()],
+                    ttl_msec: None,
+                },
+                ActionSpec::SuspendUser {
+                    perm: true,
+                    policy: "Cse".into()
+                },
+            ],
+            "the post label goes first, then the author suspend"
+        );
+        assert_eq!(
+            page_specs(&[SUSPEND_PERMANENT_CSE]),
+            vec![ActionSpec::SuspendUser {
+                perm: true,
+                policy: "Cse".into()
+            }]
+        );
+        assert_eq!(
+            action_specs_json(&page_specs(&[SUSPEND_PERMANENT_CSE])),
+            r#"[{"kind":"suspend","permanent":true,"policy":"Cse"}]"#
+        );
+        assert!(page_class(&[SUSPEND_PERMANENT_CSE]) > page_class(&[SUSPEND]));
+        assert_eq!(page_class(&[SUSPEND]), crate::dedup_cache::CLASS_SUSPEND);
+    }
+
+    #[test]
+    fn a_suspension_made_permanent_or_moved_to_another_policy_is_harsher() {
+        let r = |actions: Vec<PageAction>| record("H", None, None, ControlMode::Live, actions);
+        let why = harsher_because(
+            Some(&r(vec![SUSPEND])),
+            &r(vec![SUSPEND_PERMANENT_CSE]),
+            None,
+        );
+        assert_eq!(
+            why,
+            vec![
+                "makes the suspension permanent".to_owned(),
+                "changes the suspension policy (PlatformManipulation to Cse)".to_owned()
+            ]
+        );
+        assert!(
+            harsher_because(
+                Some(&r(vec![SUSPEND_PERMANENT_CSE])),
+                &r(vec![SUSPEND]),
+                None
+            )
+            .iter()
+            .all(|w| !w.contains("permanent")),
+            "back to temporary is softer"
+        );
+        assert_eq!(
+            harsher_because(Some(&r(vec![SUSPEND])), &r(vec![SUSPEND]), None),
+            Vec::<String>::new()
+        );
+        let author_cse = PageAction::SuspendAuthor {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        let label = PageAction::PostSpamHighRecall {
+            lifetime: Lifetime::Permanent,
+        };
+        assert_eq!(
+            harsher_because(
+                Some(&r(vec![label, PageAction::SUSPEND_AUTHOR])),
+                &r(vec![label, author_cse]),
+                None,
+            ),
+            vec![
+                "makes the suspension permanent".to_owned(),
+                "changes the suspension policy (PlatformManipulation to Cse)".to_owned()
+            ],
+            "an author suspend made permanent and moved to Cse"
+        );
+        assert_eq!(
+            harsher_because(Some(&r(vec![label])), &r(vec![label, author_cse]), None),
+            vec!["adds suspend".to_owned()]
+        );
+        assert!(
+            harsher_because(
+                Some(&r(vec![author_cse])),
+                &r(vec![PageAction::SUSPEND_AUTHOR]),
+                None
+            )
+            .iter()
+            .all(|w| !w.contains("permanent")),
+            "an author suspend back to temporary is softer"
+        );
+        let rules_perm =
+            serde_json::json!([{"kind": "suspend", "permanent": true, "policy": "Cse"}]);
+        assert!(
+            harsher_because(
+                Some(&r(vec![SUSPEND_PERMANENT_CSE])),
+                &record("H", None, None, ControlMode::Rules, vec![]),
+                Some(rules_perm.as_array().unwrap()),
+            )
+            .is_empty(),
+            "rules that send the same permanent suspension are no harsher"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_saved_with_a_suspension_option_is_refused_by_an_image_before_them() {
+        let (ac, store) = loaded(&[record("H", None, None, ControlMode::Rows, vec![])]).await;
+        let first = ActionControlPutRequest {
+            expected_version: None,
+            ..row_put("H", LevelRow::High, ControlMode::Recording, vec![])
+        };
+        assert!(set(&ac, first).await.is_ok());
+        let old = Arc::new(ActionControl::new(
+            store.clone(),
+            "prod".into(),
+            "pod-old".into(),
+        ));
+        refresh_as_older_image(&old).await;
+        let live_row = ActionControlPutRequest {
+            expected_version: Some(1),
+            confirm: Some(CONFIRM_WORD.into()),
+            rollout_bp: Some(1_000),
+            ..row_put(
+                "H",
+                LevelRow::High,
+                ControlMode::Live,
+                vec![SUSPEND_PERMANENT_CSE],
+            )
+        };
+        let out = set(&ac, live_row).await;
+        assert!(out.is_ok(), "{out:?}");
+        let row = stored(&store, "user/l/H/high");
+        assert_eq!(
+            (row.actions.clone(), row.rollout_bp, row.v),
+            (
+                vec![SUSPEND_PERMANENT_CSE],
+                Some(1_000),
+                SUSPENSION_OPTIONS_RECORD_VERSION
+            )
+        );
+        ac.refresh().await.unwrap();
+        let r = ac.resolve(
+            &ResolveInput {
+                confidence: Some(crate::confidence::Claim {
+                    row: LevelRow::High,
+                    unknown: false,
+                    evidence: None,
+                    now_ms: NOW_MS,
+                }),
+                author_id: (0..10_000)
+                    .find(|&id| in_rollout(Some(1_000), "", "H", id))
+                    .unwrap(),
+                ..input("H", "c", &[])
+            },
+            &on(),
+            |_| true,
+        );
+        assert_eq!(r.mode, ControlMode::Live);
+        assert_eq!(r.page_actions, vec![SUSPEND_PERMANENT_CSE]);
+        refresh_as_older_image(&old).await;
+        let held = old.snapshot();
+        let row = &held.records["user/l/H/high"];
+        assert_eq!(
+            (row.mode, row.version),
+            (ControlMode::Recording, 1),
+            "an older image keeps the log-only copy it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_record_saved_with_an_author_suspension_option_is_refused_by_an_image_before_them()
+     {
+        let author_cse = PageAction::SuspendAuthor {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        let label = PageAction::PostSpamHighRecall {
+            lifetime: Lifetime::Permanent,
+        };
+        let post_put = |mode, actions, expected_version| ActionControlPutRequest {
+            entity_type: ControlEntity::Post,
+            expected_version,
+            ..put("H", mode, actions)
+        };
+        let (ac, store) = loaded(&[]).await;
+        let first = set(&ac, post_put(ControlMode::Recording, vec![], None)).await;
+        assert!(first.is_ok(), "{first:?}");
+        let old = Arc::new(ActionControl::new(
+            store.clone(),
+            "prod".into(),
+            "pod-old".into(),
+        ));
+        refresh_as_older_image(&old).await;
+
+        let plain = set(
+            &ac,
+            post_put(
+                ControlMode::Live,
+                vec![label, PageAction::SUSPEND_AUTHOR],
+                Some(1),
+            ),
+        )
+        .await;
+        assert!(plain.is_ok(), "{plain:?}");
+        let row = stored(&store, "post/h/H");
+        assert!(
+            row.v < POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            "a plain author suspend keeps an older version: {}",
+            row.v
+        );
+
+        let out = set(
+            &ac,
+            post_put(ControlMode::Live, vec![label, author_cse], Some(2)),
+        )
+        .await;
+        assert!(out.is_ok(), "{out:?}");
+        let row = stored(&store, "post/h/H");
+        assert_eq!(
+            (row.actions.clone(), row.v),
+            (
+                vec![label, author_cse],
+                POST_SUSPENSION_OPTIONS_RECORD_VERSION
+            )
+        );
+        assert!(
+            row.v > RAISED_FOLLOWER_LIMIT_RECORD_VERSION,
+            "above every version the image before it reads"
+        );
+        let author = serde_json::to_value(author_cse).unwrap();
+        assert!(
+            author.get("permanent").is_some() && author.get("policy").is_some(),
+            "the image before it refuses the action itself too (deny_unknown_fields)"
+        );
+        refresh_as_older_image(&old).await;
+        let held = old.snapshot();
+        assert_eq!(
+            (
+                held.records["post/h/H"].mode,
+                held.records["post/h/H"].version
+            ),
+            (ControlMode::Recording, 1),
+            "an older image keeps the log-only copy it held"
+        );
     }
 }

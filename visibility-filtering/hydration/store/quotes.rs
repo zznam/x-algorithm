@@ -1,98 +1,54 @@
+use super::edges::edge_key;
+use super::key_origin::PairKey;
 use super::{RequestRow, Store};
-use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery};
-use crate::hydration::batch::{HydrationBatch, RawHydrationBatch};
 use crate::hydration::fetcher::{AnyFetcher, Fetcher};
-use crate::hydration::hydrator::{PairEdge, UserPair};
+use crate::hydration::hydrator::{EdgeKey, UserPair};
 use crate::hydration::inventory::classify;
-use crate::hydration::relation::{quoting_author, Related};
-use crate::hydration::{candidate_count_by_key, Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
-use crate::models::{AuthorId, PairEdges, QuoteFacts, QuoteLink, TweetId};
+use crate::hydration::relation::{Related, quoting_author};
+use crate::hydration::sources::source;
+use crate::hydration::{Cause, Hydrator, Hydrators, QuoteEntry, Quoted};
+use crate::models::{AuthorId, EdgeSet, Quote, QuoteLink, TweetId};
 use rustc_hash::FxHashMap;
-use strum::VariantArray;
 use xai_core_entities::entities::QuotedTweet;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PairKey {
-    Asked(UserPair),
-    Unasked,
-    InputFailed,
-}
 
 #[derive(Default)]
 pub(super) struct Quotes {
     entries: Vec<QuoteEntry>,
-    pub(super) quoted_tweets: Fetcher<QuotedTweet>,
-    pair_edges: [Fetcher<bool, UserPair>; PairEdge::VARIANTS.len()],
 }
 
 impl Quotes {
-    pub(super) fn new(entries: &[QuoteEntry]) -> Self {
-        let mut entries = entries.to_vec();
+    pub(super) fn new(mut entries: Vec<QuoteEntry>) -> Self {
         entries.sort_unstable();
         entries.dedup();
-        Self {
-            entries,
-            ..Self::default()
-        }
+        Self { entries }
     }
 
-    pub(super) fn outer_of(&self, inner: TweetId) -> Option<TweetId> {
+    pub(super) fn outers_of(&self, inner: TweetId) -> impl Iterator<Item = TweetId> + '_ {
         self.entries
             .iter()
-            .find(|quote| quote.inner == inner)
+            .filter(move |quote| quote.inner == inner)
             .map(|quote| quote.outer)
     }
 
-    pub(super) fn quoted_author(&self, inner: TweetId) -> Result<AuthorId, Cause> {
-        let quotes = || {
-            self.entries
-                .iter()
-                .filter(move |quote| quote.inner == inner)
-        };
-        let named = quotes().find_map(|quote| {
-            self.quoted_tweets
-                .get(quote.outer.0)
+            pub(super) fn quoted_author(
+        &self,
+        quoted_tweets: &Fetcher<QuotedTweet>,
+        inner: TweetId,
+    ) -> Result<AuthorId, Cause> {
+        let named = self.outers_of(inner).find_map(|outer| {
+            quoted_tweets
+                .get(outer.0)
                 .filter(|quoted| quoted.tweet_id == inner.0 && quoted.user_id != 0)
         });
         match named {
             Some(quoted) => Ok(AuthorId(quoted.user_id)),
-            None if quotes().any(|quote| self.quoted_tweets.is_incomplete(quote.outer.0)) => {
+            None if self
+                .outers_of(inner)
+                .any(|outer| quoted_tweets.is_incomplete(outer.0)) =>
+            {
                 Err(Cause::Failed)
             }
             None => Err(Cause::NotFound),
-        }
-    }
-
-    fn pair_fetcher(&self, edge: PairEdge) -> Option<&Fetcher<bool, UserPair>> {
-        self.pair_edges.get(usize::from(edge as u8))
-    }
-
-    fn pair_fetcher_mut(&mut self, edge: PairEdge) -> Option<&mut Fetcher<bool, UserPair>> {
-        self.pair_edges.get_mut(usize::from(edge as u8))
-    }
-
-    pub(super) fn land_pairs<'q>(
-        &mut self,
-        queries: impl Iterator<Item = (PairEdge, &'q EdgeQuery)>,
-        answers: Vec<RawHydrationBatch<bool>>,
-    ) {
-        for ((edge, query), answer) in queries.zip(answers) {
-            let EdgeFrom::User(source) = query.from else {
-                continue;
-            };
-            let pair = |destination| UserPair {
-                source,
-                destination,
-            };
-            let claimed: Vec<UserPair> = query.destination_ids.iter().copied().map(pair).collect();
-            let answers = answer
-                .into_hydrated()
-                .into_iter()
-                .map(|(destination, holds)| (pair(destination), holds))
-                .collect();
-            if let Some(fetcher) = self.pair_fetcher_mut(edge) {
-                fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));
-            }
         }
     }
 }
@@ -123,42 +79,34 @@ impl Store {
     }
 
     fn quoting_author(&self, outer: TweetId) -> Option<AuthorId> {
-        self.pure_cores.request().get(outer.0).map(quoting_author)
+        self.request_fetcher::<source::TesPureCoreData>()
+            .get(outer.0)
+            .and_then(quoting_author)
     }
 
-    fn pair_key(&self, edge: PairEdge, parent: &RequestRow, outer: TweetId) -> PairKey {
+    pub(super) fn quote_pair(
+        &self,
+        parent: &RequestRow,
+        outer: TweetId,
+        ask: impl FnOnce(AuthorId, AuthorId) -> PairKey,
+    ) -> PairKey {
         let (Some(quoted), Some(quoting)) = (parent.author, self.quoting_author(outer)) else {
             return PairKey::InputFailed;
         };
-        let (quoted, quoting) = (quoted.get(), quoting.get());
         if quoted == quoting {
             return PairKey::Unasked;
         }
-        match edge {
-            PairEdge::AuthorBlocksOuterAuthor => PairKey::Asked(UserPair {
-                source: quoted,
-                destination: quoting,
-            }),
-            PairEdge::OuterAuthorFollowsAuthor => match self
-                .authors
-                .request()
-                .get(quoted)
-                .filter(|_| !self.authors.request().is_incomplete(quoted))
-            {
-                None => PairKey::InputFailed,
-                Some((author, _)) if author.is_protected => PairKey::Asked(UserPair {
-                    source: quoting,
-                    destination: quoted,
-                }),
-                Some(_) => PairKey::Unasked,
-            },
-        }
+        ask(quoted, quoting)
     }
 
-    fn asked_pairs(&self, edge: PairEdge) -> Vec<UserPair> {
+    fn pair_key(&self, node: Hydrator, parent: &RequestRow, outer: TweetId) -> PairKey {
+        self.quote_pair_key(self.origin(node), parent, outer)
+    }
+
+    fn asked_pairs(&self, node: Hydrator) -> Vec<UserPair> {
         let mut pairs: Vec<UserPair> = self
             .paired_rows()
-            .filter_map(|(parent, outer)| match self.pair_key(edge, parent, outer) {
+            .filter_map(|(parent, outer)| match self.pair_key(node, parent, outer) {
                 PairKey::Asked(asked) => Some(asked),
                 PairKey::Unasked | PairKey::InputFailed => None,
             })
@@ -168,53 +116,43 @@ impl Store {
         pairs
     }
 
-    pub(super) fn claim_pairs(&mut self, nodes: Hydrators) -> Vec<(PairEdge, EdgeQuery)> {
-        let asked: Vec<(PairEdge, Vec<UserPair>)> = nodes
-            .iter()
-            .filter_map(Hydrator::pair_edge)
-            .map(|edge| (edge, self.asked_pairs(edge)))
-            .collect();
-        let mut queries: Vec<(PairEdge, EdgeQuery)> = Vec::new();
-        for (edge, pairs) in asked {
-            let Some(fetcher) = self.quotes.pair_fetcher_mut(edge) else {
+    pub(super) fn claim_quote_pairs(&mut self, nodes: Hydrators) -> Vec<(u64, Vec<u64>)> {
+        let mut claimed: Vec<(u64, Vec<u64>)> = Vec::new();
+        for node in nodes.iter() {
+            let edges = self
+                .asked_pairs(node)
+                .into_iter()
+                .filter_map(|pair| edge_key(node, pair))
+                .collect();
+            let Some(fetcher) = self.edge_fetcher_mut(node) else {
                 continue;
             };
-            for pair in fetcher.claim(pairs) {
-                let from = EdgeFrom::User(pair.source);
-                match queries.last_mut() {
-                    Some((queried, query)) if *queried == edge && query.from == from => {
-                        query.destination_ids.push(pair.destination);
+            for pair in fetcher.claim(edges).into_iter().map(|edge| edge.pair) {
+                match claimed.last_mut() {
+                    Some((source, destinations)) if *source == pair.source => {
+                        destinations.push(pair.destination);
                     }
-                    _ => queries.push((
-                        edge,
-                        EdgeQuery {
-                            graph: edge.graph(),
-                            direction: EdgeDirection::Forward,
-                            from,
-                            destination_ids: vec![pair.destination],
-                        },
-                    )),
+                    _ => claimed.push((pair.source, vec![pair.destination])),
                 }
             }
         }
-        queries
+        claimed
     }
 
-    pub(super) fn candidate_count_by_pair(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {
-        let destinations = |edge| {
-            self.paired_rows().filter_map(move |(parent, outer)| {
-                match self.pair_key(edge, parent, outer) {
-                    PairKey::Asked(asked) => Some(asked.destination),
-                    PairKey::Unasked | PairKey::InputFailed => None,
+    pub(super) fn count_pair_candidates(
+        &self,
+        nodes: Hydrators,
+        counts: &mut FxHashMap<u64, usize>,
+    ) {
+        for node in nodes.iter().filter(|node| node.is_quote_pair_edge()) {
+            for (parent, outer) in self.paired_rows() {
+                if let PairKey::Asked(asked) = self.pair_key(node, parent, outer)
+                    && let Some(count) = counts.get_mut(&asked.destination)
+                {
+                    *count += 1;
                 }
-            })
-        };
-        candidate_count_by_key(
-            nodes
-                .iter()
-                .filter_map(Hydrator::pair_edge)
-                .flat_map(destinations),
-        )
+            }
+        }
     }
 
     pub(super) fn quoted(&self) -> FxHashMap<QuoteEntry, Quoted> {
@@ -230,17 +168,19 @@ impl Store {
     }
 
     fn quoted_entry(&self, parent: &RequestRow, outer: TweetId) -> Quoted {
-        let mut pair_edges = PairEdges::default();
+        let mut pair_edges = EdgeSet::default();
         let mut failed = Hydrators::empty();
-        for node in self.callable.iter() {
-            let Some((edge, fetcher)) = node
-                .pair_edge()
-                .and_then(|edge| Some((edge, self.quotes.pair_fetcher(edge)?)))
-            else {
+        for node in self
+            .callable
+            .iter()
+            .filter(|node| node.is_quote_pair_edge())
+        {
+            let (Some(fetcher), Some(edge)) = (self.edge_fetcher(node), node.edge()) else {
                 continue;
             };
-            let holds = match self.pair_key(edge, parent, outer) {
-                PairKey::Asked(asked) => {
+            let holds = match self.pair_key(node, parent, outer) {
+                PairKey::Asked(pair) => {
+                    let asked = EdgeKey { edge, pair };
                     if classify(self.stake(node), fetcher.answer(asked)).fails_node() {
                         failed = failed.with(node);
                     }
@@ -252,21 +192,18 @@ impl Store {
                     false
                 }
             };
-            match edge {
-                PairEdge::AuthorBlocksOuterAuthor => pair_edges.author_blocks_outer_author = holds,
-                PairEdge::OuterAuthorFollowsAuthor => {
-                    pair_edges.outer_author_follows_author = holds
-                }
+            if holds {
+                pair_edges = pair_edges.with(node);
             }
         }
         Quoted {
-            facts: QuoteFacts {
-                link: self.quoting_author(outer).map(|quoting| QuoteLink {
+            quote: self.quoting_author(outer).map(|quoting| Quote {
+                link: QuoteLink {
                     outer,
                     quoting_author: quoting.get(),
-                }),
+                },
                 pair_edges,
-            },
+            }),
             failed,
         }
     }

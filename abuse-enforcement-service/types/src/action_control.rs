@@ -1,6 +1,42 @@
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
-pub const ACTION_CONTROL_RECORD_VERSION: u32 = 4;
+pub const ACTION_CONTROL_RECORD_VERSION: u32 = 10;
+pub const POST_SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 10;
+pub const RAISED_FOLLOWER_LIMIT_RECORD_VERSION: u32 = 9;
+pub const FOLLOWER_CEILING_CHECK: FollowerCeilingCheck = FollowerCeilingCheck {
+    id: "very_high_follower_count",
+    when: "cred.follower_count >= 12345.67",
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct FollowerCeilingCheck {
+    pub id: &'static str,
+    pub when: &'static str,
+}
+
+static FOLLOWER_CEILING_COUNT: LazyLock<u32> = LazyLock::new(|| {
+    let when = FOLLOWER_CEILING_CHECK.when;
+    when.split(">=")
+        .nth(1)
+        .and_then(|rest| rest.trim().parse::<f64>().ok())
+        .map(|n| n.ceil() as u32)
+        .unwrap_or_else(|| panic!("`{when}` is not `cred.follower_count >= N`"))
+});
+
+pub fn follower_ceiling() -> u32 {
+    *FOLLOWER_CEILING_COUNT
+}
+
+pub fn stored_off_follower_threshold() -> u32 {
+    follower_ceiling() - 1
+}
+pub const FOLLOWER_THRESHOLD_MAX: u32 = 1_000_000_000;
+pub const POST_LABEL_RECORD_VERSION: u32 = 7;
+pub const SUSPENSION_OPTIONS_RECORD_VERSION: u32 = 6;
+pub const AUTHOR_SKIPS_RECORD_VERSION: u32 = 5;
+pub const ROLLOUT_RECORD_VERSION: u32 = 4;
 pub const ROWS_RECORD_VERSION: u32 = 3;
 pub const BAND_RECORD_VERSION: u32 = 1;
 
@@ -56,7 +92,7 @@ impl ConfidenceLevel {
         }
     }
 
-            pub fn floor(self) -> f64 {
+                pub fn floor(self) -> f64 {
         match self {
             ConfidenceLevel::Low => 0.70,
             ConfidenceLevel::Mid => 0.85,
@@ -190,17 +226,108 @@ impl Lifetime {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SuspensionPolicy {
+    #[default]
+    PlatformManipulation,
+    Cse,
+}
+
+impl SuspensionPolicy {
+    pub const ALL: [SuspensionPolicy; 2] = [
+        SuspensionPolicy::PlatformManipulation,
+        SuspensionPolicy::Cse,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuspensionPolicy::PlatformManipulation => "PlatformManipulation",
+            SuspensionPolicy::Cse => "Cse",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == SuspensionPolicy::default()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+pub const PAGE_POST_LABELS: &[&str] = &[
+    "NsfaHighPrecision",
+    "NsfaLimitedInventory",
+    "NsfwHighPrecision",
+    "SoftNsfw",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PostLabelName(&'static str);
+
+impl PostLabelName {
+    pub fn parse(name: &str) -> Option<Self> {
+        PAGE_POST_LABELS
+            .iter()
+            .find(|l| **l == name)
+            .map(|l| Self(l))
+    }
+
+    pub fn all() -> impl Iterator<Item = Self> {
+        PAGE_POST_LABELS.iter().map(|l| Self(l))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl Serialize for PostLabelName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PostLabelName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Self::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{name}` is not a label the page may put on a post"
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageAction {
-        Suspend {},
+        Suspend {
+        #[serde(default, skip_serializing_if = "is_false")]
+        permanent: bool,
+        #[serde(default, skip_serializing_if = "SuspensionPolicy::is_default")]
+        policy: SuspensionPolicy,
+    },
         LivenessCheck {},
         SpamHighRecall { lifetime: Lifetime },
             PhoenixSkip { lifetime: Lifetime },
         PostSpamHighRecall { lifetime: Lifetime },
             HideReply { lifetime: Lifetime },
-        SuspendAuthor {},
+        SuspendAuthor {
+        #[serde(default, skip_serializing_if = "is_false")]
+        permanent: bool,
+        #[serde(default, skip_serializing_if = "SuspensionPolicy::is_default")]
+        policy: SuspensionPolicy,
+    },
+        PostLabel {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        label: PostLabelName,
+        lifetime: Lifetime,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -221,42 +348,90 @@ impl ControlEntity {
 }
 
 impl PageAction {
+        pub const SUSPEND: PageAction = PageAction::Suspend {
+        permanent: false,
+        policy: SuspensionPolicy::PlatformManipulation,
+    };
+
+            pub const SUSPEND_AUTHOR: PageAction = PageAction::SuspendAuthor {
+        permanent: false,
+        policy: SuspensionPolicy::PlatformManipulation,
+    };
+
+            pub fn suspension(self) -> Option<(bool, SuspensionPolicy)> {
+        match self {
+            PageAction::Suspend { permanent, policy }
+            | PageAction::SuspendAuthor { permanent, policy } => Some((permanent, policy)),
+            _ => None,
+        }
+    }
+
+    fn suspension_with_options(self) -> bool {
+        self.suspension()
+            .is_some_and(|(permanent, policy)| permanent || !policy.is_default())
+    }
+
+        pub fn uses_suspension_options(self) -> bool {
+        self.entity() == ControlEntity::User && self.suspension_with_options()
+    }
+
+        pub fn uses_post_suspension_options(self) -> bool {
+        self.entity() == ControlEntity::Post && self.suspension_with_options()
+    }
+
+            fn suspensions(entity: ControlEntity) -> impl Iterator<Item = PageAction> {
+        [false, true].into_iter().flat_map(move |permanent| {
+            SuspensionPolicy::ALL
+                .into_iter()
+                .map(move |policy| match entity {
+                    ControlEntity::User => PageAction::Suspend { permanent, policy },
+                    ControlEntity::Post => PageAction::SuspendAuthor { permanent, policy },
+                })
+        })
+    }
+
     pub fn entity(self) -> ControlEntity {
         match self {
-            PageAction::Suspend {}
+            PageAction::Suspend { .. }
             | PageAction::LivenessCheck {}
             | PageAction::SpamHighRecall { .. }
             | PageAction::PhoenixSkip { .. } => ControlEntity::User,
             PageAction::PostSpamHighRecall { .. }
             | PageAction::HideReply { .. }
-            | PageAction::SuspendAuthor {} => ControlEntity::Post,
+            | PageAction::SuspendAuthor { .. }
+            | PageAction::PostLabel { .. } => ControlEntity::Post,
         }
+    }
+
+        pub fn is_post_label(self) -> bool {
+        matches!(self, PageAction::PostLabel { .. })
     }
 
                 pub fn menu(entity: ControlEntity) -> Vec<PageAction> {
         match entity {
-            ControlEntity::User => vec![
-                PageAction::Suspend {},
-                PageAction::LivenessCheck {},
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Days7,
-                },
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Days30,
-                },
-                PageAction::SpamHighRecall {
-                    lifetime: Lifetime::Permanent,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Days7,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Days30,
-                },
-                PageAction::PhoenixSkip {
-                    lifetime: Lifetime::Permanent,
-                },
-            ],
+            ControlEntity::User => Self::suspensions(entity)
+                .chain([
+                    PageAction::LivenessCheck {},
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Days7,
+                    },
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Days30,
+                    },
+                    PageAction::SpamHighRecall {
+                        lifetime: Lifetime::Permanent,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Days7,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Days30,
+                    },
+                    PageAction::PhoenixSkip {
+                        lifetime: Lifetime::Permanent,
+                    },
+                ])
+                .collect(),
             ControlEntity::Post => vec![
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Days30,
@@ -273,8 +448,14 @@ impl PageAction {
                 PageAction::HideReply {
                     lifetime: Lifetime::Permanent,
                 },
-                PageAction::SuspendAuthor {},
-            ],
+            ]
+            .into_iter()
+            .chain(Self::suspensions(entity))
+            .chain(PostLabelName::all().flat_map(|label| {
+                [Lifetime::Days7, Lifetime::Days30, Lifetime::Permanent]
+                    .map(|lifetime| PageAction::PostLabel { label, lifetime })
+            }))
+            .collect(),
         }
     }
 
@@ -287,7 +468,7 @@ impl PageAction {
                     lifetime: Lifetime::Days7,
                 },
             ],
-            (ControlEntity::User, LevelRow::High) => vec![PageAction::Suspend {}],
+            (ControlEntity::User, LevelRow::High) => vec![PageAction::SUSPEND],
             (ControlEntity::Post, LevelRow::Mid) => vec![PageAction::PostSpamHighRecall {
                 lifetime: Lifetime::Days30,
             }],
@@ -298,15 +479,16 @@ impl PageAction {
         }
     }
 
-            pub fn kind(self) -> &'static str {
+                pub fn kind(self) -> &'static str {
         match self {
-            PageAction::Suspend {} => "suspend",
+            PageAction::Suspend { .. } => "suspend",
             PageAction::LivenessCheck {} => "liveness_check",
             PageAction::SpamHighRecall { .. } => "spam_high_recall",
             PageAction::PhoenixSkip { .. } => "phoenix_skip",
             PageAction::PostSpamHighRecall { .. } => "post_spam_high_recall",
             PageAction::HideReply { .. } => "hide_reply",
-            PageAction::SuspendAuthor {} => "suspend_author",
+            PageAction::SuspendAuthor { .. } => "suspend_author",
+            PageAction::PostLabel { label, .. } => label.as_str(),
         }
     }
 }
@@ -339,12 +521,16 @@ pub struct ActionControlRecord {
     pub confidence: Option<LevelRow>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<ConfidenceEvidence>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+            #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_override: Option<Box<EvidenceOverride>>,
                     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub admit_unlisted_labels: bool,
                         #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_bp: Option<u32>,
+                            #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_threshold: Option<u32>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_high_credibility: Option<bool>,
 }
 
 impl ActionControlRecord {
@@ -367,6 +553,8 @@ impl ActionControlRecord {
         "evidence_override",
         "admit_unlisted_labels",
         "rollout_bp",
+        "follower_threshold",
+        "skip_high_credibility",
     ];
 
             pub fn uses_confidence(&self) -> bool {
@@ -376,9 +564,42 @@ impl ActionControlRecord {
             || self.mode == ControlMode::Rows
     }
 
-                pub fn schema_version(&self) -> u32 {
-        if self.rollout_bp.is_some() {
-            ACTION_CONTROL_RECORD_VERSION
+            pub fn uses_suspension_options(&self) -> bool {
+        self.actions.iter().any(|a| a.uses_suspension_options())
+    }
+
+            pub fn uses_post_suspension_options(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| a.uses_post_suspension_options())
+    }
+
+        pub fn sets_author_skips(&self) -> bool {
+        self.follower_threshold.is_some() || self.skip_high_credibility.is_some()
+    }
+
+        pub fn uses_post_label(&self) -> bool {
+        self.actions.iter().any(|a| a.is_post_label())
+    }
+
+        pub fn raises_follower_limit(&self) -> bool {
+        self.follower_threshold
+            .is_some_and(|n| n >= follower_ceiling())
+    }
+
+                                        pub fn schema_version(&self) -> u32 {
+        if self.uses_post_suspension_options() {
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION
+        } else if self.raises_follower_limit() {
+            RAISED_FOLLOWER_LIMIT_RECORD_VERSION
+        } else if self.uses_post_label() {
+            POST_LABEL_RECORD_VERSION
+        } else if self.uses_suspension_options() {
+            SUSPENSION_OPTIONS_RECORD_VERSION
+        } else if self.sets_author_skips() {
+            AUTHOR_SKIPS_RECORD_VERSION
+        } else if self.rollout_bp.is_some() {
+            ROLLOUT_RECORD_VERSION
         } else if self.uses_confidence() {
             ROWS_RECORD_VERSION
         } else {
@@ -447,13 +668,15 @@ pub struct ActionControlPutRequest {
     pub expected_version: Option<u64>,
         #[serde(default)]
     pub confirm: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_follower_limit: Option<u32>,
         #[serde(default)]
     pub updated_by: Option<String>,
         #[serde(default)]
     pub confidence: Option<LevelRow>,
         #[serde(default)]
     pub evidence: Option<ConfidenceEvidence>,
-        #[serde(default)]
+            #[serde(default)]
     pub evidence_override: Option<EvidenceOverride>,
             #[serde(default)]
     pub rows: Option<RowsRequest>,
@@ -461,6 +684,38 @@ pub struct ActionControlPutRequest {
     pub admit_unlisted_labels: Option<bool>,
             #[serde(default)]
     pub rollout_bp: Option<u32>,
+            #[serde(default, skip_serializing_if = "Option::is_none", with = "keep_or_set")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<u32>, nullable))]
+    pub follower_threshold: Option<Option<u32>>,
+            #[serde(default, skip_serializing_if = "Option::is_none", with = "keep_or_set")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<bool>, nullable))]
+    pub skip_high_credibility: Option<Option<bool>>,
+}
+
+mod keep_or_set {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        v: &Option<Option<T>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        v.as_ref().and_then(Option::as_ref).serialize(s)
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FollowerSkipView {
+            pub today_threshold: u64,
+                pub ceiling: u64,
+            #[serde(default)]
+    pub max_threshold: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -497,7 +752,7 @@ pub struct RowSetting {
     pub actions: Vec<PageAction>,
     #[serde(default)]
     pub evidence: Option<ConfidenceEvidence>,
-    #[serde(default)]
+        #[serde(default)]
     pub evidence_override: Option<EvidenceOverride>,
         #[serde(default)]
     pub expected_version: Option<u64>,
@@ -606,6 +861,8 @@ pub struct ActionControlListResponse {
     pub cse: CseLists,
     #[serde(default)]
     pub confidence: Option<ConfidenceView>,
+        #[serde(default)]
+    pub follower_skip: Option<FollowerSkipView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -694,7 +951,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
-                PageAction::Suspend {},
+                PageAction::SUSPEND,
                 PageAction::LivenessCheck {},
                 PageAction::SpamHighRecall {
                     lifetime: Lifetime::Days7
@@ -702,7 +959,7 @@ mod tests {
                 PageAction::PostSpamHighRecall {
                     lifetime: Lifetime::Permanent
                 },
-                PageAction::SuspendAuthor {},
+                PageAction::SUSPEND_AUTHOR,
             ]
         );
     }
@@ -734,10 +991,211 @@ mod tests {
     }
 
     #[test]
+    fn a_suspend_writes_its_options_only_when_they_differ_from_the_default() {
+        let plain: PageAction = serde_json::from_str(r#"{"kind":"suspend"}"#).unwrap();
+        assert_eq!(plain, PageAction::SUSPEND);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"kind":"suspend"}"#
+        );
+        let spelled: PageAction = serde_json::from_str(
+            r#"{"kind":"suspend","permanent":false,"policy":"PlatformManipulation"}"#,
+        )
+        .unwrap();
+        assert_eq!(spelled, PageAction::SUSPEND);
+        assert!(!spelled.uses_suspension_options());
+        let perm: PageAction =
+            serde_json::from_str(r#"{"kind":"suspend","permanent":true,"policy":"Cse"}"#).unwrap();
+        assert_eq!(
+            perm,
+            PageAction::Suspend {
+                permanent: true,
+                policy: SuspensionPolicy::Cse
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&perm).unwrap(),
+            r#"{"kind":"suspend","permanent":true,"policy":"Cse"}"#
+        );
+        assert!(perm.uses_suspension_options());
+        assert_eq!(perm.kind(), "suspend");
+        assert_eq!(perm.entity(), ControlEntity::User);
+    }
+
+    #[test]
+    fn an_author_suspend_writes_its_options_only_when_they_differ_from_the_default() {
+        let plain: PageAction = serde_json::from_str(r#"{"kind":"suspend_author"}"#).unwrap();
+        assert_eq!(plain, PageAction::SUSPEND_AUTHOR);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"kind":"suspend_author"}"#
+        );
+        assert!(!plain.uses_post_suspension_options());
+        let spelled: PageAction = serde_json::from_str(
+            r#"{"kind":"suspend_author","permanent":false,"policy":"PlatformManipulation"}"#,
+        )
+        .unwrap();
+        assert_eq!(spelled, PageAction::SUSPEND_AUTHOR);
+        for (json, permanent, policy) in [
+            (
+                r#"{"kind":"suspend_author","permanent":true}"#,
+                true,
+                SuspensionPolicy::PlatformManipulation,
+            ),
+            (
+                r#"{"kind":"suspend_author","policy":"Cse"}"#,
+                false,
+                SuspensionPolicy::Cse,
+            ),
+            (
+                r#"{"kind":"suspend_author","permanent":true,"policy":"Cse"}"#,
+                true,
+                SuspensionPolicy::Cse,
+            ),
+        ] {
+            let a: PageAction = serde_json::from_str(json).unwrap();
+            assert_eq!(a, PageAction::SuspendAuthor { permanent, policy });
+            assert_eq!(serde_json::to_string(&a).unwrap(), json);
+            assert_eq!(a.suspension(), Some((permanent, policy)));
+            assert!(a.uses_post_suspension_options(), "{json}");
+            assert!(!a.uses_suspension_options(), "{json}");
+            assert_eq!(a.kind(), "suspend_author");
+            assert_eq!(a.entity(), ControlEntity::Post);
+        }
+        let account = PageAction::Suspend {
+            permanent: true,
+            policy: SuspensionPolicy::Cse,
+        };
+        assert!(account.uses_suspension_options());
+        assert!(!account.uses_post_suspension_options());
+    }
+
+    #[test]
+    fn each_menu_offers_its_entitys_suspension_once_per_option() {
+        for (entity, kind, default) in [
+            (ControlEntity::User, "suspend", PageAction::SUSPEND),
+            (
+                ControlEntity::Post,
+                "suspend_author",
+                PageAction::SUSPEND_AUTHOR,
+            ),
+        ] {
+            let menu = PageAction::menu(entity);
+            let suspends: Vec<&PageAction> = menu.iter().filter(|a| a.kind() == kind).collect();
+            assert_eq!(suspends.len(), 2 * SuspensionPolicy::ALL.len(), "{kind}");
+            assert_eq!(suspends[0], &default);
+            let mut seen = std::collections::HashSet::new();
+            assert!(suspends.iter().all(|a| seen.insert(**a)));
+            assert!(
+                menu.iter()
+                    .filter_map(|a| a.suspension())
+                    .eq(suspends.iter().filter_map(|a| a.suspension())),
+                "{kind}: the menu's only suspensions, in the same order on both menus"
+            );
+            assert!(menu.iter().all(|a| a.entity() == entity));
+        }
+        let user: Vec<_> = PageAction::menu(ControlEntity::User)
+            .iter()
+            .filter_map(|a| a.suspension())
+            .collect();
+        let post: Vec<_> = PageAction::menu(ControlEntity::Post)
+            .iter()
+            .filter_map(|a| a.suspension())
+            .collect();
+        assert_eq!(user, post);
+    }
+
+    #[test]
+    fn a_record_with_an_author_suspension_option_is_refused_by_older_images() {
+        let old = r#"{"v":3,"entity_type":"post","head":"H","mode":"live","actions":[{"kind":"suspend_author"}],"version":1,"confidence":"high","rollout_bp":1000}"#;
+        let mut r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            ROLLOUT_RECORD_VERSION,
+            "a plain author suspend keeps its version"
+        );
+        for action in [
+            PageAction::SuspendAuthor {
+                permanent: true,
+                policy: SuspensionPolicy::PlatformManipulation,
+            },
+            PageAction::SuspendAuthor {
+                permanent: false,
+                policy: SuspensionPolicy::Cse,
+            },
+        ] {
+            r.actions = vec![action];
+            assert_eq!(r.schema_version(), 10);
+            assert_eq!(r.schema_version(), POST_SUSPENSION_OPTIONS_RECORD_VERSION);
+            assert!(r.schema_version() > RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+        }
+        r.actions = vec![
+            PageAction::PostSpamHighRecall {
+                lifetime: Lifetime::Permanent,
+            },
+            PageAction::SuspendAuthor {
+                permanent: true,
+                policy: SuspensionPolicy::Cse,
+            },
+        ];
+        r.follower_threshold = Some(follower_ceiling());
+        assert_eq!(
+            r.schema_version(),
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            "above the raised follower limit"
+        );
+        assert_eq!(
+            POST_SUSPENSION_OPTIONS_RECORD_VERSION,
+            ACTION_CONTROL_RECORD_VERSION
+        );
+
+        let user = r#"{"v":6,"entity_type":"user","head":"H","mode":"live","actions":[{"kind":"suspend","permanent":true,"policy":"Cse"}],"version":1}"#;
+        let r = ActionControlRecord::parse_strict(user.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            SUSPENSION_OPTIONS_RECORD_VERSION,
+            "an account suspend with options stays v: 6"
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_suspension_option_is_refused_by_older_images() {
+        let old = r#"{"v":3,"entity_type":"user","head":"H","mode":"live","actions":[{"kind":"suspend"}],"version":1,"confidence":"high","rollout_bp":1000}"#;
+        let mut r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            r.schema_version(),
+            ROLLOUT_RECORD_VERSION,
+            "a plain suspend keeps its version"
+        );
+        r.actions = vec![PageAction::Suspend {
+            permanent: true,
+            policy: SuspensionPolicy::PlatformManipulation,
+        }];
+        assert_eq!(r.schema_version(), 6);
+        assert_eq!(r.schema_version(), SUSPENSION_OPTIONS_RECORD_VERSION);
+        r.actions = vec![PageAction::Suspend {
+            permanent: false,
+            policy: SuspensionPolicy::Cse,
+        }];
+        assert_eq!(r.schema_version(), SUSPENSION_OPTIONS_RECORD_VERSION);
+        assert!(r.schema_version() > AUTHOR_SKIPS_RECORD_VERSION);
+        let value = serde_json::to_value(r.actions[0]).unwrap();
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter().any(|k| *k == "policy"),
+            "an older image's deny_unknown_fields refuses the action itself too"
+        );
+    }
+
+    #[test]
     fn actions_outside_the_menu_do_not_parse() {
         for bad in [
             r#"{"kind":"suspend","perm":true}"#,
-            r#"{"kind":"suspend","policy":"Cse"}"#,
+            r#"{"kind":"suspend","policy":"Spam"}"#,
+            r#"{"kind":"suspend","permanent":"yes"}"#,
+            r#"{"kind":"suspend_author","perm":true}"#,
+            r#"{"kind":"suspend_author","policy":"Spam"}"#,
+            r#"{"kind":"suspend_author","permanent":"yes"}"#,
             r#"{"kind":"spam_high_recall","lifetime":"90d"}"#,
             r#"{"kind":"label","labels":["SpamHighRecall"]}"#,
             r#"{"kind":"arkose"}"#,
@@ -766,7 +1224,8 @@ mod tests {
                 "updated_at_ms":5,"version":2,"write_nonce":9,"confidence":"high",
                 "evidence":{"precision_lower_bound":0.95,"reads":59,"humans":0,"read_at_ms":4,"link":"l"},
                 "evidence_override":{"by":"operator@example.com","reason":"seeded","expires_at_ms":6},
-                "admit_unlisted_labels":true,"rollout_bp":500}"#,
+                "admit_unlisted_labels":true,"rollout_bp":500,"follower_threshold":250,
+                "skip_high_credibility":false}"#,
         )
         .unwrap();
         let keys: Vec<String> = serde_json::to_value(&r)
@@ -851,7 +1310,158 @@ mod tests {
             4,
             "a row with a rollout is refused by images that read v: 3 rows"
         );
-        assert_eq!(l.schema_version(), ACTION_CONTROL_RECORD_VERSION);
+        assert_eq!(l.schema_version(), ROLLOUT_RECORD_VERSION);
+    }
+
+    #[test]
+    fn a_head_record_with_author_skips_is_refused_by_older_images() {
+        let old = r#"{"v":1,"entity_type":"user","head":"H","classifier":null,"band":null,"mode":"live","actions":[{"kind":"suspend"}],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0}"#;
+        let r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert_eq!(
+            (r.follower_threshold, r.skip_high_credibility),
+            (None, None)
+        );
+        assert!(!r.sets_author_skips());
+        assert_eq!(serde_json::to_string(&r).unwrap(), old, "bytes unchanged");
+        assert_eq!(r.schema_version(), BAND_RECORD_VERSION);
+        for (threshold, credibility) in [(Some(0), None), (Some(250), None), (None, Some(false))] {
+            let mut h = r.clone();
+            h.follower_threshold = threshold;
+            h.skip_high_credibility = credibility;
+            assert_eq!(h.schema_version(), 5);
+            assert_eq!(h.schema_version(), AUTHOR_SKIPS_RECORD_VERSION);
+            h.v = h.schema_version();
+            let json = serde_json::to_string(&h).unwrap();
+            let back = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
+            assert_eq!(back, h);
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let older: Vec<&String> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k == "follower_threshold" || *k == "skip_high_credibility")
+                .collect();
+            assert_eq!(older.len(), 1, "an older FIELDS list refuses {json}");
+            assert!(
+                h.v > ROLLOUT_RECORD_VERSION,
+                "and so does an older version bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_record_with_a_raised_follower_limit_is_refused_by_older_images() {
+        let old = format!(
+            r#"{{"v":5,"entity_type":"post","head":"H","classifier":null,"band":null,"mode":"rows","actions":[],"reason":"","updated_by":"","key_id":"","updated_at_ms":0,"version":1,"write_nonce":0,"follower_threshold":{}}}"#,
+            follower_ceiling() - 1
+        );
+        let r = ActionControlRecord::parse_strict(old.as_bytes()).unwrap();
+        assert!(!r.raises_follower_limit());
+        assert_eq!(r.schema_version(), AUTHOR_SKIPS_RECORD_VERSION);
+        assert_eq!(serde_json::to_string(&r).unwrap(), old, "bytes unchanged");
+        let c = follower_ceiling();
+        for n in [c, c * 5 / 2, FOLLOWER_THRESHOLD_MAX] {
+            let mut h = r.clone();
+            h.follower_threshold = Some(n);
+            h.actions = vec![PageAction::PostLabel {
+                label: PostLabelName::parse("SoftNsfw").unwrap(),
+                lifetime: Lifetime::Days30,
+            }];
+            assert!(h.raises_follower_limit());
+            assert_eq!(h.schema_version(), 9);
+            assert_eq!(h.schema_version(), RAISED_FOLLOWER_LIMIT_RECORD_VERSION);
+            assert!(h.schema_version() <= ACTION_CONTROL_RECORD_VERSION);
+            h.v = h.schema_version();
+            let json = serde_json::to_string(&h).unwrap();
+            assert_eq!(
+                ActionControlRecord::parse_strict(json.as_bytes()).unwrap(),
+                h
+            );
+            assert!(
+                h.v > 8,
+                "a version bound from before raised limits (7 on main, 8 with the liveness cooldown) refuses it"
+            );
+        }
+        assert_eq!(stored_off_follower_threshold(), c - 1);
+        assert_eq!(FOLLOWER_CEILING_CHECK.id, "very_high_follower_count");
+    }
+
+    #[test]
+    fn a_put_carries_the_repeated_follower_limit_only_when_sent() {
+        let base = r#""entity_type":"post","head":"H","mode":"live","reason":"r""#;
+        let parse = |extra: &str| {
+            serde_json::from_str::<ActionControlPutRequest>(&format!("{{{base}{extra}}}"))
+        };
+        let p = parse("").unwrap();
+        assert_eq!(p.confirm_follower_limit, None);
+        assert!(
+            serde_json::to_value(&p)
+                .unwrap()
+                .get("confirm_follower_limit")
+                .is_none(),
+            "left out when not sent, so an older service still parses the request"
+        );
+        let p = parse(r#","follower_threshold":250000,"confirm_follower_limit":250000"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.confirm_follower_limit),
+            (Some(Some(250_000)), Some(250_000))
+        );
+        for bad in [
+            r#","confirm_follower_limit":-1"#,
+            r#","confirm_follower_limit":"250,000""#,
+            r#","confirm_follower_limit":2.5"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let view: FollowerSkipView =
+            serde_json::from_str(r#"{"today_threshold":12,"ceiling":34}"#).unwrap();
+        assert_eq!(
+            view.max_threshold, 0,
+            "an older pod's view reads as no raised limits"
+        );
+    }
+
+    #[test]
+    fn a_put_tells_left_out_from_null_from_a_value() {
+        let base = r#""entity_type":"post","head":"H","mode":"live","reason":"r""#;
+        let parse = |extra: &str| {
+            serde_json::from_str::<ActionControlPutRequest>(&format!("{{{base}{extra}}}"))
+        };
+        let p = parse("").unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (None, None)
+        );
+        let p = parse(r#","follower_threshold":null,"skip_high_credibility":null"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (Some(None), Some(None))
+        );
+        let p = parse(r#","follower_threshold":0,"skip_high_credibility":false"#).unwrap();
+        assert_eq!(
+            (p.follower_threshold, p.skip_high_credibility),
+            (Some(Some(0)), Some(Some(false)))
+        );
+        let p = parse(r#","follower_threshold":2500"#).unwrap();
+        assert_eq!(p.follower_threshold, Some(Some(2500)));
+        for bad in [
+            r#","follower_threshold":-1"#,
+            r#","follower_threshold":1.5"#,
+            r#","follower_threshold":"off""#,
+            r#","skip_high_credibility":"no""#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let left_out = serde_json::to_value(parse("").unwrap()).unwrap();
+        assert!(left_out.get("follower_threshold").is_none());
+        let cleared =
+            serde_json::to_value(parse(r#","follower_threshold":null"#).unwrap()).unwrap();
+        assert_eq!(
+            cleared.get("follower_threshold"),
+            Some(&serde_json::Value::Null)
+        );
+        let set = serde_json::to_value(parse(r#","follower_threshold":0"#).unwrap()).unwrap();
+        assert_eq!(set.get("follower_threshold"), Some(&serde_json::json!(0)));
     }
 
     #[test]
@@ -1049,7 +1659,7 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(user(High), vec![PageAction::Suspend {}]);
+        assert_eq!(user(High), vec![PageAction::SUSPEND]);
         assert!(post(Low).is_empty());
         for l in LevelRow::ALL {
             for (e, a) in [
@@ -1061,7 +1671,9 @@ mod tests {
             }
         }
         assert!(
-            !post(High).contains(&PageAction::SuspendAuthor {}),
+            LevelRow::ALL
+                .iter()
+                .all(|&l| post(l).iter().all(|a| a.suspension().is_none())),
             "a post default never suspends the author"
         );
     }
@@ -1081,5 +1693,103 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json["factory_evidence_max_age_ms"], 9);
+    }
+
+    #[test]
+    fn a_post_label_names_a_listed_label_and_round_trips() {
+        let json = r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"permanent"}"#;
+        let a: PageAction = serde_json::from_str(json).unwrap();
+        let label = PostLabelName::parse("NsfwHighPrecision").unwrap();
+        assert_eq!(
+            a,
+            PageAction::PostLabel {
+                label,
+                lifetime: Lifetime::Permanent
+            }
+        );
+        assert_eq!(serde_json::to_string(&a).unwrap(), json);
+        assert_eq!(a.entity(), ControlEntity::Post);
+        assert_eq!(a.kind(), "NsfwHighPrecision");
+        assert!(a.is_post_label());
+        let soft = r#"{"kind":"post_label","label":"SoftNsfw","lifetime":"30d"}"#;
+        let a: PageAction = serde_json::from_str(soft).unwrap();
+        assert_eq!(a.kind(), "SoftNsfw");
+        assert_eq!(serde_json::to_string(&a).unwrap(), soft);
+        for nsfa in ["NsfaHighPrecision", "NsfaLimitedInventory"] {
+            let json = format!(r#"{{"kind":"post_label","label":"{nsfa}","lifetime":"7d"}}"#);
+            let a: PageAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(a.kind(), nsfa);
+            assert_eq!(a.entity(), ControlEntity::Post);
+            assert_eq!(serde_json::to_string(&a).unwrap(), json);
+        }
+        for bad in [
+            r#"{"kind":"post_label","label":"softnsfw","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighRecall","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfaHighRecall","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"nsfahighprecision","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"nsfwhighprecision","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"90d"}"#,
+            r#"{"kind":"post_label","lifetime":"permanent"}"#,
+            r#"{"kind":"post_label","label":"NsfwHighPrecision","lifetime":"7d","ttl":1}"#,
+        ] {
+            assert!(serde_json::from_str::<PageAction>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn every_listed_label_is_on_the_post_menu_with_every_lifetime() {
+        let post = PageAction::menu(ControlEntity::Post);
+        let user = PageAction::menu(ControlEntity::User);
+        for label in PostLabelName::all() {
+            for lifetime in [Lifetime::Days7, Lifetime::Days30, Lifetime::Permanent] {
+                let a = PageAction::PostLabel { label, lifetime };
+                assert!(post.contains(&a), "{a:?}");
+                assert!(!user.contains(&a), "{a:?}");
+            }
+        }
+        assert_eq!(
+            post.iter().filter(|a| a.is_post_label()).count(),
+            3 * PAGE_POST_LABELS.len()
+        );
+    }
+
+    #[test]
+    fn listed_labels_never_shadow_an_action_of_their_own() {
+        let mut seen = std::collections::HashSet::new();
+        for label in PAGE_POST_LABELS {
+            assert!(seen.insert(label), "{label} listed twice");
+            assert!(
+                !["SpamHighRecall", "RiskyHighVizReply"].contains(label),
+                "{label} has its own page action"
+            );
+            let kinds: Vec<&str> = PageAction::menu(ControlEntity::Post)
+                .into_iter()
+                .chain(PageAction::menu(ControlEntity::User))
+                .filter(|a| !a.is_post_label())
+                .map(PageAction::kind)
+                .collect();
+            assert!(!kinds.contains(label), "{label} is another action's kind");
+        }
+    }
+
+    #[test]
+    fn a_record_with_a_post_label_is_refused_by_older_images() {
+        let json = r#"{"v":3,"entity_type":"post","head":"H","mode":"live","actions":[{"kind":"hide_reply","lifetime":"permanent"}],"version":1,"confidence":"high"}"#;
+        let mut r = ActionControlRecord::parse_strict(json.as_bytes()).unwrap();
+        assert!(!r.uses_post_label());
+        assert_eq!(r.schema_version(), ROWS_RECORD_VERSION);
+        r.actions = vec![PageAction::PostLabel {
+            label: PostLabelName::parse("NsfwHighPrecision").unwrap(),
+            lifetime: Lifetime::Permanent,
+        }];
+        r.rollout_bp = Some(1_000);
+        assert_eq!(r.schema_version(), 7);
+        assert_eq!(r.schema_version(), POST_LABEL_RECORD_VERSION);
+        assert!(r.schema_version() > SUSPENSION_OPTIONS_RECORD_VERSION);
+        r.v = r.schema_version();
+        let back = ActionControlRecord::parse_strict(serde_json::to_string(&r).unwrap().as_bytes())
+            .unwrap();
+        assert_eq!(back, r);
     }
 }

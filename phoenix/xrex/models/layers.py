@@ -42,6 +42,13 @@ from xrex.utils.model import MemoryModelOutput
 from xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual
 
 
+def scale_value_heads(value_heads: jax.Array, token_scale: jax.Array | None) -> jax.Array:
+    if token_scale is None:
+        return value_heads
+    scaled = value_heads.astype(jnp.float32) * token_scale[:, : value_heads.shape[1], None, None]
+    return scaled.astype(value_heads.dtype)
+
+
 def rope_angles(
     dim: int, base_exponent: int, seq_len: int, positions: jax.Array | None = None
 ) -> jax.Array:
@@ -158,7 +165,10 @@ class MultiHeadAttention(hk.Module):
         assert num_q_heads % num_kv_heads == 0
 
         input_size = input_to_query.shape[-1]
-        lr_multiplier = self.scale_config.hidden_lr_multiplier(input_size)
+        lr_multiplier = (
+            self.scale_config.hidden_lr_multiplier(input_size)
+            * self.scale_config.transformer_matrix_lr_scale
+        )
 
         qkv_pspec = P(
             self.data_axis,
@@ -253,6 +263,9 @@ class MultiHeadAttention(hk.Module):
                 query_heads = checkpoint_name(query_heads, "query_heads_rope")
                 key_heads = checkpoint_name(key_heads, "key_heads_rope")
 
+        if seqpack_layout is not None:
+            value_heads = scale_value_heads(value_heads, seqpack_layout.value_scale)
+
         if self.config.attn_impl == "recsys_flash_attn":
             raise NotImplementedError(
                 f"FA2 has been removed but {self.config.attn_impl=} requires it"
@@ -319,7 +332,10 @@ class MultiHeadAttention(hk.Module):
             ),
         )
 
-        lr_multiplier = self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+        lr_multiplier = (
+            self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+            * self.scale_config.transformer_matrix_lr_scale
+        )
 
         embeddings = self._out_projection(
             attn,
@@ -348,7 +364,8 @@ class MultiHeadAttention(hk.Module):
             with_bias=self.config.with_bias,
             name=f"qkv{self.name_suffix}",
             pspec=P(None, None),
-            lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size),
+            lr_multiplier=self.scale_config.hidden_lr_multiplier(input_size)
+            * self.scale_config.transformer_matrix_lr_scale,
             sharding_context=self.sharding_context,
             dot=Fp8Dot(self.fp8_gemms),
         )
@@ -619,6 +636,8 @@ class CandidateOnlyAttention(MultiHeadAttention):
             shard_heads(checkpoint_name(v, "value_heads"), "kv_head")
             for v in (candidate_values, history_values)
         )
+        if seqpack_layout is not None:
+            history_values = scale_value_heads(history_values, seqpack_layout.value_scale)
 
         if config.qk_norm:
             query_heads = all_heads_qk_norm("q_norm", self.scale_config)(query_heads)
@@ -647,6 +666,16 @@ class CandidateOnlyAttention(MultiHeadAttention):
             if seqpack_layout is not None
             else {}
         )
+        num_candidates = segment_ids.shape[1] - history_states.shape[1]
+        num_user_rows = candidate_states.shape[1] - num_candidates
+        if num_user_rows:
+            assert candidate_region_kwargs, "User-token rows need seqpack_candidate_packing"
+            key_starts = candidate_region_kwargs["candidate_key_starts"]
+            assert key_starts.shape[1] == num_user_rows + 1, (key_starts.shape, num_user_rows)
+            candidate_region_kwargs["user_key_starts"] = key_starts.at[:, :-1].add(1)
+            candidate_region_kwargs["user_key_counts"] = (
+                candidate_region_kwargs["candidate_key_counts"] - 1
+            )
         attention = self._get_candidate_only_attn_impl()(
             config, self.scale_config, sharding_context=self.sharding_context
         )
@@ -678,7 +707,8 @@ class CandidateOnlyAttention(MultiHeadAttention):
             w_init=self.w_init,
             with_bias=config.with_bias,
             pspec=P(None, None),
-            lr_multiplier=self.scale_config.attn_output_lr_multiplier(attn.shape[-1]),
+            lr_multiplier=self.scale_config.attn_output_lr_multiplier(attn.shape[-1])
+            * self.scale_config.transformer_matrix_lr_scale,
             rms_clip_axes=(-2, -1),
             name=f"out{self.name_suffix}",
         )

@@ -1,10 +1,9 @@
 use crate::hydration::Hydrators;
-use crate::models::{PostCandidate, QuoteFacts, UserCandidate, UserEntity, ViewerRelationship};
+use crate::models::{EdgeSet, PostCandidate, Quote, UserCandidate, UserEntity};
 use crate::rules::context::RuleContext;
 use crate::rules::rule_spec::features::leaves::{ViewerFollowsAuthor, ViewerIsAuthor};
 use crate::rules::rule_spec::inputs::{Inputs, Interpreter};
 use crate::rules::rule_spec::rule::{all, RuleCond};
-use crate::rules::rule_spec::Predicate;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -14,8 +13,6 @@ pub trait Engine: Copy + Debug + Eq + 'static {
     type Candidate: Candidate;
 
     fn open<L: Copy + Debug + Eq + 'static>(only: Self::PostOnly<L>) -> L;
-
-    fn lift(predicate: Predicate<Self>) -> Predicate;
 }
 
 pub(in crate::rules) trait Fold: Engine {
@@ -42,8 +39,8 @@ pub(in crate::rules) trait Fold: Engine {
 
 pub trait Candidate {
     fn author(&self) -> &UserEntity;
-    fn viewer_relationship(&self) -> ViewerRelationship;
-    fn quote(&self) -> QuoteFacts;
+    fn edges(&self) -> EdgeSet;
+    fn quote(&self) -> Option<Quote>;
     fn failed(&self) -> Hydrators;
 }
 
@@ -63,11 +60,6 @@ impl Engine for PostEngine {
     #[inline]
     fn open<L: Copy + Debug + Eq + 'static>(only: L) -> L {
         only
-    }
-
-    #[inline]
-    fn lift(predicate: Predicate) -> Predicate {
-        predicate
     }
 }
 
@@ -99,36 +91,6 @@ impl Engine for UserEngine {
 
     fn open<L: Copy + Debug + Eq + 'static>(only: Absent<L>) -> L {
         match only.0 {}
-    }
-
-    fn lift(predicate: Predicate<Self>) -> Predicate {
-        match predicate {
-            Predicate::Request(leaf) => Predicate::Request(leaf),
-            Predicate::AuthorFacts(leaf) => Predicate::AuthorFacts(leaf),
-            Predicate::ViewerAccount(leaf) => Predicate::ViewerAccount(leaf),
-            Predicate::ViewerLabel(leaf) => Predicate::ViewerLabel(leaf),
-            Predicate::NotificationFilter(leaf) => Predicate::NotificationFilter(leaf),
-            Predicate::AuthorSafety(leaf) => Predicate::AuthorSafety(leaf),
-            Predicate::AuthorLabels(leaf) => Predicate::AuthorLabels(leaf),
-            Predicate::AuthorProfile(leaf) => Predicate::AuthorProfile(leaf),
-            Predicate::AuthorEmail(leaf) => Predicate::AuthorEmail(leaf),
-            Predicate::AuthorPhone(leaf) => Predicate::AuthorPhone(leaf),
-            Predicate::Relationship(leaf) => Predicate::Relationship(leaf),
-            Predicate::PairEdge(leaf) => Predicate::PairEdge(leaf),
-            Predicate::PostFacts(Absent(never, _))
-            | Predicate::SourceTweetId(Absent(never, _))
-            | Predicate::Tweet(Absent(never, _))
-            | Predicate::TweetSafetyLabels(Absent(never, _))
-            | Predicate::ReplyControl(Absent(never, _))
-            | Predicate::PostModeration(Absent(never, _))
-            | Predicate::ArticleStage(Absent(never, _))
-            | Predicate::CommunityModerator(Absent(never, _))
-            | Predicate::CommunityViewerRemoved(Absent(never, _))
-            | Predicate::ReactedToPostSafetyLabels(Absent(never, _))
-            | Predicate::ReactedToAuthorSafety(Absent(never, _))
-            | Predicate::Edge(Absent(never, _))
-            | Predicate::Compound(Absent(never, _)) => match never {},
-        }
     }
 }
 
@@ -165,13 +127,13 @@ impl Candidate for PostCandidate {
     }
 
     #[inline]
-    fn viewer_relationship(&self) -> ViewerRelationship {
-        self.viewer_relationship
+    fn edges(&self) -> EdgeSet {
+        self.edges
     }
 
     #[inline]
-    fn quote(&self) -> QuoteFacts {
-        QuoteFacts::default()
+    fn quote(&self) -> Option<Quote> {
+        None
     }
 
     #[inline]
@@ -187,12 +149,12 @@ impl Candidate for UserCandidate {
     }
 
     #[inline]
-    fn viewer_relationship(&self) -> ViewerRelationship {
-        self.viewer_relationship
+    fn edges(&self) -> EdgeSet {
+        self.edges
     }
 
     #[inline]
-    fn quote(&self) -> QuoteFacts {
+    fn quote(&self) -> Option<Quote> {
         self.quote
     }
 

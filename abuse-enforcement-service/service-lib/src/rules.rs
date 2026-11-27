@@ -292,6 +292,33 @@ pub fn decide_with_id(
     rules: &CompiledRules,
     facts: &Facts,
 ) -> Result<(Decision, String), EvalError> {
+    use crate::safety_checks::{
+        FOLLOWER_CEILING, PRE_CEILING, ceiling_stops, invited_reply_stop, test_account_stop,
+    };
+    let decided = decide_by_rules(rules, facts);
+    let stop = test_account_stop(facts)
+        .or_else(|| ceiling_stops(facts, false).then_some(&FOLLOWER_CEILING));
+    let Some(check) = stop else {
+        return match decided {
+            Ok((Decision::Act(_), _)) => match invited_reply_stop(facts) {
+                Some(invited) => Ok((
+                    Decision::Skip(invited.reason.to_owned()),
+                    invited.id.to_owned(),
+                )),
+                None => decided,
+            },
+            other => other,
+        };
+    };
+    match decided {
+        Ok((decision @ Decision::Skip(_), id)) if PRE_CEILING.contains(&id.as_str()) => {
+            Ok((decision, id))
+        }
+        _ => Ok((Decision::Skip(check.reason.to_owned()), check.id.to_owned())),
+    }
+}
+
+fn decide_by_rules(rules: &CompiledRules, facts: &Facts) -> Result<(Decision, String), EvalError> {
     let mut ctx = Context::default();
     bind_facts(&mut ctx, facts)?;
 
@@ -736,7 +763,6 @@ mod tests {
         for id in [
             "user_in_allowlist",
             "user_not_found",
-            "very_high_follower_count",
             "high_follower_count",
             "pagerank_skipped",
         ] {
@@ -746,17 +772,12 @@ mod tests {
                 user.rule_ids
             );
         }
-        let pos = |id: &str| {
-            user.rule_ids
-                .iter()
-                .position(|r| r == id)
-                .unwrap_or_else(|| panic!("user pipeline missing {id:?}"))
-        };
-        assert!(
-            pos("very_high_follower_count") < pos("high_follower_count"),
-            "very_high_follower_count must precede high_follower_count; got {:?}",
-            user.rule_ids
-        );
+        for ids in [&user.rule_ids, &post.rule_ids] {
+            assert!(
+                !ids.iter().any(|r| r == "very_high_follower_count"),
+                "{ids:?}"
+            );
+        }
         for id in [
             "post_in_allowlist",
             "user_in_allowlist",
@@ -900,6 +921,11 @@ mod tests {
     }
 
 
+            fn limits() -> (i64, i64) {
+        let view = crate::safety_checks::follower_skip_view();
+        (view.today_threshold as i64, view.ceiling as i64 + 1)
+    }
+
     fn base_facts() -> Facts {
         Facts {
             entity_type: crate::facts::EntityType::User,
@@ -931,6 +957,7 @@ mod tests {
             labels: vec![],
             allowlist: AllowlistFacts::default(),
             author,
+            invited: crate::facts::InvitedReply::NotAReply,
         });
         f
     }
@@ -1098,7 +1125,7 @@ rules:
         let EntityFacts::User(ref mut u) = f.entity else {
             unreachable!("base_facts is a User entity");
         };
-        u.cred.follower_count = Some(50_000);
+        u.cred.follower_count = Some(crate::safety_checks::follower_ceiling() as i64 - 1);
 
         assert_eq!(
             decide_with(&rules, &f).expect("eval should succeed"),
@@ -1254,7 +1281,8 @@ rules:
             Decision::Skip("user_in_allowlist".into())
         );
         let mut f = base_facts();
-        f.cred_mut().follower_count = Some(5_000);
+        f.cred_mut().follower_count =
+            Some(crate::safety_checks::follower_skip_view().today_threshold as i64);
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("high_follower_count".into())
@@ -1335,19 +1363,20 @@ rules:
 
     #[test]
     fn baked_in_user_pipeline_splits_follower_bands_at_the_ceiling() {
+        let (floor, above) = limits();
         let rules = RulesCache::new().resolve(EntityType::User, None);
         let mut f = base_facts();
-        f.cred_mut().follower_count = Some(250_000);
+        f.cred_mut().follower_count = Some(above);
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("very_high_follower_count".into())
         );
-        f.cred_mut().follower_count = Some(5_000);
+        f.cred_mut().follower_count = Some(floor);
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("high_follower_count".into())
         );
-        f.cred_mut().follower_count = Some(10);
+        f.cred_mut().follower_count = Some(floor - 1);
         assert_ne!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("high_follower_count".into())
@@ -1362,11 +1391,50 @@ rules:
     fn baked_in_user_ceiling_ignores_skip_author_credibility_prechecks() {
         let rules = RulesCache::new().resolve(EntityType::User, None);
         let mut f = base_facts();
-        f.cred_mut().follower_count = Some(250_000);
+        f.cred_mut().follower_count = Some(limits().1);
         f.score.skip_author_credibility_prechecks = true;
         assert_eq!(
             decide_with(&rules, &f).unwrap(),
             Decision::Skip("very_high_follower_count".into())
+        );
+    }
+
+            #[test]
+    fn the_ceiling_stops_a_post_decided_by_the_rules_whatever_the_waiver() {
+        let rules = RulesCache::new().resolve(EntityType::Post, None);
+        let author = UserFacts {
+            user: GizmoduckFacts {
+                present: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut f = post_facts(author, vec!["SpamEmbeddingPtosDistilled".into()]);
+        f.score.skip_author_credibility_prechecks = true;
+        let (floor, above) = limits();
+        f.cred_mut().follower_count = Some(floor);
+        assert!(
+            matches!(decide_with(&rules, &f).unwrap(), Decision::Act(_)),
+            "the waiver lifts the floor"
+        );
+        f.cred_mut().follower_count = Some(above);
+        assert_eq!(
+            decide_with_id(&rules, &f).unwrap(),
+            (
+                Decision::Skip("very_high_follower_count".into()),
+                "very_high_follower_count".into()
+            )
+        );
+        f.cred_mut().follower_count = None;
+        assert!(
+            matches!(decide_with(&rules, &f).unwrap(), Decision::Act(_)),
+            "an unknown count reads as 0 on the rules"
+        );
+        f.cred_mut().follower_count = Some(above);
+        f.user_mut().present = false;
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("user_not_found".into())
         );
     }
 

@@ -4,7 +4,7 @@ use crate::candidate_pipeline::phoenix_candidate_pipeline::PhoenixCandidatePipel
 use crate::candidate_pipeline::phoenix_scores_pipeline::PhoenixScoresPipeline;
 use crate::candidate_pipeline::ranked_following_candidate_pipeline::RankedFollowingCandidatePipeline;
 use crate::clients::gizmoduck_client::{
-    GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient, ViewerData,
+    GizmoduckClient, MockGizmoduckClient, ProdGizmoduckClient, QueryFields, ViewerData,
 };
 use crate::clients::resurrection_date_client::{
     MockResurrectionDateClient, ProdResurrectionDateClient, ResurrectionDateClient,
@@ -25,6 +25,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
 use xai_candidate_pipeline::candidate_pipeline::PipelineResult;
+use xai_candidate_pipeline::component_library::clients::{JetfuelClient, ProdJetfuelClient};
 use xai_candidate_pipeline::component_library::utils::{
     generate_request_id, non_zero, resolve_request_id,
 };
@@ -112,6 +113,8 @@ impl QueryBuilder {
             user_roles: viewer_data.roles.clone(),
             datacenter: self.datacenter.clone(),
             has_phone_number: viewer_data.has_phone_number,
+            subscription_level: viewer_data.subscription_level,
+            follower_count: viewer_data.follower_count,
             resurrection_time_ms,
             product: request_type.to_string(),
             now_ms: std::time::SystemTime::now()
@@ -206,7 +209,19 @@ impl QueryBuilder {
     async fn fetch_viewer_data(&self, viewer_id: u64) -> ViewerData {
         match tokio::time::timeout(
             std::time::Duration::from_millis(VIEWER_ROLES_TIMEOUT_MS),
-            self.gizmoduck_client.get_viewer_data(viewer_id),
+            self.gizmoduck_client.get_viewer_data_with_fields(
+                viewer_id,
+                &[
+                    QueryFields::ROLES,
+                    QueryFields::MUTE_SETTINGS,
+                    QueryFields::COUNTS,
+                    QueryFields::SAFETY,
+                    QueryFields::EXTENDED_PROFILE,
+                    QueryFields::ACCOUNT,
+                    QueryFields::DEVICES,
+                    QueryFields::EXTENDED_ACCOUNT,
+                ],
+            ),
         )
         .await
         {
@@ -313,6 +328,7 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
             root_span,
         } = ctx;
         query.return_backbone_scores = true;
+        query.is_debug_request = true;
         let output = self.run_pipeline(query).instrument(root_span).await?;
 
         let debug_json = build_debug_json(&output.pipeline_result);
@@ -842,6 +858,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let (
             gizmoduck_client,
             resurrection_date_client,
+            jetfuel_client,
             phoenix_candidate_pipeline,
             phoenix_scores_pipeline,
         ) = tokio::join!(
@@ -862,6 +879,13 @@ impl xai_x_service_builder::XService for HomeMixerServer {
                         .await
                         .expect("Failed to create ResurrectionDate client"),
                 ) as Arc<dyn ResurrectionDateClient>
+            },
+            async {
+                Arc::new(
+                    ProdJetfuelClient::new(&datacenter)
+                        .await
+                        .expect("Failed to create Jetfuel client"),
+                ) as Arc<dyn JetfuelClient>
             },
             async {
                 Arc::new(
@@ -905,6 +929,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let (for_you_pipeline, ranked_following_pipeline, following_pipeline) = tokio::join!(
             ForYouCandidatePipeline::new(
                 Arc::clone(&scored_posts),
+                Arc::clone(&jetfuel_client),
                 config.shard_coordinate,
                 &datacenter,
             ),
@@ -915,6 +940,7 @@ impl xai_x_service_builder::XService for HomeMixerServer {
         let for_you = Arc::new(ForYouFeedServer::new(
             query_builder.clone(),
             for_you_pipeline,
+            jetfuel_client,
         ));
 
         let ranked_following = Arc::new(RankedFollowingFeedServer::new(

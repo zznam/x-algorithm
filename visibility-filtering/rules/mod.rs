@@ -1,14 +1,17 @@
+mod action_kind;
 mod author_rules;
 #[cfg(test)]
 mod catalog;
 mod context;
+mod defaults;
 pub mod engine;
-mod expansion;
+mod experiment;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod golden_corpus;
 mod levels;
+pub(crate) mod notification_kind;
 mod rule_spec;
 mod safety_level;
 mod tweet_rules;
@@ -17,21 +20,18 @@ mod tweet_rules;
 use crate::models::{Placement, PostCandidate, ViewerFeatures};
 #[cfg(test)]
 use crate::params::CountryLists;
+pub(crate) use action_kind::ActionKind;
 use context::RuleContext;
-pub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};
-pub(crate) use expansion::Expansion;
-pub(crate) use rule_spec::observed::NoTrace;
-pub use rule_spec::observed::{NodeKind, NodeTrace, Skip, Witness};
+pub use engine::RuleEngine;
+#[cfg(test)]
+pub(crate) use experiment::Experiment;
+pub(crate) use experiment::{ExperimentSet, RequestExperiments};
 pub(crate) use rule_spec::RuleId;
-pub use rule_spec::{
-    ArticleStageLeaf, AuthorFactsLeaf, AuthorLabelsLeaf, AuthorSafetyLeaf, CommunityModeratorLeaf,
-    CommunityViewerRemovedLeaf, CompoundLeaf, Contribution, EdgeLeaf, PostFactsLeaf,
-    PostModerationLeaf, Predicate, ReactedToAuthorSafetyLeaf, ReactedToPostSafetyLabelsLeaf,
-    RelationshipLeaf, ReplyControlLeaf, RequestLeaf, SourceTweetIdLeaf, Truth, TweetLeaf,
-    TweetSafetyLabelsLeaf, ViewerAccountLeaf,
-};
-pub(crate) use safety_level::QuoteEntries;
-pub use safety_level::SafetyLevel;
+pub(crate) use rule_spec::observed::NoTrace;
+pub use rule_spec::observed::PolicyTrace;
+pub use rule_spec::{Predicate, RequestLeaf};
+pub(crate) use safety_level::{LevelError, QuoteEntries, RerenderReason, WireLevel};
+pub use safety_level::{Rpc, SafetyLevel};
 
 #[cfg(test)]
 pub(crate) fn test_context<'a>(

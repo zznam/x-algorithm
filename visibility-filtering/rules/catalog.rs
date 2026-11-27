@@ -2,6 +2,7 @@ use crate::rules::engine::WiredRule;
 use crate::rules::rule_spec::engine::Engine;
 use crate::rules::rule_spec::rule::{NamedCond, Rule, RuleCond};
 use crate::rules::rule_spec::rule_name;
+use crate::rules::safety_level::Judging;
 use crate::rules::{RuleEngine, SafetyLevel};
 use std::cmp::Reverse;
 use std::fmt::Write;
@@ -19,14 +20,16 @@ struct CatalogRule {
     named: Vec<(&'static str, String)>,
 }
 
-fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = CatalogRule> {
-    rules.iter().map(|rule| {
+fn catalog_rules<E: Engine>(
+    rules: impl Iterator<Item = &'static Rule<E>>,
+) -> impl Iterator<Item = CatalogRule> {
+    rules.map(|rule| {
         let action = rule.action.spec();
         let mut named: Vec<&'static NamedCond<E>> = Vec::new();
         rule.when.named(&mut named);
         CatalogRule {
-            severity: action.severity(),
-            kind_and_slot: action.kind_and_slot(),
+            severity: action.kind().severity(),
+            kind_and_slot: action.kind().catalog(),
             line: format!(
                 "`{}`: audience `{:?}`, when `{}`, `{}`",
                 rule_name(rule.id, &rule.action),
@@ -45,11 +48,16 @@ fn catalog_rules<E: Engine>(rules: &[&'static Rule<E>]) -> impl Iterator<Item = 
 pub(super) fn catalog() -> String {
     let mut rules: Vec<(CatalogRule, Vec<&'static str>)> = Vec::new();
     for &level in SafetyLevel::VARIANTS {
-        let listed = level.spec().rules.lists();
-        for entry in catalog_rules(listed.user).chain(catalog_rules(listed.post)) {
-            match rules.iter_mut().find(|(other, _)| *other == entry) {
-                Some((_, levels)) => levels.push(level.into()),
-                None => rules.push((entry, vec![level.into()])),
+        let level_name: &'static str = level.into();
+        for (_, listed) in level.judged_lists() {
+            for entry in
+                catalog_rules(listed.user.iter().copied()).chain(catalog_rules(listed.post_rules()))
+            {
+                match rules.iter_mut().find(|(other, _)| *other == entry) {
+                    Some((_, levels)) if levels.last() == Some(&level_name) => {}
+                    Some((_, levels)) => levels.push(level_name),
+                    None => rules.push((entry, vec![level_name])),
+                }
             }
         }
     }
@@ -71,8 +79,8 @@ pub(super) fn catalog() -> String {
          ## Precedence\n\n\
          A level folds its user list, then its post list. Each list folds in this order of\n\
          action and keeps its listed order within one action, so every user rule comes before\n\
-         every post rule. The first withholding decides; the slots fill as `GLOSSARY.md` (Slot)\n\
-         says.\n\n\
+         every post rule. The first withholding or FOSNR notice that applies decides; the slots\n\
+         fill as `GLOSSARY.md` (Slot) says.\n\n\
          | Action | Slot |\n|---|---|\n",
     );
     let mut kinds: Vec<(&str, &str)> = rules.iter().map(|(entry, _)| entry.kind_and_slot).collect();
@@ -101,14 +109,24 @@ pub(super) fn catalog() -> String {
     doc.push_str(
         "\n## Levels\n\n\
          Each level's rules in fold order: the user list, then the post list, each under its\n\
-         actions in precedence order.\n",
+         actions in precedence order. A notification level's post kinds follow it, each as\n\
+         `<level>_<kind>`, then the rules on its recipient's retweet sources as\n\
+         `<level>_retweet_source`.\n",
     );
     let rule_engine = RuleEngine::for_tests();
     for &level in SafetyLevel::VARIANTS {
-        writeln!(doc, "\n### {}\n", <&str>::from(level)).unwrap();
-        let (user, post) = rule_engine.fold_order(level);
-        write_wired(&mut doc, "user", &user);
-        write_wired(&mut doc, "post", &post);
+        let level_name: &str = level.into();
+        for (judging, _) in level.judged_lists() {
+            let heading = match judging {
+                Judging::Level => level_name.to_owned(),
+                Judging::PostKind(kind) => format!("{level_name}_{}", <&str>::from(kind)),
+                Judging::RetweetSource => format!("{level_name}_retweet_source"),
+            };
+            let (user, post) = rule_engine.judged_fold_order(level, judging);
+            writeln!(doc, "\n### {heading}\n").unwrap();
+            write_wired(&mut doc, "user", &user);
+            write_wired(&mut doc, "post", &post);
+        }
     }
     doc
 }
@@ -116,19 +134,28 @@ pub(super) fn catalog() -> String {
 fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E>]) {
     let mut band = None;
     for rule in rules {
-        let (kind, slot) = rule.action.kind_and_slot();
+        let (kind, slot) = rule.action.kind().catalog();
         if band != Some(kind) {
             band = Some(kind);
             match slot {
-                "withholding" => writeln!(doc, "- {list}, {kind}, withholding:"),
+                "withholding" | "fosnr" => writeln!(doc, "- {list}, {kind}, {slot}:"),
                 _ => writeln!(doc, "- {list}, {kind}, {slot} slot:"),
             }
             .unwrap();
         }
+        let gate = rule.experiment.map_or_else(String::new, |experiment| {
+            format!(" ({:?} on `{}`)", experiment.shape(), experiment.key())
+        });
         if rules.iter().filter(|other| other.name == rule.name).count() > 1 {
-            writeln!(doc, "  - `{}` when `{}`", rule.name, spelled(rule.when)).unwrap();
+            writeln!(
+                doc,
+                "  - `{}` when `{}`{gate}",
+                rule.name,
+                spelled(rule.when)
+            )
+            .unwrap();
         } else {
-            writeln!(doc, "  - `{}`", rule.name).unwrap();
+            writeln!(doc, "  - `{}`{gate}", rule.name).unwrap();
         }
     }
 }
@@ -136,9 +163,40 @@ fn write_wired<E: Engine>(doc: &mut String, list: &str, rules: &[WiredRule<'_, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DropReason;
+    use crate::rules::rule_spec::ActionSpec;
+    use std::collections::BTreeSet;
 
     #[test]
     fn the_policy_catalog_is_printed_from_the_rules() {
         crate::pinned::assert_pinned("docs/policy-catalog.md", &catalog());
+    }
+
+    fn viewer_gated_drop_rules<E: Engine>(
+        rules: impl Iterator<Item = &'static Rule<E>>,
+    ) -> impl Iterator<Item = String> {
+        rules
+            .filter(|rule| {
+                matches!(
+                    rule.action.spec(),
+                    ActionSpec::Drop(reason) if matches!(reason.reason(), DropReason::NsfwViewer(_))
+                )
+            })
+            .map(|rule| rule_name(rule.id, &rule.action))
+    }
+
+    #[test]
+    fn dashboard_lists_every_viewer_gated_drop_rule() {
+        let gated: BTreeSet<String> = SafetyLevel::VARIANTS
+            .iter()
+            .flat_map(|level| {
+                let listed = level.spec().rules().lists();
+                viewer_gated_drop_rules(listed.user.iter().copied())
+                    .chain(viewer_gated_drop_rules(listed.post_rules()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let dashboard = crate::pinned::dashboard_tuple("VIEWER_GATED_DROP_RULES");
+        assert_eq!(dashboard, gated);
     }
 }

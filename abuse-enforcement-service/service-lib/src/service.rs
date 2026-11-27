@@ -72,6 +72,14 @@ fn join_audit_info(mut additional_info: Vec<String>) -> String {
     additional_info.join("; ")
 }
 
+fn post_label_source(head: &str) -> String {
+    if head.is_empty() {
+        PLUGIN_ID.to_owned()
+    } else {
+        format!("{PLUGIN_ID}/{head}")
+    }
+}
+
 fn compute_expires_at_msec(ttl_msec: i64) -> i64 {
     let now_msec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -121,6 +129,7 @@ fn admin_event(
 
 pub struct AppState {
         pub ais_client: AisClient,
+                pub gd: Option<crate::gizmoduck::GizmoduckCoreClient>,
     pub dynamic_config: DynamicConfig,
                 pub rules_cache: std::sync::Arc<crate::rules::RulesCache>,
     pub dedup_cache: Option<crate::dedup_cache::ManhattanDedupCache>,
@@ -162,7 +171,8 @@ pub enum EnforcementAction {
                                                 AddPostLabelsV2 {
         tweet_id: i64,
         labels: Vec<String>,
-                                        expires_at_msec: Option<i64>,
+                                expires_at_msec: Option<i64>,
+                        source: String,
                         audit_note: String,
     },
                                     BounceArkose { user_id: i64, audit_note: String },
@@ -203,12 +213,14 @@ impl EnforcementAction {
         tweet_id: i64,
         labels: Vec<String>,
         ttl_msec: Option<i64>,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         Self::AddPostLabelsV2 {
             tweet_id,
             labels,
             expires_at_msec: ttl_msec.map(compute_expires_at_msec),
+            source: post_label_source(head),
             audit_note: join_audit_info(additional_info),
         }
     }
@@ -234,10 +246,11 @@ impl EnforcementAction {
         }
     }
 
-                                                                    pub fn from_spec(
+                                                                        pub fn from_spec(
         spec: &ActionSpec,
         entity_id: i64,
         user_id: i64,
+        head: &str,
         additional_info: Vec<String>,
     ) -> Self {
         match spec {
@@ -248,7 +261,7 @@ impl EnforcementAction {
                 Self::add_user_label(user_id, labels.clone(), *ttl_msec, additional_info)
             }
             ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {
-                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, additional_info)
+                Self::add_post_label(entity_id, labels.clone(), *ttl_msec, head, additional_info)
             }
             ActionSpec::Arkose => Self::bounce_arkose(user_id, additional_info),
             ActionSpec::Captcha => Self::bounce_captcha(user_id, additional_info),
@@ -377,6 +390,7 @@ impl EnforcementAction {
                 tweet_id,
                 labels,
                 expires_at_msec,
+                source,
                 ..
             } => {
                 let tweet_entity = json!({
@@ -386,8 +400,10 @@ impl EnforcementAction {
                     }
                 });
                 let safety_label = match expires_at_msec {
-                    Some(expires_at_msec) => json!({"expiresAtMsec": expires_at_msec}),
-                    None => json!({}),
+                    Some(expires_at_msec) => {
+                        json!({"source": source, "expiresAtMsec": expires_at_msec})
+                    }
+                    None => json!({"source": source}),
                 };
                 let labels_json: Vec<Value> = labels
                     .iter()
@@ -486,14 +502,16 @@ pub fn strato_retry_strategy() -> ExponentialBuilder {
     path = "/action",
     tag = "debug",
     security(("BearerAuth" = [])),
-    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer.",
+    description = "[PROTECTED — bearer token] Manual/debug direct AIS intakeAction (ThriftMux). The production path is the Kafka consumer. An account-ending action on a test account is refused.",
     request_body(
         content = Object,
         description = "ActionIntakeRequest JSON (actorHeader + action + tool), or legacy {\"actionIntakeRequest\": …}",
     ),
     responses(
         (status = 200, description = "AIS responded successfully — body is the raw AIS response", body = Object),
+        (status = 422, description = "AIS rejected the request permanently, or an account-ending action (suspend, deactivation or read-only) names a test account (or no account). Body shape: {\"action\": <reason>}"),
         (status = 500, description = "AIS call failed (network / non-success response). Body shape: {\"action\": <error string>}"),
+        (status = 503, description = "A suspend, deactivation or read-only action whose account couldn't be looked up. Body shape: {\"action\": <reason>}"),
     ),
 )]
 #[tracing::instrument(skip_all)]
@@ -507,17 +525,24 @@ pub async fn handle_action(
     info!("POST /api/action: {payload}");
 
     let (status, result) = match coerce_intake_request(payload) {
-        Ok(req) => match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await
-        {
-            Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
-            Err(e) => {
-                error!(error = format!("{e:#}"), "Action AIS call failed");
-                let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+        Ok(req) => match account_action_refusal(state.gd.as_ref(), &req).await {
+            Some((code, why)) => {
+                warn!(reason = %why, "POST /api/action: account action refused");
+                ("refused", (code, Json(json!({ "action": why }))))
+            }
+            None => {
+                match call_ais(&state.ais_client, 0, "action", req, AisMetricLabels::HTTP).await {
+                    Ok(resp) => ("ok", (StatusCode::OK, Json(resp))),
+                    Err(e) => {
+                        error!(error = format!("{e:#}"), "Action AIS call failed");
+                        let code = if e.downcast_ref::<PermanentAisFailure>().is_some() {
+                            StatusCode::UNPROCESSABLE_ENTITY
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        ("error", (code, Json(json!({"action": format!("{e:#}")}))))
+                    }
+                }
             }
         },
         Err(e) => (
@@ -535,6 +560,68 @@ pub async fn handle_action(
     metrics::HTTP_INFLIGHT.with_label_values(&["action"]).dec();
 
     result
+}
+
+const ACCOUNT_ACTIONS: &[&str] = &[
+    "suspendUser",
+    "suspendUserV2",
+    "deactivateUser",
+    "readOnlyUser",
+];
+
+async fn account_action_refusal(
+    gd: Option<&crate::gizmoduck::GizmoduckCoreClient>,
+    req: &Value,
+) -> Option<(StatusCode, String)> {
+    let (name, action) = req
+        .get("action")?
+        .as_object()?
+        .iter()
+        .find(|(name, _)| ACCOUNT_ACTIONS.contains(&name.as_str()))?;
+    let user_id = action.get("userId").and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    });
+    let Some(user_id) = user_id.filter(|id| *id > 0) else {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{name} has no valid userId"),
+        ));
+    };
+    if crate::test_user::is_test_user_id(user_id) {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test user (test_user_skipped)"),
+        ));
+    }
+    let Some(gd) = gd else {
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("can't check user {user_id}: no gizmoduck client"),
+        ));
+    };
+    let user = match gd.fetch_user(user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("can't check user {user_id}: {e:#}"),
+            ));
+        }
+    };
+    if !user.present {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} not found (user_not_found)"),
+        ));
+    }
+    crate::safety_checks::test_account_check(&user).map(|check| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("user {user_id} is a test account ({})", check.reason),
+        )
+    })
 }
 
 #[utoipa::path(
@@ -2966,7 +3053,7 @@ pub async fn handle_backfill_run_get(
         (status = 200, description = "The same run, already started", body = BackfillRunRecord),
         (status = 400, description = "Invalid request: {error: code, detail}"),
         (status = 403, description = "not_page_key or person_required"),
-        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, weak_evidence, switched_off, settings_not_set or lost_race"),
+        (status = 409, description = "changed_since_you_looked, run_in_progress, run_id_conflict, switched_off, settings_not_set or lost_race"),
         (status = 503, description = "Store unreachable"),
     ),
 )]
@@ -2999,7 +3086,6 @@ pub async fn handle_backfill_run_start(
                     &actor.0,
                     &cfg,
                     &state.action_control,
-                    &state.dynamic_config.action_control_config(),
                     &state.off_switch,
                     crate::now_millis(),
                 )
@@ -3048,7 +3134,7 @@ pub async fn handle_backfill_run_start(
         (status = 400, description = "confirm_required"),
         (status = 403, description = "key_not_allowed or person_required"),
         (status = 404, description = "No such run or change"),
-        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off, weak_evidence or lost_race"),
+        (status = 409, description = "version_conflict, not_running, not_paused, already_final, switched_off or lost_race"),
         (status = 503, description = "Store unreachable"),
     ),
 )]
@@ -3087,8 +3173,6 @@ pub async fn handle_backfill_run_change(
             who.as_deref(),
             &actor.0,
             &state.backfill.config(),
-            &state.action_control,
-            &state.dynamic_config.action_control_config(),
             &state.off_switch,
             crate::now_millis(),
         )
@@ -3169,6 +3253,7 @@ mod tests {
         };
         Arc::new(AppState {
             ais_client: crate::ais_client::AisClient::unconnected(),
+            gd: None,
             dynamic_config,
             rules_cache: Arc::new(crate::rules::RulesCache::new()),
             dedup_cache: None,
@@ -4172,6 +4257,7 @@ mod tests {
                 2,
                 vec![SPAM_HIGH_RECALL_LABEL.to_owned()],
                 Some(LABEL_EXPIRY_MSEC),
+                "",
                 vec![],
             ),
             EnforcementAction::bounce_arkose(1, vec!["n".to_owned()]),
@@ -4430,7 +4516,7 @@ mod tests {
             perm: true,
             policy: "TestPolicy".into(),
         };
-        let action = EnforcementAction::from_spec(&suspend, 1, 1, vec!["k: v".into()]);
+        let action = EnforcementAction::from_spec(&suspend, 1, 1, "", vec!["k: v".into()]);
         let v = action.to_json();
         assert_eq!(v["suspendUser"]["perm"], true);
         assert_eq!(v["suspendUser"]["policy"], "TestPolicy");
@@ -4439,7 +4525,7 @@ mod tests {
             labels: vec!["LowQualityReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&label, 2, 2, vec![]);
+        let action = EnforcementAction::from_spec(&label, 2, 2, "", vec![]);
         let v = action.to_json();
         let label_id_type = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["labelReference"]["labelIdType"];
@@ -4449,20 +4535,20 @@ mod tests {
             labels: vec!["RiskyHighVizReply".into()],
             ttl_msec: Some(7 * 24 * 60 * 60 * 1000),
         };
-        let action = EnforcementAction::from_spec(&post_label, 555, 999, vec![]);
+        let action = EnforcementAction::from_spec(&post_label, 555, 999, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::AddPostLabelsV2 { tweet_id: 555, .. }
         ));
         assert_eq!(action.name(), "addPostLabelsV2");
 
-        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, vec![]);
+        let arkose = EnforcementAction::from_spec(&ActionSpec::Arkose, 3, 3, "", vec![]);
         assert!(matches!(
             arkose,
             EnforcementAction::BounceArkose { user_id: 3, .. }
         ));
         assert_eq!(arkose.name(), "bounceArkose");
-        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, vec![]);
+        let captcha = EnforcementAction::from_spec(&ActionSpec::Captcha, 4, 4, "", vec![]);
         assert!(matches!(
             captcha,
             EnforcementAction::BounceCaptcha { user_id: 4, .. }
@@ -4476,6 +4562,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec!["model_version: v51".to_owned()],
         );
         assert_eq!(action.name(), "addPostLabelsV2");
@@ -4510,14 +4597,95 @@ mod tests {
     }
 
     #[test]
-    fn add_post_label_without_ttl_emits_empty_safety_label() {
+    fn add_post_label_without_ttl_emits_no_expiry() {
         let action =
-            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, vec![]);
+            EnforcementAction::add_post_label(777, vec!["SpamHighRecall".into()], None, "", vec![]);
         let v = action.to_json();
         let safety_label = &v["addLabelsV2"]["labels"][0]["nonPolicyBasedLabel"]["label"]["labelReferenceWithSafetyLabel"]
             ["safetyLabel"];
-        assert_eq!(*safety_label, json!({}));
+        assert_eq!(*safety_label, json!({"source": PLUGIN_ID}));
         assert!(safety_label["expiresAtMsec"].is_null());
+    }
+
+    #[test]
+    fn post_label_request_names_the_head_in_label_source() {
+        let t = xai_abuse_thrift_codec::Transcoder::from_schema_bytes(
+            xai_abuse_thrift_codec::SCHEMA_AIS,
+        )
+        .unwrap();
+        let method = t
+            .lookup_method(
+                "com.twitter.agenttools.ais.thriftscala.ActionIntakeService",
+                "intakeAction",
+            )
+            .expect("intakeAction");
+        let encode = |p: &Value| {
+            t.encode_call(
+                method.thrift_method_name,
+                method.arg_field_name,
+                method.arg_field_id,
+                method.request_type,
+                p,
+                1,
+            )
+        };
+        for (label, head) in [
+            ("NsfwHighPrecision", "AdultExplicitEmbeddingPtosDistilled"),
+            ("SpamHighRecall", "CopyLinkBaitEmbeddingGrokDistilled"),
+        ] {
+            let action = EnforcementAction::from_spec(
+                &ActionSpec::AddPostLabelsV2 {
+                    labels: vec![label.into()],
+                    ttl_msec: None,
+                },
+                555,
+                999,
+                head,
+                vec!["k: v".into()],
+            );
+            let payload = build_intake_request(
+                action.actor_header(),
+                action.to_json(),
+                AIS_TOOL,
+                Some(action.audit_note()),
+            );
+            let source = format!("xai-abuse-enforcement-service/{head}");
+            let tweet = json!({"entity": {"entityType": "Tweet", "entityId": {"longId": 555}}});
+            assert_eq!(
+                payload,
+                json!({
+                    "actorHeader": {"botmakerBot": {"botId": 0}},
+                    "action": {
+                        "addLabelsV2": {
+                            "entityId": tweet,
+                            "entityRef": tweet,
+                            "labels": [{
+                                "nonPolicyBasedLabel": {
+                                    "label": {
+                                        "labelReferenceWithSafetyLabel": {
+                                            "labelReference": {
+                                                "entityType": "Tweet",
+                                                "labelIdType": {"safetyTweetLabels": label},
+                                                "labelType": "Safety"
+                                            },
+                                            "safetyLabel": {"source": source}
+                                        }
+                                    }
+                                }
+                            }],
+                            "violatingUserIds": []
+                        }
+                    },
+                    "tool": "RtpPlugin",
+                    "auditHeader": {"note": format!("k: v; {}", AUDIT_NOTE.as_str())}
+                })
+            );
+            let bytes = encode(&payload).expect("encodes through the AIS schema");
+            assert!(
+                bytes.windows(source.len()).any(|w| w == source.as_bytes()),
+                "{source} missing from the encoded call"
+            );
+        }
     }
 
     #[test]
@@ -4532,6 +4700,7 @@ mod tests {
             99,
             vec!["RiskyHighVizReply".into()],
             Some(LABEL_EXPIRY_MSEC),
+            "",
             vec![],
         );
         let plugin_b = EnforcementAction::bounce_captcha(1, vec![]);
@@ -4571,6 +4740,7 @@ mod tests {
             777,
             vec!["RiskyHighVizReply".into()],
             Some(7 * 24 * 60 * 60 * 1000),
+            "",
             vec![],
         );
         assert_eq!(
@@ -4620,6 +4790,7 @@ mod tests {
             },
             9,
             9,
+            "",
             vec!["head: AdsRenderBot".into()],
         );
         assert_eq!(
@@ -4707,7 +4878,7 @@ mod tests {
 
     #[test]
     fn from_spec_builds_spam_liveness_check() {
-        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, vec![]);
+        let action = EnforcementAction::from_spec(&ActionSpec::SpamLivenessCheck, 9, 9, "", vec![]);
         assert!(matches!(
             action,
             EnforcementAction::SpamLivenessCheck { user_id: 9, .. }
@@ -4785,5 +4956,252 @@ mod tests {
             }
         }
         assert!(checked >= 30, "only {checked} operations in the API doc");
+    }
+
+    mod account_action_refusal_tests {
+        use std::collections::HashMap;
+
+        use super::*;
+        use crate::gizmoduck::GizmoduckCoreClient;
+        use crate::gizmoduck::test_support::{AccountShape, FixedUsers};
+        use crate::safety_checks::TestAccountPolicy;
+
+        const PLAIN: i64 = 1_700_200_001;
+        const QA_ROLE: i64 = 1_700_200_002;
+        const QA_MAIL: i64 = 1_700_200_003;
+        const QA_MAIL_UNCONFIRMED: i64 = 1_700_200_004;
+        const NETWORK: i64 = 1_700_200_005;
+        const TEMPORARY: i64 = 1_700_200_006;
+        const TEST_ID: i64 = 2_000_000_001;
+        const NOT_FOUND: i64 = 1_700_200_099;
+
+        fn client(fail: bool) -> GizmoduckCoreClient {
+            let shape = |s: AccountShape, id: i64| (id, s.user(id));
+            let users: HashMap<_, _> = [
+                shape(AccountShape::default(), PLAIN),
+                shape(
+                    AccountShape {
+                        roles: vec!["qa_test_role"],
+                        ..Default::default()
+                    },
+                    QA_ROLE,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(3),
+                        ..Default::default()
+                    },
+                    QA_MAIL,
+                ),
+                shape(
+                    AccountShape {
+                        login_email: Some("a@test.example.com"),
+                        email_confirmed: Some(2),
+                        ..Default::default()
+                    },
+                    QA_MAIL_UNCONFIRMED,
+                ),
+                shape(
+                    AccountShape {
+                        creation_ip: Some("203.0.113.40"),
+                        ..Default::default()
+                    },
+                    NETWORK,
+                ),
+                shape(
+                    AccountShape {
+                        test_user_status: Some(1),
+                        ..Default::default()
+                    },
+                    TEMPORARY,
+                ),
+            ]
+            .into();
+            GizmoduckCoreClient::from_lookup(Arc::new(FixedUsers {
+                users,
+                fail,
+                ..Default::default()
+            }))
+            .with_policy(
+                TestAccountPolicy::new(
+                    &["test.example.com".into()],
+                    &["qa_test_role".into()],
+                    &["203.0.113.0/24".into()],
+                )
+                .unwrap(),
+            )
+        }
+
+                fn act(name: &str, user_id: Value) -> Value {
+            json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {name: {"userId": user_id, "perm": false}},
+                "tool": "RtpPlugin",
+            })
+        }
+
+        fn suspend(user_id: Value) -> Value {
+            act("suspendUser", user_id)
+        }
+
+        async fn refusal(gd: Option<&GizmoduckCoreClient>, req: Value) -> Option<StatusCode> {
+            account_action_refusal(gd, &req).await.map(|(code, _)| code)
+        }
+
+        #[test]
+        fn the_guarded_actions_are_the_account_ending_ones_in_the_ais_schema() {
+            assert_eq!(
+                ACCOUNT_ACTIONS,
+                [
+                    "suspendUser",
+                    "suspendUserV2",
+                    "deactivateUser",
+                    "readOnlyUser"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_accounts_are_refused() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                for id in [QA_ROLE, QA_MAIL, NETWORK, TEMPORARY, TEST_ID] {
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id}"
+                    );
+                    assert_eq!(
+                        refusal(Some(&gd), act(name, json!(id.to_string()))).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {id} as a string"
+                    );
+                }
+            }
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(NOT_FOUND))).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: an account gizmoduck doesn't return"
+                );
+            }
+            let (_, why) = account_action_refusal(Some(&gd), &act("suspendUserV2", json!(QA_ROLE)))
+                .await
+                .unwrap();
+            assert!(why.contains("test_user_skipped"), "{why}");
+            assert!(!why.contains("qa_test_role"), "{why}");
+        }
+
+        #[tokio::test]
+        async fn ordinary_accounts_and_other_actions_pass() {
+            let gd = client(false);
+            for name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(PLAIN))).await,
+                    None,
+                    "{name}"
+                );
+                assert_eq!(
+                    refusal(Some(&gd), act(name, json!(QA_MAIL_UNCONFIRMED))).await,
+                    None,
+                    "{name}"
+                );
+            }
+            let label = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {"entityRef": {"userId": QA_ROLE}}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(None, label).await,
+                None,
+                "only account-ending actions are checked"
+            );
+            assert_eq!(
+                refusal(None, act("unsuspendUser", json!(QA_ROLE))).await,
+                None,
+                "lifting a suspension is not checked"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_account_action_that_cant_be_checked_is_refused() {
+            for &name in ACCOUNT_ACTIONS {
+                assert_eq!(
+                    refusal(Some(&client(true)), act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: failed lookup"
+                );
+                assert_eq!(
+                    refusal(None, act(name, json!(PLAIN))).await,
+                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    "{name}: no client"
+                );
+                for bad in [json!(null), json!("x"), json!(0), json!(-5), json!(1.5)] {
+                    assert_eq!(
+                        refusal(Some(&client(false)), act(name, bad.clone())).await,
+                        Some(StatusCode::UNPROCESSABLE_ENTITY),
+                        "{name} {bad}"
+                    );
+                }
+                let no_id = json!({
+                    "actorHeader": {"plugin": {"pluginId": "p"}},
+                    "action": {name: {}},
+                    "tool": "RtpPlugin",
+                });
+                assert_eq!(
+                    refusal(Some(&client(false)), no_id).await,
+                    Some(StatusCode::UNPROCESSABLE_ENTITY),
+                    "{name}: no userId"
+                );
+            }
+            let two = json!({
+                "actorHeader": {"plugin": {"pluginId": "p"}},
+                "action": {"addLabelsV2": {}, "suspendUserV2": {"userId": QA_ROLE}},
+                "tool": "RtpPlugin",
+            });
+            assert_eq!(
+                refusal(Some(&client(false)), two).await,
+                Some(StatusCode::UNPROCESSABLE_ENTITY),
+                "an account action beside another variant"
+            );
+        }
+
+                                #[tokio::test]
+        async fn the_handler_refuses_before_any_ais_call() {
+            let state = test_state(json!({}), None, None).await;
+            let mut with_gd = Arc::try_unwrap(test_state(json!({}), None, None).await)
+                .ok()
+                .unwrap();
+            with_gd.gd = Some(client(false));
+            let with_gd = Arc::new(with_gd);
+            let legacy = json!({ "actionIntakeRequest": suspend(json!(QA_ROLE)) });
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(legacy)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let v2 = act("suspendUserV2", json!(QA_MAIL));
+            let (code, body) =
+                response(handle_action(State(with_gd.clone()), Json(v2)).await).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body["action"].as_str().unwrap().contains("test account"),
+                "{body}"
+            );
+            let (code, _) =
+                response(handle_action(State(state), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no client on the state"
+            );
+            let (code, _) =
+                response(handle_action(State(with_gd), Json(suspend(json!(PLAIN)))).await).await;
+            assert_eq!(
+                code,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a plain account reaches AIS"
+            );
+        }
     }
 }

@@ -2,15 +2,17 @@ use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,
-    PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,
-    PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,
-    PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,
+    PhoenixRetrievalDatasetTopK, PhoenixRetrievalExcludeSeenPosts,
+    PhoenixRetrievalInferenceClusterId, PhoenixRetrievalNewUserHistoryThreshold,
+    PhoenixRetrievalNewUserInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
+    RetrievalValueModelWeights,
 };
+use crate::util::egress::phoenix_retrieval;
 use crate::util::phoenix_request::{
     build_client_context, build_user_context, candidates_from_retrieval_response,
     retrieval_value_model_weights,
 };
-use rustc_hash::FxHashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
@@ -24,7 +26,6 @@ use xai_recsys_proto::RetrievalDatasetType;
 use xai_stats_receiver::global_stats_receiver;
 
 const ZERO_FAV_RETRIEVED_METRIC: &str = "ScoredStats.PhoenixRetrievalZeroFavTweets.Retrieved";
-const SOCIALGRAPH_RETRIEVED_METRIC: &str = "PhoenixSource.SocialgraphRetrieved";
 
 pub struct PhoenixSource {
     pub phoenix_retrieval_client: Arc<dyn PhoenixRetrievalClient + Send + Sync>,
@@ -121,8 +122,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let client_context = build_client_context(query);
         let user_context = build_user_context(query);
 
-        let response = self
-            .phoenix_retrieval_client
+        let response = phoenix_retrieval(query, cluster, self.phoenix_retrieval_client.as_ref())
             .retrieve_excluding(
                 cluster,
                 user_id,
@@ -138,6 +138,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
                 vec![],
                 Self::seen_post_exclusions(query),
                 retrieval_value_model_weights(&query.params.get(RetrievalValueModelWeights)),
+                dataset_top_k(&query.params.get(PhoenixRetrievalDatasetTopK)),
             )
             .await
             .map_err(|e| format!("PhoenixSource: {e}"))?;
@@ -145,39 +146,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
         let candidates =
             candidates_from_retrieval_response(response, served_type_for_dataset, cluster);
         record_zero_fav_retrieved(&candidates);
-        record_socialgraph_retrieved(query, &candidates);
         Ok(candidates)
-    }
-}
-
-fn record_socialgraph_retrieved(query: &ScoredPostsQuery, candidates: &[PostCandidate]) {
-    let Some(receiver) = global_stats_receiver() else {
-        return;
-    };
-    let muted: FxHashSet<i64> = query.user_features.muted_user_ids.iter().copied().collect();
-    let blocked: FxHashSet<i64> = query
-        .user_features
-        .blocked_user_ids
-        .iter()
-        .copied()
-        .collect();
-    let (mut muted_count, mut blocked_count) = (0u64, 0u64);
-    for c in candidates {
-        let author_id = c.author_id as i64;
-        muted_count += muted.contains(&author_id) as u64;
-        blocked_count += blocked.contains(&author_id) as u64;
-    }
-    let m = SOCIALGRAPH_RETRIEVED_METRIC;
-    receiver.incr(m, &[("type", "requests")], 1);
-    receiver.incr(m, &[("type", "retrieved")], candidates.len() as u64);
-    if muted_count > 0 {
-        receiver.incr(m, &[("type", "muted")], muted_count);
-    }
-    if blocked_count > 0 {
-        receiver.incr(m, &[("type", "blocked")], blocked_count);
-    }
-    if muted_count + blocked_count > 0 {
-        receiver.incr(m, &[("type", "requests_with_hit")], 1);
     }
 }
 
@@ -196,10 +165,22 @@ fn record_zero_fav_retrieved(candidates: &[PostCandidate]) {
     receiver.incr(ZERO_FAV_RETRIEVED_METRIC, &[("type", "requests")], 1);
 }
 
+fn dataset_top_k(spec: &str) -> HashMap<String, u32> {
+    spec.split(',')
+        .filter_map(|entry| {
+            let (name, k) = entry.split_once('=')?;
+            Some((name.trim().to_string(), k.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
     match RetrievalDatasetType::try_from(dataset_type as i32) {
         Ok(RetrievalDatasetType::HomeCold) => pb::ServedType::ForYouPhoenixRetrievalCold,
         Ok(RetrievalDatasetType::ZeroFav) => pb::ServedType::ForYouPhoenixRetrievalZeroFav,
+        Ok(RetrievalDatasetType::AiVideoSelf2day | RetrievalDatasetType::AiVideoModel2day) => {
+            pb::ServedType::ForYouPhoenixRetrievalAiVideo
+        }
         _ => pb::ServedType::ForYouPhoenixRetrieval,
     }
 }

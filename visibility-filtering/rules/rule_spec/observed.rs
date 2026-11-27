@@ -1,16 +1,22 @@
 use super::rule::{Rule, RuleCond};
-use super::{truth_of, Predicate, Truth};
+use super::{truth_of, Contribution, Predicate, Truth};
+use crate::hydration::Hydrators;
+use crate::models::Evaluation;
+use crate::rules::action_kind::ActionKind;
+use crate::rules::defaults::{Bucket, Defaults, Effect};
 use crate::rules::rule_spec::engine::{Engine, Fold};
 use crate::rules::RuleContext;
+
+type Completed = (Option<Contribution>, Hydrators);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Skip<H> {
     FalseConjunct(H),
     TrueDisjunct(H),
-    Terminal(usize),
+    Terminal,
 }
 
-pub(in crate::rules) trait NodeObserver<E: Engine> {
+pub(in crate::rules) trait Observer<E: Engine> {
     const TOTAL: bool;
     type Handle: Copy;
 
@@ -22,11 +28,24 @@ pub(in crate::rules) trait NodeObserver<E: Engine> {
     ) -> Self::Handle;
 
     fn finish(&mut self, handle: Self::Handle, truth: Truth);
+
+    fn row(
+        &mut self,
+        by: &'static str,
+        root: Self::Handle,
+        truth: Truth,
+        effect: Effect,
+        kind: ActionKind,
+        defaults_admitted: Hydrators,
+        completed: Option<Completed>,
+    );
+
+    fn retained(&mut self, defaults: Defaults);
 }
 
 pub(crate) struct NoTrace;
 
-impl<E: Engine> NodeObserver<E> for NoTrace {
+impl<E: Engine> Observer<E> for NoTrace {
     const TOTAL: bool = false;
     type Handle = ();
 
@@ -35,10 +54,26 @@ impl<E: Engine> NodeObserver<E> for NoTrace {
 
     #[inline]
     fn finish(&mut self, (): (), _: Truth) {}
+
+    #[inline]
+    fn row(
+        &mut self,
+        _: &'static str,
+        (): (),
+        _: Truth,
+        _: Effect,
+        _: ActionKind,
+        _: Hydrators,
+        _: Option<Completed>,
+    ) {
+    }
+
+    #[inline]
+    fn retained(&mut self, _: Defaults) {}
 }
 
 #[inline]
-pub(in crate::rules) fn evaluate<E: Fold, O: NodeObserver<E>>(
+pub(in crate::rules) fn evaluate<E: Fold, O: Observer<E>>(
     condition: RuleCond<E>,
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
@@ -76,7 +111,7 @@ pub(in crate::rules) fn evaluate<E: Fold, O: NodeObserver<E>>(
 }
 
 #[inline]
-fn group<E: Fold, O: NodeObserver<E>>(
+fn group<E: Fold, O: Observer<E>>(
     children: &[RuleCond<E>],
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
@@ -88,20 +123,26 @@ fn group<E: Fold, O: NodeObserver<E>>(
     let mut truth = identity;
     let mut decided = None;
     for &child in children {
-        let answer = if let (false, RuleCond::Leaf(leaf)) = (O::TOTAL, child) {
-            truth_of(leaf, context)
-        } else {
-            let (answer, child_handle) = evaluate(
-                child,
-                context,
-                observer,
-                Some(handle),
-                skip.or(decided.map(after)),
-            );
-            if decided.is_none() && answer == absorbing {
-                decided = Some(child_handle);
+        let answer = match child {
+            RuleCond::Leaf(leaf) if !O::TOTAL => truth_of(leaf, context),
+            RuleCond::Not(RuleCond::Leaf(leaf)) if !O::TOTAL => !truth_of(*leaf, context),
+            RuleCond::Leaf(_)
+            | RuleCond::All(_)
+            | RuleCond::Any(_)
+            | RuleCond::Not(_)
+            | RuleCond::Named(_) => {
+                let (answer, child_handle) = evaluate(
+                    child,
+                    context,
+                    observer,
+                    Some(handle),
+                    skip.or(decided.map(after)),
+                );
+                if decided.is_none() && answer == absorbing {
+                    decided = Some(child_handle);
+                }
+                answer
             }
-            answer
         };
         if answer == absorbing && !O::TOTAL {
             return answer;
@@ -112,13 +153,13 @@ fn group<E: Fold, O: NodeObserver<E>>(
 }
 
 #[inline]
-pub(in crate::rules) fn evaluate_rule<E: Fold, O: NodeObserver<E>>(
+pub(in crate::rules) fn evaluate_rule<E: Fold, O: Observer<E>>(
     rule: &Rule<E>,
     context: &RuleContext<'_, E::Candidate>,
     observer: &mut O,
-    terminal: Option<usize>,
+    after_terminal: bool,
 ) -> (Truth, O::Handle) {
-    let skip = terminal.map(Skip::Terminal);
+    let skip = after_terminal.then_some(Skip::Terminal);
     let root = observer.enter(None, None, skip);
     let truth = if O::TOTAL {
         let (audience, audience_handle) = evaluate(
@@ -179,12 +220,41 @@ pub struct NodeTrace {
     pub default_witnesses: Vec<Witness>,
 }
 
-#[derive(Default)]
-pub(in crate::rules) struct NodeTracer {
-    pub(in crate::rules) nodes: Vec<NodeTrace>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyTrace {
+    pub evaluation: Evaluation,
+    pub nodes: Vec<NodeTrace>,
+    pub rows: Vec<RowTrace>,
 }
 
-impl<E: Engine> NodeObserver<E> for NodeTracer {
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowTrace {
+    pub by: &'static str,
+    pub root: usize,
+    pub truth: Truth,
+    pub effect: Effect,
+    pub defaults_admitted: Hydrators,
+    pub defaults_retained: Hydrators,
+    pub completed: Option<Completed>,
+}
+
+#[derive(Default)]
+pub(in crate::rules) struct Total {
+    nodes: Vec<NodeTrace>,
+    rows: Vec<(Bucket, RowTrace)>,
+}
+
+impl Total {
+    pub(in crate::rules) fn into_trace(self, evaluation: Evaluation) -> PolicyTrace {
+        PolicyTrace {
+            evaluation,
+            nodes: self.nodes,
+            rows: self.rows.into_iter().map(|(_, row)| row).collect(),
+        }
+    }
+}
+
+impl<E: Engine> Observer<E> for Total {
     const TOTAL: bool = true;
     type Handle = usize;
 
@@ -196,7 +266,7 @@ impl<E: Engine> NodeObserver<E> for NodeTracer {
     ) -> usize {
         let kind = match node {
             None => NodeKind::Rule,
-            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(E::lift(leaf)),
+            Some(RuleCond::Leaf(leaf)) => NodeKind::Leaf(leaf.lift()),
             Some(RuleCond::All(_)) => NodeKind::All,
             Some(RuleCond::Any(_)) => NodeKind::Any,
             Some(RuleCond::Not(_)) => NodeKind::Not,
@@ -272,5 +342,35 @@ impl<E: Engine> NodeObserver<E> for NodeTracer {
         node.truth = truth;
         node.witnesses = witnesses;
         node.default_witnesses = default_witnesses;
+    }
+
+    fn row(
+        &mut self,
+        by: &'static str,
+        root: usize,
+        truth: Truth,
+        effect: Effect,
+        kind: ActionKind,
+        defaults_admitted: Hydrators,
+        completed: Option<Completed>,
+    ) {
+        self.rows.push((
+            kind.bucket(),
+            RowTrace {
+                by,
+                root,
+                truth,
+                effect,
+                defaults_admitted,
+                defaults_retained: Hydrators::empty(),
+                completed,
+            },
+        ));
+    }
+
+    fn retained(&mut self, defaults: Defaults) {
+        for (bucket, row) in &mut self.rows {
+            row.defaults_retained = row.defaults_admitted.intersection(defaults.get(*bucket));
+        }
     }
 }

@@ -1,229 +1,295 @@
-use crate::clients::about_this_account_client::AboutThisAccountClient;
-use crate::clients::article_client::ArticleClient;
-use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::{EdgeQuery, SocialgraphClient};
-use crate::clients::trusted_friends_client::TrustedFriendsClient;
-use crate::clients::user_devices_client::UserDevicesClient;
-use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::WingmanClient;
 use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};
 use crate::hydration::community_source::{CommunityPost, CommunitySource};
-use crate::hydration::decode::article::decode_lifecycle;
-pub(crate) use crate::hydration::decode::author::{
-    actor_batch, author_batch, DecodedActor, DecodedAuthor,
-};
-use crate::hydration::decode::tweet::pure_core;
-use crate::hydration::decode::viewer::decode_viewer;
-pub(crate) use crate::hydration::decode::viewer::DecodedViewer;
-use crate::hydration::fetcher::Owner;
-use crate::hydration::tweet_source::{decode_tweet, TweetSource};
-use crate::models::{ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures};
-use crate::post_card::{PostCard, PostCards};
-use crate::safety_label_source::SafetyLabelSource;
-use futures::future::join;
+use crate::hydration::decode::author::{AuthorFallbackCache, AuthorNotFound};
+use crate::hydration::decode::tweet::TweetFallbackCache;
+use crate::hydration::execute::{send, InFlight, Timed};
+use crate::hydration::fetcher::{Fetcher, FetcherId, Fetchers};
+use crate::hydration::hydrator::{Edge, EdgeKey};
+use crate::hydration::inventory::Answer;
+use crate::hydration::store::{CallRequest, FetcherKey, Store};
+use crate::hydration::tweet_source::TweetSource;
+use crate::metrics::RequestMetrics;
+use futures::future::BoxFuture;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
-use std::iter;
+use std::collections::HashSet;
+use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
+use strum::VariantArray;
 use tonic::metadata::{MetadataMap, MetadataValue};
-use tracing::warn;
-use wingman_client::Exists;
-use xai_core_entities::entities::{ConversationControl, GizmoduckUser, QuotedTweet};
-use xai_core_entities::gizmoduck_client::QueryFields;
+use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
 use xai_core_entities::tweet_entity_service_client::TESClient;
-use xai_strato::Bytes;
-use xai_visibility_filtering_proto as vf_pb;
+use xai_safety_label_source::SafetyLabelSource;
+use xai_strato::StratoGrpc;
+
+mod about_this_account;
+mod articles;
+mod communities;
+mod geoduck;
+mod gizmoduck;
+mod notifinfra;
+mod safety_labels;
+mod socialgraph;
+mod tes;
+mod trusted_friends;
+mod wingman;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Expired;
 
-pub(crate) type Edges = Result<Vec<RawHydrationBatch<bool>>, Expired>;
+pub(crate) trait SourceFetch: 'static {
+    const DECIDES_EXISTENCE: bool;
 
-#[tonic::async_trait]
-pub(crate) trait Sources: Send + Sync {
-    async fn pure_cores(&self, owner: Owner, tweet_ids: &[u64]) -> RawHydrationBatch<PureCore>;
+    type Key: Copy + Eq + Hash;
+    type Reply: Batches;
 
-    async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures>;
+    fn fetch<'c>(
+        backends: &'c Backends,
+        input: &'c Input<'c>,
+    ) -> impl Future<Output = Result<Self::Reply, Expired>> + Send + 'c;
 
-    async fn conversation_controls(
-        &self,
-        tweet_ids: &[u64],
-    ) -> RawHydrationBatch<ConversationControl>;
+    fn count_missing(_: &CallContext<'_>, reply: Self::Reply) -> Self::Reply {
+        reply
+    }
 
-    async fn quoted_tweets(&self, outer_ids: &[u64]) -> RawHydrationBatch<QuotedTweet>;
+    fn fall_back(_: &CallContext<'_>, reply: Self::Reply) -> Self::Reply {
+        reply
+    }
 
-    async fn safety_labels(
-        &self,
-        owner: Owner,
-        tweet_ids: &[u64],
-    ) -> RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>>;
+    fn count(_: &CallContext<'_>, _: &Input<'_>, reply: Self::Reply) -> Self::Reply {
+        reply
+    }
 
-    async fn viewer(
-        &self,
-        viewer_id: u64,
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedViewer>;
+    #[cfg(test)]
+    type World: Default + Send + Sync;
 
-    async fn users(
-        &self,
-        owner: Owner,
-        user_ids: &[u64],
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedAuthor>;
-
-    async fn actors(
-        &self,
-        user_ids: &[u64],
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedActor>;
-
-    async fn confirmed_emails(&self, user_ids: &[u64]) -> RawHydrationBatch<bool>;
-
-    async fn verified_phones(&self, user_ids: &[u64]) -> RawHydrationBatch<bool>;
-
-    async fn select_edges(&self, viewer_id: u64, queries: &[EdgeQuery]) -> Edges;
-
-    async fn select_pair_edges(&self, queries: &[EdgeQuery]) -> Edges;
-
-    async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>>;
-
-    async fn second_degree(
-        &self,
-        viewer_id: u64,
-        root_author_ids: &[u64],
-    ) -> RawHydrationBatch<bool>;
-
-    async fn community_moderations(
-        &self,
-        posts: &[CommunityPost],
-    ) -> RawHydrationBatch<CommunityModeration>;
-
-    async fn community_moderators(
-        &self,
-        viewer_id: u64,
-        community_ids: &[u64],
-    ) -> RawHydrationBatch<bool>;
-
-    async fn community_viewer_removals(
-        &self,
-        viewer_id: u64,
-        community_ids: &[u64],
-    ) -> RawHydrationBatch<bool>;
-
-    async fn article_lifecycles(&self, article_ids: &[u64]) -> RawHydrationBatch<ArticleLifecycle>;
-
-    async fn article_media_entities(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> RawHydrationBatch<bool>;
-
-    async fn article_cover_media(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> RawHydrationBatch<bool>;
-
-    async fn trusted_friends(&self, viewer_id: u64, list_ids: &[u64]) -> RawHydrationBatch<bool>;
-
-    async fn outside_places(&self, viewer_id: u64, place_ids: &[u64]) -> RawHydrationBatch<bool>;
+    #[cfg(test)]
+    fn in_memory(world: &Self::World, input: &Input<'_>, call: &InMemoryCall<'_>) -> Self::Reply;
 }
 
-fn expired(status: &tonic::Status) -> bool {
-    let timer_expired = iter::successors(std::error::Error::source(status), |err| err.source())
-        .any(|err| err.is::<tonic::TimeoutExpired>());
-    timer_expired || status.code() == tonic::Code::DeadlineExceeded
-}
+pub(crate) trait Batches: AsRef<[RawHydrationBatch<Self::Value>]> + Send {
+    type Value;
 
-fn select_result(
-    sets: Result<&[Option<HashSet<u64>>], &tonic::Status>,
-    edges: Vec<RawHydrationBatch<bool>>,
-) -> Edges {
-    match sets {
-        Err(status) if expired(status) => Err(Expired),
-        Ok(_) | Err(_) => Ok(edges),
+    fn timed_out(failed: RawHydrationBatch<Self::Value>, queries: usize) -> Self;
+
+    fn ran_out(&self) -> bool {
+        false
     }
 }
 
-fn edge_batches(
-    queries: &[EdgeQuery],
-    sets: Result<&[Option<HashSet<u64>>], &tonic::Status>,
-) -> Vec<RawHydrationBatch<bool>> {
-    queries
-        .iter()
-        .enumerate()
-        .map(|(position, query)| {
-            let set = sets
-                .as_ref()
-                .map(|sets| sets.get(position).and_then(Option::as_ref));
-            let answers = query.destination_ids.iter().map(|&destination| {
-                let answer = match set {
-                    Err(_) => Hydrated::Failed,
-                    Ok(None) => Hydrated::Partial(false),
-                    Ok(Some(set)) => Hydrated::Found(set.contains(&destination)),
-                };
-                (destination, answer)
-            });
-            HydrationBatch::from_hydrated(answers.collect())
-        })
-        .collect()
+impl<V: Send> Batches for RawHydrationBatch<V> {
+    type Value = V;
+
+    fn timed_out(failed: Self, _: usize) -> Self {
+        failed
+    }
 }
 
-fn tweet_batch(
-    tweet_ids: &[u64],
-    values: HashMap<u64, anyhow::Result<Bytes>>,
-) -> RawHydrationBatch<TweetFeatures> {
-    let tweets: FxHashMap<_, _> = values
-        .into_iter()
-        .map(|(id, value)| (id, value.and_then(|bytes| decode_tweet(&bytes))))
-        .collect();
-    HydrationBatch::from_results(tweet_ids.iter().copied(), tweets)
+impl<V: Clone + Send> Batches for Vec<RawHydrationBatch<V>> {
+    type Value = V;
+
+    fn timed_out(failed: RawHydrationBatch<V>, queries: usize) -> Self {
+        vec![failed; queries]
+    }
 }
 
-fn viewer_batch<E>(
-    viewer_id: u64,
-    viewer: Result<Option<GizmoduckUser>, E>,
-    fields: &[QueryFields],
-) -> RawHydrationBatch<DecodedViewer> {
-    let viewer = viewer.map(|user| Some(decode_viewer(user.as_ref(), fields)));
-    one_viewer_batch(viewer_id, viewer)
+pub(crate) struct Input<'c> {
+    pub(crate) keys: &'c [u64],
+    pub(crate) viewer_id: Option<u64>,
+    pub(crate) fields: &'c [QueryFields],
+    pub(crate) queries: &'c [EdgeQuery],
+    pub(crate) community_posts: &'c [CommunityPost],
+    #[cfg(test)]
+    pub(crate) fetcher: FetcherId,
 }
 
-fn one_viewer_batch<V, E>(viewer_id: u64, answer: Result<Option<V>, E>) -> RawHydrationBatch<V> {
-    HydrationBatch::from_results([viewer_id], HashMap::from([(viewer_id, answer)]))
+pub(crate) struct CallContext<'p> {
+    pub(crate) metrics: &'p RequestMetrics,
+    pub(crate) label: (&'static str, &'static str),
+    pub(crate) tweet_cache: Option<&'p TweetFallbackCache>,
+    pub(crate) author_cache: Option<&'p AuthorFallbackCache>,
+    pub(crate) author_not_found: AuthorNotFound,
 }
 
-fn lifecycle_batch(rows: RawHydrationBatch<i32>) -> RawHydrationBatch<ArticleLifecycle> {
-    let decoded = rows.into_hydrated().into_iter().map(|(id, row)| {
-        let lifecycle = match row {
-            Hydrated::Found(value) => {
-                decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Found)
+pub(crate) trait Fetches<F: SourceFetch>: Send + Sync {
+    fn fetch<'c>(&'c self, input: &'c Input<'c>) -> BoxFuture<'c, Result<F::Reply, Expired>>;
+}
+
+pub(super) type Value<F> = <<F as SourceFetch>::Reply as Batches>::Value;
+
+pub(super) trait Registered: SourceFetch {
+    const SOURCE: Source;
+    const EDGE: Option<Edge> = Edge::answered_from_the_viewer_by(Self::SOURCE);
+
+    fn fetchers(all: &SourceFetchers) -> &Fetchers<Value<Self>, Self::Key>;
+    fn fetchers_mut(all: &mut SourceFetchers) -> &mut Fetchers<Value<Self>, Self::Key>;
+}
+
+#[cfg(test)]
+pub(crate) trait Held: SourceFetch {
+    fn world(worlds: &Worlds) -> &Self::World;
+    fn world_mut(worlds: &mut Worlds) -> &mut Self::World;
+}
+
+macro_rules! sources {
+    ($($source:ident => $backend:literal,)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, VariantArray)]
+        pub(crate) enum Source {
+            $($source,)*
+        }
+
+        pub(crate) mod source {
+            $(pub(crate) struct $source;)*
+        }
+
+        impl Source {
+            pub(super) const fn decides_existence(self) -> bool {
+                match self {
+                    $(Source::$source => <source::$source as SourceFetch>::DECIDES_EXISTENCE,)*
+                }
             }
-            Hydrated::Partial(value) => {
-                decode_lifecycle(value).map_or(Hydrated::Failed, Hydrated::Partial)
+
+            pub(super) const fn backend_label(self) -> &'static str {
+                match self {
+                    $(Source::$source => $backend,)*
+                }
             }
-            Hydrated::NotFound => Hydrated::NotFound,
-            Hydrated::Failed => Hydrated::Failed,
-            Hydrated::Unanswered => Hydrated::Unanswered,
-        };
-        (id, lifecycle)
-    });
-    HydrationBatch::from_hydrated(decoded.collect())
+
+            pub(super) fn send<'p>(
+                self,
+                call: CallRequest<'p>,
+                sources: &'p dyn Sources,
+                context: CallContext<'p>,
+                timed: Timed<'p>,
+            ) -> InFlight<'p> {
+                match self {
+                    $(Source::$source => send::<source::$source, dyn Sources>(
+                        call, sources, context, timed, Reply::$source,
+                    ),)*
+                }
+            }
+        }
+
+        pub(crate) trait Sources: Send + Sync $(+ Fetches<source::$source>)* {}
+
+        impl<T: Send + Sync $(+ Fetches<source::$source>)*> Sources for T {}
+
+        #[derive(Default)]
+        #[expect(non_snake_case, reason = "each field is named for its Source variant")]
+        pub(super) struct SourceFetchers {
+            $($source: Fetchers<Value<source::$source>, <source::$source as SourceFetch>::Key>,)*
+        }
+
+        impl SourceFetchers {
+            pub(super) fn answer(&self, id: FetcherId, key: u64) -> Option<Answer> {
+                match id.source {
+                    $(Source::$source => FetcherKey::answer(self.$source.of(id.owner), key),)*
+                }
+            }
+
+            pub(super) fn claim(&mut self, id: FetcherId, keys: Vec<u64>) -> Vec<u64> {
+                match id.source {
+                    $(Source::$source => FetcherKey::claim(self.$source.of_mut(id.owner), keys),)*
+                }
+            }
+
+            pub(super) fn edges(&self, id: FetcherId) -> Option<&Fetcher<bool, EdgeKey>> {
+                match id.source {
+                    $(Source::$source => FetcherKey::edges(self.$source.of(id.owner)),)*
+                }
+            }
+
+            pub(super) fn edges_mut(&mut self, id: FetcherId) -> Option<&mut Fetcher<bool, EdgeKey>> {
+                match id.source {
+                    $(Source::$source => FetcherKey::edges_mut(self.$source.of_mut(id.owner)),)*
+                }
+            }
+        }
+
+        pub(super) enum Reply {
+            $($source(<source::$source as SourceFetch>::Reply),)*
+        }
+
+        impl Reply {
+            pub(super) fn land(self, store: &mut Store, call: &CallRequest<'_>) {
+                match self {
+                    $(Reply::$source(reply) => store.land_reply::<source::$source>(call, reply),)*
+                }
+            }
+        }
+
+        $(
+            impl Registered for source::$source {
+                const SOURCE: Source = Source::$source;
+
+                fn fetchers(all: &SourceFetchers) -> &Fetchers<Value<Self>, Self::Key> {
+                    &all.$source
+                }
+
+                fn fetchers_mut(all: &mut SourceFetchers) -> &mut Fetchers<Value<Self>, Self::Key> {
+                    &mut all.$source
+                }
+            }
+        )*
+
+        #[cfg(test)]
+        #[derive(Default)]
+        #[expect(non_snake_case, reason = "each field is named for its Source variant")]
+        pub(crate) struct Worlds {
+            $($source: <source::$source as SourceFetch>::World,)*
+        }
+
+        $(
+            #[cfg(test)]
+            impl Held for source::$source {
+                fn world(worlds: &Worlds) -> &Self::World {
+                    &worlds.$source
+                }
+
+                fn world_mut(worlds: &mut Worlds) -> &mut Self::World {
+                    &mut worlds.$source
+                }
+            }
+        )*
+    };
+}
+
+sources! {
+    TesPureCoreData => "tes",
+    TesTweetForVisibility => "tes",
+    TesConversationControl => "tes",
+    TesQuotedTweet => "tes",
+    TesTweetState => "tes",
+    SafetyLabels => "safety_labels",
+    GizmoduckViewer => "gizmoduck",
+    GizmoduckAuthor => "gizmoduck",
+    Flock => "socialgraph",
+    ViewerCountry => "about_this_account",
+    Wingman => "wingman",
+    CommunityModeration => "communities",
+    CommunityModerator => "communities",
+    CommunityViewerRemoved => "communities",
+    ArticleLifecycle => "articles",
+    ArticleMediaEntities => "articles",
+    ArticleCoverMedia => "articles",
+    TrustedFriends => "trusted_friends",
+    UserLocation => "geoduck",
+    GizmoduckActor => "gizmoduck",
+    ActorEmails => "notifinfra",
+    ActorPhones => "notifinfra",
 }
 
 pub(crate) struct Backends {
     pub(crate) tes: Arc<dyn TESClient + Send + Sync>,
     pub(crate) tweets: TweetSource,
-    pub(crate) gizmoduck: GizmoduckLookup,
+    pub(crate) gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
     pub(crate) socialgraph: Arc<dyn SocialgraphClient + Send + Sync>,
-    pub(crate) about_this_account: AboutThisAccountClient,
+    pub(crate) strato: StratoGrpc,
     pub(crate) wingman: Arc<dyn WingmanClient>,
-    pub(crate) articles: ArticleClient,
-    pub(crate) trusted_friends: TrustedFriendsClient,
-    pub(crate) user_location: UserLocationClient,
     pub(crate) safety_labels: Arc<SafetyLabelSource>,
     pub(crate) communities: CommunitySource,
-    pub(crate) user_devices: UserDevicesClient,
 }
 
 pub(crate) struct ProdSources {
@@ -236,6 +302,12 @@ impl ProdSources {
     }
 }
 
+impl<F: SourceFetch> Fetches<F> for ProdSources {
+    fn fetch<'c>(&'c self, input: &'c Input<'c>) -> BoxFuture<'c, Result<F::Reply, Expired>> {
+        Box::pin(F::fetch(&self.backends, input))
+    }
+}
+
 const TEST_USERS_DTAB: &str = "/s/gizmoduck/test-users-permanent=>/s/gizmoduck/gizmoduck";
 
 pub fn test_users_metadata() -> MetadataMap {
@@ -244,362 +316,28 @@ pub fn test_users_metadata() -> MetadataMap {
     metadata
 }
 
-#[tonic::async_trait]
-impl Sources for ProdSources {
-    async fn pure_cores(&self, _: Owner, tweet_ids: &[u64]) -> RawHydrationBatch<PureCore> {
-        let cores = self
-            .backends
-            .tes
-            .get_tweet_core_datas(tweet_ids.to_vec())
-            .await;
-        HydrationBatch::from_results(tweet_ids.iter().copied(), cores).map(|core| pure_core(&core))
-    }
-
-    async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures> {
-        let values = self.backends.tweets.get_tweet_values(tweet_ids).await;
-        tweet_batch(tweet_ids, values)
-    }
-
-    async fn conversation_controls(
-        &self,
-        tweet_ids: &[u64],
-    ) -> RawHydrationBatch<ConversationControl> {
-        let controls = self
-            .backends
-            .tes
-            .get_conversation_controls(tweet_ids.to_vec())
-            .await;
-        HydrationBatch::from_results(tweet_ids.iter().copied(), controls)
-    }
-
-    async fn quoted_tweets(&self, outer_ids: &[u64]) -> RawHydrationBatch<QuotedTweet> {
-        let quoted = self
-            .backends
-            .tes
-            .get_quoted_tweets(outer_ids.to_vec())
-            .await;
-        HydrationBatch::from_results(outer_ids.iter().copied(), quoted)
-    }
-
-    async fn safety_labels(
-        &self,
-        _: Owner,
-        tweet_ids: &[u64],
-    ) -> RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>> {
-        let labels: FxHashMap<_, _> = self
-            .backends
-            .safety_labels
-            .get(tweet_ids)
-            .await
-            .into_iter()
-            .map(|(id, labels)| (id, labels.map(Some)))
-            .collect();
-        HydrationBatch::from_results(tweet_ids.iter().copied(), labels)
-    }
-
-    async fn viewer(
-        &self,
-        viewer_id: u64,
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedViewer> {
-        let viewer = self
-            .backends
-            .gizmoduck
-            .get_viewer(viewer_id, fields)
-            .await
-            .inspect_err(|error| warn!(%error, "Gizmoduck viewer lookup failed; failing open"));
-        viewer_batch(viewer_id, viewer, fields)
-    }
-
-    async fn users(
-        &self,
-        _: Owner,
-        user_ids: &[u64],
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedAuthor> {
-        let users = self
-            .backends
-            .gizmoduck
-            .get_users(user_ids.to_vec(), fields)
-            .await;
-        author_batch(HydrationBatch::from_results(
-            user_ids.iter().copied(),
-            users,
-        ))
-    }
-
-    async fn actors(
-        &self,
-        user_ids: &[u64],
-        fields: &[QueryFields],
-    ) -> RawHydrationBatch<DecodedActor> {
-        let users = self
-            .backends
-            .gizmoduck
-            .get_users(user_ids.to_vec(), fields)
-            .await;
-        actor_batch(HydrationBatch::from_results(
-            user_ids.iter().copied(),
-            users,
-        ))
-    }
-
-    async fn confirmed_emails(&self, user_ids: &[u64]) -> RawHydrationBatch<bool> {
-        let confirmed = self
-            .backends
-            .user_devices
-            .confirmed_emails(user_ids)
-            .await
-            .inspect_err(|error| warn!(%error, "confirmed email lookup failed"));
-        HydrationBatch::from_results(
-            user_ids.iter().copied(),
-            held_by(user_ids, confirmed.as_ref().ok()),
-        )
-    }
-
-    async fn verified_phones(&self, user_ids: &[u64]) -> RawHydrationBatch<bool> {
-        let verified = self
-            .backends
-            .user_devices
-            .verified_phones(user_ids)
-            .await
-            .inspect_err(|error| warn!(%error, "verified phone lookup failed"));
-        HydrationBatch::from_results(
-            user_ids.iter().copied(),
-            held_by(user_ids, verified.as_ref().ok()),
-        )
-    }
-
-    async fn select_edges(&self, viewer_id: u64, queries: &[EdgeQuery]) -> Edges {
-        let sets = self
-            .backends
-            .socialgraph
-            .select_edges(Some(viewer_id), queries)
-            .await;
-        let edges = edge_batches(queries, sets.as_deref());
-        select_result(sets.as_deref(), edges)
-    }
-
-    async fn select_pair_edges(&self, queries: &[EdgeQuery]) -> Edges {
-        let sets = self.backends.socialgraph.select_edges(None, queries).await;
-        let edges = edge_batches(queries, sets.as_deref());
-        select_result(sets.as_deref(), edges)
-    }
-
-    async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>> {
-        let country = self
-            .backends
-            .about_this_account
-            .tfe_top_country(viewer_id)
-            .await
-            .inspect_err(|error| warn!(%error, "tfe_top_country lookup failed"));
-        one_viewer_batch(viewer_id, country.map(|country| country.map(Arc::from)))
-    }
-
-    async fn second_degree(
-        &self,
-        viewer_id: u64,
-        root_author_ids: &[u64],
-    ) -> RawHydrationBatch<bool> {
-        let answers = self
-            .backends
-            .wingman
-            .batch_exists_intersect(viewer_id, root_author_ids)
-            .await;
-        let answers: HashMap<_, _> = root_author_ids
-            .iter()
-            .copied()
-            .zip(answers.into_iter().flatten())
-            .map(|(root, answer)| {
-                let answer = match answer {
-                    Exists::Found => Ok(Some(true)),
-                    Exists::NotFound => Ok(Some(false)),
-                    Exists::Incomplete | Exists::ItemError => Err(answer),
-                };
-                (root, answer)
+fn held_by(keys: &[u64], holders: Option<&HashSet<u64>>) -> RawHydrationBatch<bool> {
+    HydrationBatch::from_hydrated(
+        keys.iter()
+            .map(|&key| {
+                let held = holders.map_or(Hydrated::Failed, |holders| {
+                    Hydrated::Found(holders.contains(&key))
+                });
+                (key, held)
             })
-            .collect();
-        HydrationBatch::from_results(root_author_ids.iter().copied(), answers)
-    }
-
-    async fn community_moderations(
-        &self,
-        posts: &[CommunityPost],
-    ) -> RawHydrationBatch<CommunityModeration> {
-        let moderations = self.backends.communities.moderations(posts).await;
-        HydrationBatch::from_results(posts.iter().map(|post| post.tweet_id), moderations)
-    }
-
-    async fn community_moderators(
-        &self,
-        viewer_id: u64,
-        community_ids: &[u64],
-    ) -> RawHydrationBatch<bool> {
-        let moderators = self
-            .backends
-            .communities
-            .moderators(viewer_id, community_ids)
-            .await;
-        HydrationBatch::from_results(community_ids.iter().copied(), moderators)
-    }
-
-    async fn community_viewer_removals(
-        &self,
-        viewer_id: u64,
-        community_ids: &[u64],
-    ) -> RawHydrationBatch<bool> {
-        let removals = self
-            .backends
-            .communities
-            .viewer_removals(viewer_id, community_ids)
-            .await;
-        HydrationBatch::from_results(community_ids.iter().copied(), removals)
-    }
-
-    async fn article_media_entities(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> RawHydrationBatch<bool> {
-        let rows = self
-            .backends
-            .articles
-            .media_entities(viewer_id, article_ids)
-            .await;
-        HydrationBatch::from_results(article_ids.iter().copied(), rows)
-    }
-
-    async fn article_cover_media(
-        &self,
-        viewer_id: Option<u64>,
-        article_ids: &[u64],
-    ) -> RawHydrationBatch<bool> {
-        let rows = self
-            .backends
-            .articles
-            .cover_media(viewer_id, article_ids)
-            .await;
-        HydrationBatch::from_results(article_ids.iter().copied(), rows)
-    }
-
-    async fn article_lifecycles(&self, article_ids: &[u64]) -> RawHydrationBatch<ArticleLifecycle> {
-        let rows = self.backends.articles.lifecycles(article_ids).await;
-        lifecycle_batch(HydrationBatch::from_results(
-            article_ids.iter().copied(),
-            rows,
-        ))
-    }
-
-    async fn trusted_friends(&self, viewer_id: u64, list_ids: &[u64]) -> RawHydrationBatch<bool> {
-        let answers = self
-            .backends
-            .trusted_friends
-            .batch_is_member_or_owner(viewer_id, list_ids)
-            .await;
-        let answers: HashMap<_, _> = list_ids
-            .iter()
-            .copied()
-            .zip(answers)
-            .map(|(list_id, answer)| (list_id, answer.map(Some)))
-            .collect();
-        HydrationBatch::from_results(list_ids.iter().copied(), answers)
-    }
-
-    async fn outside_places(&self, viewer_id: u64, place_ids: &[u64]) -> RawHydrationBatch<bool> {
-        let places = self
-            .backends
-            .user_location
-            .places(viewer_id)
-            .await
-            .inspect_err(|error| warn!(%error, "Geoduck userLocation lookup failed"));
-        let answers: HashMap<_, _> = place_ids
-            .iter()
-            .map(|&place| {
-                let outside = places.as_ref().map(|places| Some(!places.contains(&place)));
-                (place, outside)
-            })
-            .collect();
-        HydrationBatch::from_results(place_ids.iter().copied(), answers)
-    }
+            .collect(),
+    )
 }
 
-#[tonic::async_trait]
-impl PostCards for ProdSources {
-    async fn post_card(&self, tweet_id: u64) -> Option<PostCard> {
-        let (core, media) = join(
-            self.backends.tes.get_tweet_core_datas(vec![tweet_id]),
-            self.backends.tes.get_tweet_media_entities(vec![tweet_id]),
-        )
-        .await;
-        let core = only(core)?;
-        let author = only(
-            self.backends
-                .gizmoduck
-                .get_users(vec![core.author_id], &[QueryFields::PROFILE])
-                .await,
-        )
-        .and_then(|result| result.user);
-        Some(PostCard::new(
-            tweet_id,
-            core,
-            author.as_ref().map(|user| &user.profile),
-            &only(media).unwrap_or_default(),
-        ))
-    }
-}
-
-fn held_by(
-    user_ids: &[u64],
-    holders: Option<&HashSet<u64>>,
-) -> HashMap<u64, Result<Option<bool>, ()>> {
-    user_ids
-        .iter()
-        .map(|&user_id| {
-            let held = holders
-                .map(|holders| Some(holders.contains(&user_id)))
-                .ok_or(());
-            (user_id, held)
-        })
-        .collect()
-}
-
-fn only<V, E>(answers: HashMap<u64, Result<Option<V>, E>>) -> Option<V> {
-    answers.into_values().next()?.ok().flatten()
+fn one_viewer_batch<V, E>(viewer_id: u64, answer: Result<Option<V>, E>) -> RawHydrationBatch<V> {
+    HydrationBatch::from_hydrated(FxHashMap::from_iter([(viewer_id, Hydrated::from(answer))]))
 }
 
 #[cfg(test)]
-pub(crate) use in_memory::{control, found_user, suspended, Fault, InMemorySources};
+pub(crate) use in_memory::{control, found_user, suspended, Fault, InMemoryCall, InMemorySources};
 
 #[cfg(test)]
 mod fake_backends;
 
 #[cfg(test)]
 mod in_memory;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::clients::socialgraph_client::Graph;
-    use tonic::Status;
-
-    #[test]
-    fn a_select_past_its_forwarded_deadline_expires_and_another_error_fails_every_key() {
-        let queries = [EdgeQuery::forward(Graph::Follows, vec![1, 2])];
-        let client_timer = Status::from_error(Box::new(tonic::TimeoutExpired(())));
-        for (status, expired) in [
-            (client_timer, true),
-            (Status::deadline_exceeded(""), true),
-            (Status::unavailable(""), false),
-        ] {
-            let batches = edge_batches(&queries, Err(&status));
-            let failed = Some(Hydrated::Failed);
-            assert_eq!(
-                [1, 2].map(|key| batches[0].hydrated(&key).cloned()),
-                [failed.clone(), failed],
-                "{status:?}"
-            );
-            let result = select_result(Err(&status), batches);
-            assert_eq!(result.is_err(), expired, "{status:?}");
-        }
-    }
-}

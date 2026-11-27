@@ -17,6 +17,7 @@ pub mod gizmoduck_labels;
 pub mod growthbook;
 pub mod growthbook_writer;
 pub mod head_guard;
+pub mod invited_reply;
 #[cfg(test)]
 mod ledger_contract_fixtures;
 pub mod limiter;
@@ -24,6 +25,7 @@ pub mod manhattan;
 pub mod metrics;
 pub mod off_switch;
 pub mod overturn_hold;
+pub mod post_labels;
 pub mod restart_on_config_change;
 pub mod rules;
 pub mod safety_checks;
@@ -41,9 +43,15 @@ mod confidence_adversarial_tests;
 #[cfg(test)]
 mod confidence_path_tests;
 #[cfg(test)]
+mod invited_reply_path_tests;
+#[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
 mod safety_audit_tests;
+#[cfg(test)]
+mod suspend_order_path_tests;
+#[cfg(test)]
+mod test_account_path_tests;
 
 use xai_abuse_proto::enforcement as abuse_proto;
 
@@ -54,7 +62,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::dedup_cache::{DedupCheck, DedupSlot};
+use crate::dedup_cache::{DedupCheck, DedupKey, DedupSlot, SlotHolder};
 use anyhow::{Context, Result};
 use axum::Router;
 
@@ -75,7 +83,9 @@ use xai_strato::{Strato, StratoClientConfig};
 
 use crate::config::Config;
 use crate::decision::Decision;
-use crate::facts::{EntityFacts, EntityType, Facts, PostFacts, ScoreFacts, UserFacts};
+use crate::facts::{
+    EntityFacts, EntityType, Facts, InvitedReply, PostFacts, ScoreFacts, UserFacts,
+};
 use crate::growthbook::DynamicConfig;
 use crate::growthbook_writer::GrowthBookWriter;
 use crate::service::{
@@ -156,11 +166,38 @@ struct DecisionContext {
                 global_dry_run: bool,
             run: Option<Arc<backfill::BackfillRunRecord>>,
                 run_nonce: i64,
+        slot: Option<DecisionSlot>,
+}
+
+#[derive(Clone)]
+struct DecisionSlot {
+    cache: Arc<dyn DedupSlot>,
+    key: DedupKey,
+    claim_nonce: Option<u64>,
+            displaced_in_flight_suspend: Option<u8>,
+}
+
+impl std::fmt::Debug for DecisionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionSlot")
+            .field("key", &self.key)
+            .field("claim_nonce", &self.claim_nonce)
+            .field(
+                "displaced_in_flight_suspend",
+                &self.displaced_in_flight_suspend,
+            )
+            .finish()
+    }
 }
 
 impl DecisionContext {
                     fn records_only(&self) -> bool {
         self.global_dry_run || self.control.record_only()
+    }
+
+            fn dedup_key(&self, entity_type: EntityType, entity_id: i64) -> DedupKey {
+        DedupKey::entity(entity_type, entity_id)
+            .with_post_labels(self.control.dedup_labels().as_deref())
     }
 
         fn claimed(&self) -> bool {
@@ -200,6 +237,7 @@ struct EnforcementCtx {
     gd: gizmoduck::GizmoduckCoreClient,
     cred_clients: strato::CredClients,
     uas_strato: Arc<Strato>,
+        reply_parents: invited_reply::ReplyParents,
     dynamic_config: DynamicConfig,
             rules_cache: Arc<rules::RulesCache>,
     allowlist: Option<allowlist::ManhattanAllowlist>,
@@ -210,6 +248,7 @@ struct EnforcementCtx {
             head_guard: Arc<head_guard::HeadGuard>,
             action_control: Arc<action_control::ActionControl>,
             backfill: Arc<backfill::Backfill>,
+            post_labels: Option<Arc<dyn post_labels::PostLabelReader>>,
         #[cfg(test)]
     outcome_log: Option<Arc<std::sync::Mutex<Vec<abuse_proto::DecisionOutcome>>>>,
 }
@@ -310,21 +349,239 @@ const ALREADY_SUSPENDED: &str = "already_suspended";
 
 const ALREADY_SUSPENDED_STRIPPED: &str = "already_suspended_stripped";
 
+const ALREADY_POST_LABELED: &str = "already_post_labeled";
+
+const POST_LABELS_CARRIED: &str = "post_labels_carried";
+
+const POST_LABELS_READ: &str = "post_labels_read";
+
+async fn drop_carried_post_labels(
+    reader: Option<&dyn post_labels::PostLabelReader>,
+    facts: &mut Facts,
+    specs: &mut Vec<decision::ActionSpec>,
+    extra: &mut BTreeMap<String, String>,
+) -> bool {
+    let Some(reader) = reader else {
+        metrics::POST_LABEL_READ_TOTAL
+            .with_label_values(&["unavailable"])
+            .inc();
+        extra.insert(POST_LABELS_READ.into(), "unavailable".into());
+        return false;
+    };
+    let now_ms = now_millis();
+    let carried = match reader.labels(facts.entity_id, now_ms).await {
+        Ok(Some(carried)) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["ok"])
+                .inc();
+            carried
+        }
+        Ok(None) => {
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["not_found"])
+                .inc();
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                post_id = facts.entity_id,
+                "post label read failed: {e:#}; sending every label"
+            );
+            metrics::POST_LABEL_READ_TOTAL
+                .with_label_values(&["failed"])
+                .inc();
+            extra.insert(POST_LABELS_READ.into(), "failed".into());
+            return false;
+        }
+    };
+    if let EntityFacts::Post(post) = &mut facts.entity {
+        post.present = true;
+        post.labels = carried.keys().cloned().collect();
+    }
+    let dropped = post_labels::drop_carried(specs, &carried, now_ms);
+    if !dropped.is_empty() {
+        extra.insert(
+            POST_LABELS_CARRIED.into(),
+            serde_json::to_string(&dropped).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+    specs.is_empty()
+}
+
 fn strip_redundant_suspends(
     specs: &mut Vec<decision::ActionSpec>,
     user: &crate::facts::GizmoduckFacts,
 ) -> Vec<decision::ActionSpec> {
     let is_suspend =
         |s: &decision::ActionSpec| matches!(s, decision::ActionSpec::SuspendUser { .. });
-    let has_perm = specs
-        .iter()
-        .any(|s| matches!(s, decision::ActionSpec::SuspendUser { perm: true, .. }));
-    if !user.suspended || has_perm || !specs.iter().any(is_suspend) {
+    if !user.suspended || outranks_temporary_suspension(specs) || !specs.iter().any(is_suspend) {
         return Vec::new();
     }
     let (stripped, kept) = std::mem::take(specs).into_iter().partition(is_suspend);
     *specs = kept;
     stripped
+}
+
+fn outranks_temporary_suspension(specs: &[decision::ActionSpec]) -> bool {
+    specs
+        .iter()
+        .any(|s| s.dedup_action_class() > dedup_cache::CLASS_SUSPEND)
+}
+
+const ALREADY_PERMANENTLY_SUSPENDED: &str = "already_permanently_suspended";
+
+const ALREADY_CSE_SUSPENDED: &str = "already_cse_suspended";
+
+const PERMANENT_SEEN_IN: &str = "permanent_suspension_seen_in";
+const PERMANENT_SEEN_IN_GIZMODUCK: &str = "gizmoduck";
+const PERMANENT_SEEN_IN_DEDUP: &str = "dedup";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outranking {
+                    Gizmoduck,
+            Dedup { class: u8, author_slot: bool },
+}
+
+impl Outranking {
+    fn drops(self, spec: &decision::ActionSpec) -> bool {
+        if !matches!(spec, decision::ActionSpec::SuspendUser { .. }) {
+            return false;
+        }
+        match self {
+            Outranking::Gizmoduck => !spec.is_permanent_cse_suspension(),
+            Outranking::Dedup { class, author_slot } => outranked_by(class, spec, author_slot),
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Outranking::Dedup {
+                class: dedup_cache::CLASS_SUSPEND_CSE,
+                ..
+            } => ALREADY_CSE_SUSPENDED,
+            _ => ALREADY_PERMANENTLY_SUSPENDED,
+        }
+    }
+
+    fn seen_in(self) -> &'static str {
+        match self {
+            Outranking::Gizmoduck => PERMANENT_SEEN_IN_GIZMODUCK,
+            Outranking::Dedup { .. } => PERMANENT_SEEN_IN_DEDUP,
+        }
+    }
+}
+
+fn outranked_by(class: u8, spec: &decision::ActionSpec, author_slot: bool) -> bool {
+    let mine = spec.dedup_action_class();
+    class > mine
+        || (author_slot
+            && class == mine
+            && class >= dedup_cache::CLASS_SUSPEND_PERMANENT
+            && !spec.is_permanent_cse_suspension())
+}
+
+fn drop_outranked_suspends(
+    specs: &mut Vec<decision::ActionSpec>,
+    by: Outranking,
+    extra: &mut BTreeMap<String, String>,
+    dry_run: bool,
+    facts: &Facts,
+    score: &abuse_proto::ScoreResult,
+) -> Option<abuse_proto::DecisionOutcome> {
+    let before = specs.len();
+    specs.retain(|s| !by.drops(s));
+    if specs.len() == before {
+        return None;
+    }
+    let (status, seen_in) = (by.status(), by.seen_in());
+    metrics::SUSPEND_ORDER_TOTAL
+        .with_label_values(&[status, seen_in])
+        .inc();
+    extra.insert(PERMANENT_SEEN_IN.into(), seen_in.into());
+    info!(
+        user_id = facts.user_id,
+        status, seen_in, "a stronger suspension of the account outranks this one; dropping it"
+    );
+    specs
+        .is_empty()
+        .then(|| skip_outcome(status.into(), dry_run, facts, score))
+}
+
+const AWAIT_STRONGER: Duration = Duration::from_secs(5);
+const AWAIT_WEAKER: Duration = Duration::from_secs(2);
+const SLOT_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuspendOrder {
+    Proceed,
+            Outranked(Outranking),
+}
+
+async fn order_suspends(
+    slot: &DecisionSlot,
+    specs: &[decision::ActionSpec],
+    user_id: i64,
+) -> SuspendOrder {
+    let Some(strongest) = specs
+        .iter()
+        .filter(|s| matches!(s, decision::ActionSpec::SuspendUser { .. }))
+        .max_by_key(|s| s.dedup_action_class())
+    else {
+        return SuspendOrder::Proceed;
+    };
+    let mine = strongest.dedup_action_class();
+    let key = DedupKey::entity(EntityType::User, user_id);
+    let own_key = key == slot.key;
+    let author_slot = !own_key;
+    let outranks_mine = |class: u8| outranked_by(class, strongest, author_slot);
+    let own_nonce = slot.claim_nonce.filter(|_| own_key);
+    let displaced = slot.displaced_in_flight_suspend.filter(|_| own_key);
+    let started = tokio::time::Instant::now();
+    let mut waited = false;
+    loop {
+        let other = match slot.cache.holder(&key, own_nonce).await {
+            Some(SlotHolder::Outcome(class))
+                if outranks_mine(class) && class >= dedup_cache::CLASS_SUSPEND_PERMANENT =>
+            {
+                return SuspendOrder::Outranked(Outranking::Dedup { class, author_slot });
+            }
+            Some(SlotHolder::Claim(class))
+                if class >= dedup_cache::CLASS_SUSPEND
+                    && (class != mine || outranks_mine(class)) =>
+            {
+                Some(class)
+            }
+            Some(SlotHolder::Own) => displaced.filter(|&class| class < mine),
+            _ => None,
+        };
+        let Some(other) = other else {
+            if waited {
+                metrics::SUSPEND_ORDER_TOTAL
+                    .with_label_values(&["waited", ""])
+                    .inc();
+            }
+            return SuspendOrder::Proceed;
+        };
+        let budget = if outranks_mine(other) {
+            AWAIT_STRONGER
+        } else {
+            AWAIT_WEAKER
+        };
+        if started.elapsed() >= budget {
+            warn!(
+                user_id,
+                class = mine,
+                other_class = other,
+                "another decision's suspension of this account is still in flight; sending"
+            );
+            metrics::SUSPEND_ORDER_TOTAL
+                .with_label_values(&["wait_timeout", ""])
+                .inc();
+            return SuspendOrder::Proceed;
+        }
+        waited = true;
+        tokio::time::sleep(SLOT_POLL).await;
+    }
 }
 
 fn incoming_dedup_class(
@@ -350,6 +607,7 @@ fn incoming_dedup_class(
         .unwrap_or(dedup_cache::CLASS_NONE)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(dry_run, uas))]
 async fn run_enforcement_inner(
     ctx: &EnforcementCtx,
@@ -360,6 +618,7 @@ async fn run_enforcement_inner(
     pinned_global_dry_run: bool,
     extra: &mut BTreeMap<String, String>,
     run: Option<(&backfill::BackfillRunRecord, i64)>,
+    slot: Option<&DecisionSlot>,
 ) -> Result<abuse_proto::DecisionOutcome> {
     let user_id = score.user_id;
     let (entity_type, entity_id) = Facts::resolve_target(score);
@@ -489,15 +748,18 @@ async fn run_enforcement_inner(
                             allowlist: author_allowlist,
                             ..Default::default()
                         },
+                        invited: InvitedReply::NotAReply,
                     }),
                     uas: None,
                 };
                 return Ok(skip_outcome(reason.into(), dry_run, &partial, score));
             }
 
-            let (user_res, cred_res) = tokio::join!(
+            let (user_res, cred_res, invited) = tokio::join!(
                 fetch_user(&ctx.gd, author_id),
                 fetch_cred(&ctx.cred_clients, author_id),
+                ctx.reply_parents
+                    .invited(score.in_reply_to_post_id, author_id),
             );
 
             Facts {
@@ -516,6 +778,7 @@ async fn run_enforcement_inner(
                         user: user_res?,
                         cred: cred_res?,
                     },
+                    invited,
                 }),
                 uas: None,
             }
@@ -567,7 +830,7 @@ async fn run_enforcement_inner(
                     .into(),
             );
         }
-        match safety_checks::first_page_stop(facts.entity_type, &facts) {
+        match safety_checks::first_page_stop(facts.entity_type, &facts, control.author_skips) {
             Ok(Some(check)) => (Decision::Skip(check.reason.to_owned()), check.id.to_owned()),
             Ok(None) if control.page_actions.is_empty() => (
                 Decision::Skip(action_control::STATUS_NO_ACTIONS.to_owned()),
@@ -623,6 +886,27 @@ async fn run_enforcement_inner(
     } else if let Some(rules) = seen_rules {
         record_seen_bands(ctx, score, facts.entity_type, Some(rules), false);
     }
+    if [
+        safety_checks::GIZMODUCK_TEST_USER.id,
+        safety_checks::TEST_ACCOUNT.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let Some(kind) = safety_checks::test_account_signal_kind(&facts)
+    {
+        extra.insert("test_account_signal".into(), kind.into());
+        metrics::TEST_ACCOUNT_SKIPS_TOTAL
+            .with_label_values(&[kind])
+            .inc();
+    }
+    if [
+        safety_checks::INVITED_REPLY.id,
+        safety_checks::INVITED_REPLY_UNKNOWN.id,
+    ]
+    .contains(&rule_id.as_str())
+        && let EntityFacts::Post(post) = &facts.entity
+    {
+        extra.insert("invited_reply".into(), post.invited.as_str().into());
+    }
     extra.insert("matched_rule_id".into(), rule_id);
 
     match decision {
@@ -640,9 +924,42 @@ async fn run_enforcement_inner(
                 };
                 return Ok(skip_outcome(reason.into(), dry_run, &facts, score));
             }
+            if control.page_driven()
+                && facts.entity_type == EntityType::Post
+                && post_labels::sent_labels(&specs).next().is_some()
+                && drop_carried_post_labels(
+                    ctx.post_labels.as_deref(),
+                    &mut facts,
+                    &mut specs,
+                    extra,
+                )
+                .await
+            {
+                return Ok(skip_outcome(
+                    ALREADY_POST_LABELED.into(),
+                    dry_run,
+                    &facts,
+                    score,
+                ));
+            }
+            if facts.user().permanently_suspended
+                && let Some(outcome) = drop_outranked_suspends(
+                    &mut specs,
+                    Outranking::Gizmoduck,
+                    extra,
+                    dry_run,
+                    &facts,
+                    score,
+                )
+            {
+                return Ok(outcome);
+            }
             if control.page_driven() {
                 let account = facts.user();
-                let skip = if account.suspended {
+                let upgrades = outranks_temporary_suspension(&action_control::page_specs(
+                    &control.page_actions,
+                ));
+                let skip = if account.suspended && !upgrades {
                     Some(ALREADY_SUSPENDED)
                 } else if account.deactivated {
                     Some("already_deactivated")
@@ -664,6 +981,7 @@ async fn run_enforcement_inner(
                             spec,
                             facts.entity_id,
                             facts.user_id,
+                            crate::facts::head_label(score),
                             Vec::new(),
                         )
                         .name()
@@ -780,6 +1098,16 @@ async fn run_enforcement_inner(
                 ));
             }
 
+            if !dry_run
+                && let Some(slot) = slot
+                && let SuspendOrder::Outranked(by) =
+                    order_suspends(slot, &specs, facts.user_id).await
+                && let Some(outcome) =
+                    drop_outranked_suspends(&mut specs, by, extra, dry_run, &facts, score)
+            {
+                return Ok(outcome);
+            }
+
             if let Some(outcome) = final_checks(
                 &ctx.off_switch,
                 &ctx.head_guard,
@@ -820,10 +1148,11 @@ async fn run_enforcement_inner(
                 .map(decision::ActionSpec::dedup_action_class)
                 .max()
                 .unwrap_or(dedup_cache::CLASS_NONE);
+            let head = crate::facts::head_label(score);
             let actions: Vec<EnforcementAction> = specs
                 .iter()
                 .map(|spec| {
-                    EnforcementAction::from_spec(spec, entity_id, user_id, ais_notes.clone())
+                    EnforcementAction::from_spec(spec, entity_id, user_id, head, ais_notes.clone())
                 })
                 .collect();
             let uas_action_dims: Vec<(&'static str, String)> = actions
@@ -971,7 +1300,7 @@ async fn final_checks(
         let dropped: Vec<&'static str> = specs
             .iter()
             .map(|spec| {
-                EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, Vec::new())
+                EnforcementAction::from_spec(spec, facts.entity_id, facts.user_id, head, Vec::new())
                     .name()
             })
             .collect();
@@ -1152,8 +1481,7 @@ fn dedup_retention_for(status: &str) -> DedupRetention {
 
 async fn write_dedup_outcome(
     dedup_cache: &dyn DedupSlot,
-    entity_type: EntityType,
-    entity_id: i64,
+    key: &DedupKey,
     score: &abuse_proto::ScoreResult,
     topic: &str,
     outcome: &abuse_proto::DecisionOutcome,
@@ -1164,9 +1492,7 @@ async fn write_dedup_outcome(
         .info
         .contains_key(action_control::FORCED_RECORDING_KEY);
     if retention == DedupRetention::Release || forced_recording {
-        dedup_cache
-            .invalidate(entity_type, entity_id, claim_nonce)
-            .await;
+        dedup_cache.invalidate(key, claim_nonce).await;
         return;
     }
     let mut score_for_dedup = score.clone();
@@ -1188,23 +1514,11 @@ async fn write_dedup_outcome(
     let compressed = zstd::encode_all(json_bytes.as_slice(), 3).unwrap_or(json_bytes);
     if retention == DedupRetention::Full {
         dedup_cache
-            .update(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update(key, &compressed, acted_class, claim_nonce)
             .await;
     } else {
         dedup_cache
-            .update_skip(
-                entity_type,
-                entity_id,
-                &compressed,
-                acted_class,
-                claim_nonce,
-            )
+            .update_skip(key, &compressed, acted_class, claim_nonce)
             .await;
     }
 }
@@ -1342,6 +1656,7 @@ async fn run_enforcement(
         decision.global_dry_run,
         &mut extra,
         run.map(|r| (r, decision.run_nonce)),
+        decision.slot.as_ref(),
     )
     .await;
     let finish = |status: String| async move {
@@ -1421,12 +1736,6 @@ fn resolve_control(
     let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());
     let producer_dry = score.dry_run || action_control::has_dry_run_prefix(labels);
     let factory = is_factory_message(score);
-    if !factory && !ctx.action_control.has_records() {
-        return action_control::Resolved {
-            producer_dry,
-            ..Default::default()
-        };
-    }
     let claim = Some(confidence::message_claim(score, now_millis()));
     let input = action_control::ResolveInput {
         head: crate::facts::head_label(score),
@@ -1528,7 +1837,7 @@ enum Admission {
 }
 
 impl ScoreResultProcessor {
-                        async fn admit(&self, score: &abuse_proto::ScoreResult) -> Admission {
+                            async fn admit(&self, score: &abuse_proto::ScoreResult) -> Admission {
         let msg_labels: Vec<&str> = score
             .summary
             .as_ref()
@@ -1564,10 +1873,16 @@ impl ScoreResultProcessor {
             .await;
         let (entity_type, _) = Facts::resolve_target(score);
         let head = crate::facts::head_label(score);
-        if !self.ctx.action_control.admits_unlisted(entity_type, head) {
+        let control = resolve_control(&self.ctx, score, entity_type);
+        let admits = if control.unknown {
+            dropped == "no_match"
+        } else {
+            self.ctx.action_control.admits_unlisted(entity_type, head)
+        };
+        if !admits {
             return Admission::Dropped(dropped);
         }
-        match resolve_control(&self.ctx, score, entity_type).admit_unlisted() {
+        match control.admit_unlisted() {
             Some(control) => {
                 info!(
                     list = dropped,
@@ -1659,28 +1974,32 @@ impl ScoreResultProcessor {
             global_dry_run: self.ctx.dynamic_config.is_dry_run(),
             run,
             run_nonce: backfill_claims::new_claim_nonce(),
+            slot: None,
         };
 
         let incoming_class = decision.control.incoming_dedup_class(|| {
             incoming_dedup_class(&self.ctx.dynamic_config, &self.ctx.rules_cache, score)
         });
+        let dedup_key = decision.dedup_key(entity_type, entity_id);
         let claim_nonce = if decision.records_only() {
-            decision.would_dedup_held = self
-                .dedup_cache
-                .peek(entity_type, entity_id, incoming_class)
-                .await;
+            decision.would_dedup_held = self.dedup_cache.peek(&dedup_key, incoming_class).await;
             None
         } else {
-            match self
+            let mut displaced_in_flight_suspend = None;
+            let claim_nonce = match self
                 .dedup_cache
-                .try_insert(entity_type, entity_id, incoming_class)
+                .try_insert(&dedup_key, incoming_class)
                 .await
             {
                 DedupCheck::New { claim_nonce } => claim_nonce,
                 DedupCheck::ClassBypass {
                     held_class,
+                    held_in_flight,
                     claim_nonce,
                 } => {
+                    displaced_in_flight_suspend = (held_in_flight
+                        && held_class >= dedup_cache::CLASS_SUSPEND)
+                        .then_some(held_class);
                     info!(
                         incoming_class,
                         held_class, "dedup: class bypass (incoming outranks held entry)"
@@ -1721,7 +2040,14 @@ impl ScoreResultProcessor {
                     );
                     return Ok("dedup_skipped".into());
                 }
-            }
+            };
+            decision.slot = Some(DecisionSlot {
+                cache: self.dedup_cache.clone(),
+                key: dedup_key.clone(),
+                claim_nonce,
+                displaced_in_flight_suspend,
+            });
+            claim_nonce
         };
 
         let outcome = match run_enforcement(&self.ctx, score, topic, &decision).await {
@@ -1729,9 +2055,7 @@ impl ScoreResultProcessor {
             Err(source) => {
                 let permanent = source.downcast_ref::<PermanentAisFailure>().is_some();
                 if permanent && decision.claimed() {
-                    self.dedup_cache
-                        .invalidate(entity_type, entity_id, claim_nonce)
-                        .await;
+                    self.dedup_cache.invalidate(&dedup_key, claim_nonce).await;
                 }
                 return Err(EnforcementFailed {
                     permanent,
@@ -1745,8 +2069,7 @@ impl ScoreResultProcessor {
         if decision.claimed() {
             write_dedup_outcome(
                 self.dedup_cache.as_ref(),
-                entity_type,
-                entity_id,
+                &dedup_key,
                 score,
                 topic,
                 &outcome,
@@ -2472,8 +2795,11 @@ async fn finish_state(
         backfill.spawn_settings_refresh();
     }
 
+    let gd = connect_gizmoduck(&cfg).await?;
+
     let state = Arc::new(AppState {
         ais_client,
+        gd,
         dynamic_config,
         rules_cache: Arc::new(rules_cache),
         dedup_cache,
@@ -2493,6 +2819,42 @@ async fn finish_state(
     });
 
     Ok((state, cfg))
+}
+
+async fn connect_gizmoduck(cfg: &Config) -> Result<Option<gizmoduck::GizmoduckCoreClient>> {
+    let policy = cfg.test_account_policy()?;
+    let (domains, roles, networks) = policy.sizes();
+    info!(
+        email_domains = domains,
+        roles, networks, "test-account policy loaded"
+    );
+    let connected =
+        gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
+            zone: cfg.gizmoduck_zone.clone(),
+            ca_cert_path: cfg
+                .strato_ca_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into()),
+            client_cert_path: cfg
+                .strato_client_cert_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into()),
+            client_key_path: cfg
+                .strato_client_key_path
+                .clone()
+                .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into()),
+            client_id: cfg.gizmoduck_client_id.clone(),
+        })
+        .await
+        .context("failed to create gizmoduck get-V2 fed-grpc client");
+    match connected {
+        Ok(gd) => Ok(Some(gd.with_policy(policy))),
+        Err(e) if !cfg.kafka_consumer_enabled => {
+            warn!("{e:#}; POST /api/action will refuse suspends");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn build_api_router(state: Arc<service::AppState>, api_keys: auth::ApiKeys) -> Router {
@@ -3033,27 +3395,10 @@ pub async fn start_kafka_consumers(
         }
     }
 
-    let ca = cfg
-        .strato_ca_cert_path
+    let gd = state
+        .gd
         .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/ca/ca-bundle.crt".into());
-    let crt = cfg
-        .strato_client_cert_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.crt".into());
-    let key = cfg
-        .strato_client_key_path
-        .clone()
-        .unwrap_or_else(|| "/etc/strato-tls/client/tls.key".into());
-    let gd = gizmoduck::GizmoduckCoreClient::connect(&gizmoduck::GizmoduckCoreClientConfig {
-        zone: cfg.gizmoduck_zone.clone(),
-        ca_cert_path: ca,
-        client_cert_path: crt,
-        client_key_path: key,
-        client_id: cfg.gizmoduck_client_id.clone(),
-    })
-    .await
-    .context("failed to create gizmoduck get-V2 fed-grpc client")?;
+        .context("no gizmoduck get-V2 fed-grpc client; the consumers can't decide without it")?;
 
     #[allow(deprecated)]
     let cred_hpr = Arc::new(
@@ -3085,6 +3430,35 @@ pub async fn start_kafka_consumers(
         cfg.uas_column
     );
 
+    #[allow(deprecated)]
+    let reply_parents = invited_reply::ReplyParents::new(
+        Arc::new(
+            Strato::new(&cfg.reply_parent_column, StratoClientConfig::default())
+                .context("Failed to create reply-parent Strato client")?,
+        ),
+        Duration::from_millis(cfg.reply_parent_timeout_ms),
+    );
+    info!(
+        column = %cfg.reply_parent_column,
+        timeout_ms = cfg.reply_parent_timeout_ms,
+        "reply-parent Strato client initialised"
+    );
+
+    let post_labels: Option<Arc<dyn post_labels::PostLabelReader>> =
+        match post_labels::VfPostLabels::connect(&cfg.post_labels_zone).await {
+            Ok(reader) => {
+                info!(zone = %cfg.post_labels_zone, "post label reader initialised");
+                Some(Arc::new(reader))
+            }
+            Err(e) => {
+                warn!(
+                    "post label reader unavailable: {e:#}; page post labels are sent \
+                     without checking the labels a post already carries"
+                );
+                None
+            }
+        };
+
     let retry_queue = Arc::new(Mutex::new(BinaryHeap::<RetryEntry>::new()));
 
     let enforcement_ctx = EnforcementCtx {
@@ -3092,6 +3466,7 @@ pub async fn start_kafka_consumers(
         gd,
         cred_clients,
         uas_strato,
+        reply_parents,
         dynamic_config: state.dynamic_config.clone(),
         rules_cache: state.rules_cache.clone(),
         allowlist: state.allowlist.clone(),
@@ -3102,6 +3477,7 @@ pub async fn start_kafka_consumers(
         head_guard: state.head_guard.clone(),
         action_control: state.action_control.clone(),
         backfill: state.backfill.clone(),
+        post_labels,
         #[cfg(test)]
         outcome_log: None,
     };
@@ -3131,6 +3507,7 @@ pub async fn start_kafka_consumers(
 
                 for mut entry in ready {
                     let (entity_type, entity_id) = Facts::resolve_target(&entry.score);
+                    let dedup_key = entry.decision.dedup_key(entity_type, entity_id);
                     let span = tracing::info_span!(
                         "retry",
                         entity_type = entity_type.as_str(),
@@ -3150,8 +3527,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 write_dedup_outcome(
                                     entry.dedup_cache.as_ref(),
-                                    entity_type,
-                                    entity_id,
+                                    &dedup_key,
                                     &entry.score,
                                     &entry.topic,
                                     &outcome,
@@ -3168,7 +3544,7 @@ pub async fn start_kafka_consumers(
                             if entry.decision.claimed() {
                                 entry
                                     .dedup_cache
-                                    .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                    .invalidate(&dedup_key, entry.claim_nonce)
                                     .await;
                             }
                         }
@@ -3182,7 +3558,7 @@ pub async fn start_kafka_consumers(
                                 if entry.decision.claimed() {
                                     entry
                                         .dedup_cache
-                                        .invalidate(entity_type, entity_id, entry.claim_nonce)
+                                        .invalidate(&dedup_key, entry.claim_nonce)
                                         .await;
                                 }
                             } else {
@@ -4003,6 +4379,8 @@ mod dedup_retention_tests {
             "gizmoduck_skipped",
             "user_not_found",
             "test_user_skipped",
+            "invited_reply_skipped",
+            "invited_reply_unknown_skipped",
             "user_in_allowlist",
             "post_in_allowlist",
             "rule_eval_error",
@@ -5805,6 +6183,10 @@ rules:
                 grey_badge: column("grey"),
             },
             uas_strato: column("uas"),
+            reply_parents: invited_reply::ReplyParents::new(
+                column("reply_parent"),
+                Duration::from_secs(1),
+            ),
             dynamic_config,
             rules_cache: Arc::new(rules::RulesCache::new()),
             allowlist: None,
@@ -5829,6 +6211,7 @@ rules:
                 None,
                 String::new(),
             )),
+            post_labels: None,
             outcome_log: None,
         };
         Harness {
@@ -5868,6 +6251,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5897,6 +6281,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5919,6 +6304,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await
@@ -5946,6 +6332,7 @@ rules:
             false,
             &mut BTreeMap::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5967,6 +6354,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await
@@ -5993,6 +6381,7 @@ rules:
             dedup_cache::CLASS_NONE,
             false,
             &mut BTreeMap::new(),
+            None,
             None,
         )
         .await

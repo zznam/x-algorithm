@@ -8,8 +8,7 @@ pub use xai_abuse_enforcement_types::backfill::*;
 use xai_abuse_proto::enforcement as abuse_proto;
 
 use crate::action_control::{
-    ActionControl, CONFIRM_WORD, ControlConfig, ControlStore, DRY_RUN_LABEL_PREFIX, entity_of,
-    lkey_for,
+    ActionControl, CONFIRM_WORD, ControlStore, DRY_RUN_LABEL_PREFIX, entity_of, lkey_for,
 };
 use crate::backfill_claims::{ClaimStore, KeyLocks};
 use crate::facts::{EntityType, Facts, GizmoduckFacts};
@@ -239,7 +238,9 @@ pub fn check_message(
 
 pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool {
     actions.iter().all(|a| match a {
-        PageAction::Suspend {} | PageAction::SuspendAuthor {} => account.suspended,
+        PageAction::Suspend { .. } | PageAction::SuspendAuthor { .. } => {
+            account.suspended && matches!(*a, PageAction::SUSPEND | PageAction::SUSPEND_AUTHOR)
+        }
         PageAction::SpamHighRecall { .. } => account.labels.iter().any(|l| l == "SpamHighRecall"),
         PageAction::PhoenixSkip { .. } => account
             .labels
@@ -247,7 +248,8 @@ pub fn already_applied(actions: &[PageAction], account: &GizmoduckFacts) -> bool
             .any(|l| l == crate::gizmoduck_labels::CLIENT_EVENT_PHOENIX_SKIP),
         PageAction::LivenessCheck {}
         | PageAction::PostSpamHighRecall { .. }
-        | PageAction::HideReply { .. } => false,
+        | PageAction::HideReply { .. }
+        | PageAction::PostLabel { .. } => false,
     })
 }
 
@@ -720,7 +722,6 @@ impl Backfill {
         key_id: &str,
         cfg: &BackfillConfig,
         control: &ActionControl,
-        control_cfg: &ControlConfig,
         off_switch: &OffSwitch,
         now_ms: i64,
     ) -> Result<(BackfillRunRecord, bool), RunError> {
@@ -776,10 +777,6 @@ impl Backfill {
                 Some(Box::new(existing)),
             ));
         }
-        let entity = match req.entity {
-            ControlEntity::User => EntityType::User,
-            ControlEntity::Post => EntityType::Post,
-        };
         let scope = lkey_for(req.entity, &req.head, req.classifier.as_deref(), None);
         let current = control
             .stored_version(&scope)
@@ -812,31 +809,6 @@ impl Backfill {
         let factory = seen
             .iter()
             .any(|s| s.factory && s.head == req.head && s.entity_type == req.entity);
-        let weak = if factory {
-            Vec::new()
-        } else {
-            control.weak_rows(
-                entity,
-                &req.head,
-                req.classifier.as_deref(),
-                &req.levels,
-                control_cfg,
-                now_ms,
-            )
-        };
-        if !weak.is_empty() {
-            return Err(RunError::Conflict(
-                "weak_evidence",
-                format!(
-                    "the evidence of {} doesn't clear its floor now",
-                    weak.iter()
-                        .map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                None,
-            ));
-        }
         let runs = self
             .list()
             .await
@@ -856,7 +828,7 @@ impl Backfill {
             ));
         }
         let rec = BackfillRunRecord {
-            v: BACKFILL_RUN_RECORD_VERSION,
+            v: run_record_version(&req.actions),
             run_id: req.run_id,
             entity: req.entity,
             head: req.head,
@@ -1014,8 +986,6 @@ impl Backfill {
         who: Option<&str>,
         key_id: &str,
         cfg: &BackfillConfig,
-        control: &ActionControl,
-        control_cfg: &ControlConfig,
         off_switch: &OffSwitch,
         now_ms: i64,
     ) -> Result<BackfillRunRecord, RunError> {
@@ -1145,34 +1115,6 @@ impl Backfill {
             {
                 return conflict("switched_off", "the model is still switched off".into());
             }
-            let entity = match stored.entity {
-                ControlEntity::User => EntityType::User,
-                ControlEntity::Post => EntityType::Post,
-            };
-            let weak = if stored.factory {
-                Vec::new()
-            } else {
-                control.weak_rows(
-                    entity,
-                    &stored.head,
-                    stored.classifier.as_deref(),
-                    &stored.levels,
-                    control_cfg,
-                    now_ms,
-                )
-            };
-            if !weak.is_empty() {
-                return conflict(
-                    "weak_evidence",
-                    format!(
-                        "the evidence of {} doesn't clear its floor now",
-                        weak.iter()
-                            .map(|r| r.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-            }
         }
         let mut next = stored.clone();
         next.state = to;
@@ -1238,6 +1180,11 @@ impl Backfill {
     }
 }
 
+fn lists_an_action_twice(actions: &[PageAction]) -> bool {
+    let mut kinds = HashSet::new();
+    actions.iter().any(|a| !kinds.insert(a.kind()))
+}
+
 fn validate_start(
     req: &BackfillRunStartRequest,
     cfg: &BackfillConfig,
@@ -1290,9 +1237,7 @@ fn validate_start(
             format!("every action must be a {} action", req.entity.as_str()),
         );
     }
-    let kinds: HashSet<std::mem::Discriminant<PageAction>> =
-        req.actions.iter().map(std::mem::discriminant).collect();
-    if kinds.len() != req.actions.len() {
+    if lists_an_action_twice(&req.actions) {
         return bad("duplicate_actions", "an action is listed twice".into());
     }
     if req.source == RunSource::LighterAction && req.entity != ControlEntity::User {
@@ -1391,7 +1336,7 @@ pub(crate) mod test_support {
             levels: vec![LevelRow::Missing],
             window_start_ms: now_ms - 86_400_000,
             window_end_ms: now_ms,
-            actions: vec![PageAction::Suspend {}],
+            actions: vec![PageAction::SUSPEND],
             rate_per_sec: 200,
             expected_count: 10,
             left_out: vec![],
@@ -1411,7 +1356,7 @@ pub(crate) mod test_support {
     ) -> BackfillRunRecord {
         let now = crate::now_millis();
         let rec = BackfillRunRecord {
-            v: BACKFILL_RUN_RECORD_VERSION,
+            v: run_record_version(&actions),
             run_id: run_id.into(),
             entity: actions.first().map_or(ControlEntity::User, |a| a.entity()),
             head: head.into(),
@@ -1452,6 +1397,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::action_control::SuspensionPolicy;
     use crate::action_control::test_support::MemControlStore;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1479,22 +1425,12 @@ mod tests {
         key: &str,
         who: Option<&str>,
     ) -> Result<(BackfillRunRecord, bool), RunError> {
-        bf.start(
-            req,
-            who,
-            key,
-            &config("page", "sender", 10),
-            ac,
-            &ControlConfig::default(),
-            sw,
-            NOW,
-        )
-        .await
+        bf.start(req, who, key, &config("page", "sender", 10), ac, sw, NOW)
+            .await
     }
 
     async fn change(
         bf: &Backfill,
-        ac: &ActionControl,
         sw: &OffSwitch,
         id: &str,
         c: Change,
@@ -1513,8 +1449,6 @@ mod tests {
             Some("operator@example.com"),
             key,
             &config("page", "sender", 10),
-            ac,
-            &ControlConfig::default(),
             sw,
             at,
         )
@@ -1586,7 +1520,6 @@ mod tests {
                 "page",
                 &cfg,
                 &ac,
-                &ControlConfig::default(),
                 &sw,
                 NOW,
             )
@@ -1802,7 +1735,7 @@ mod tests {
             &store,
             "run-00000001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![],
         );
         assert_eq!(
@@ -1933,7 +1866,7 @@ mod tests {
                     &self.inner,
                     "run-other001",
                     "H",
-                    vec![PageAction::Suspend {}],
+                    vec![PageAction::SUSPEND],
                     vec![LevelRow::Missing],
                 );
             }
@@ -2102,7 +2035,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 "run-00000001",
                 Change::Resume,
@@ -2291,7 +2223,7 @@ mod tests {
                         &self.inner,
                         "run-zzzz0001",
                         "H",
-                        vec![PageAction::Suspend {}],
+                        vec![PageAction::SUSPEND],
                         vec![LevelRow::Missing],
                     );
                     rival.created_at_ms = NOW + 5;
@@ -2378,6 +2310,27 @@ mod tests {
         assert_eq!(again, bf.run("run-00000001").await.unwrap().unwrap());
     }
 
+    #[test]
+    fn two_different_post_labels_are_two_actions() {
+        use xai_abuse_enforcement_types::action_control::Lifetime;
+        let label = |name, lifetime| PageAction::PostLabel {
+            label: crate::action_control::PostLabelName::parse(name).unwrap(),
+            lifetime,
+        };
+        assert!(!lists_an_action_twice(&[
+            label("NsfwHighPrecision", Lifetime::Permanent),
+            label("SoftNsfw", Lifetime::Permanent),
+        ]));
+        assert!(lists_an_action_twice(&[
+            label("SoftNsfw", Lifetime::Days7),
+            label("SoftNsfw", Lifetime::Permanent),
+        ]));
+        assert!(lists_an_action_twice(&[
+            PageAction::SUSPEND,
+            PageAction::SUSPEND
+        ]));
+    }
+
     #[tokio::test]
     async fn start_refuses_bad_input() {
         let (_, bf, ac, sw) = parts();
@@ -2414,14 +2367,14 @@ mod tests {
             (
                 "wrong_entity",
                 BackfillRunStartRequest {
-                    actions: vec![PageAction::SuspendAuthor {}],
+                    actions: vec![PageAction::SUSPEND_AUTHOR],
                     ..base.clone()
                 },
             ),
             (
                 "duplicate_actions",
                 BackfillRunStartRequest {
-                    actions: vec![PageAction::Suspend {}, PageAction::Suspend {}],
+                    actions: vec![PageAction::SUSPEND, PageAction::SUSPEND],
                     ..base.clone()
                 },
             ),
@@ -2451,7 +2404,7 @@ mod tests {
                 BackfillRunStartRequest {
                     entity: ControlEntity::Post,
                     source: RunSource::LighterAction,
-                    actions: vec![PageAction::SuspendAuthor {}],
+                    actions: vec![PageAction::SUSPEND_AUTHOR],
                     ..base.clone()
                 },
             ),
@@ -2528,43 +2481,82 @@ mod tests {
                 None,
                 None,
                 ControlMode::Live,
-                vec![PageAction::Suspend {}],
+                vec![PageAction::SUSPEND],
             )
         });
     }
 
-                    #[tokio::test]
-    async fn a_factory_head_starts_without_the_row_evidence_check() {
+                #[tokio::test]
+    async fn a_run_starts_without_evidence_and_is_marked_factory_from_the_seen_list() {
         let (store, bf, _, sw) = parts();
         let control = Arc::new(MemControlStore::default());
         high_row(&control, "H", true, None);
         high_row(&control, "F", false, None);
         let ac = ActionControl::new(control.clone(), "test".into(), String::new());
         ac.refresh().await.unwrap();
-        let req = || BackfillRunStartRequest {
+        let req = |run_id: &str| BackfillRunStartRequest {
             levels: vec![LevelRow::High],
             expected_control_version: Some(1),
-            ..start_request("run-00000001", "H", NOW)
+            ..start_request(run_id, "H", NOW)
         };
-        assert!(matches!(
-            start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await,
-            Err(RunError::Conflict("weak_evidence", ..))
-        ));
+        let (rec, created) = start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000000"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            created && !rec.factory,
+            "a high row with no evidence starts"
+        );
+        assert_eq!(rec.state, RunState::Running);
+        change(
+            &bf,
+            &sw,
+            &rec.run_id,
+            Change::Stop,
+            1,
+            "page",
+            None,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
         seen_factory(&control, "H");
         control
             .fail_scan
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        match start(&bf, &ac, &sw, req(), "page", Some("a@example.com")).await {
+        match start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000001"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        {
             Err(RunError::Store(msg)) => assert!(msg.contains("seen list"), "{msg}"),
             other => panic!("expected a store error, got {other:?}"),
         }
-        assert!(store.pkey_rows(RUN_PKEY).is_empty(), "nothing written");
+        assert_eq!(store.pkey_rows(RUN_PKEY).len(), 1, "nothing more written");
         control
             .fail_scan
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let (rec, created) = start(&bf, &ac, &sw, req(), "page", Some("a@example.com"))
-            .await
-            .unwrap();
+        let (rec, created) = start(
+            &bf,
+            &ac,
+            &sw,
+            req("run-00000001"),
+            "page",
+            Some("a@example.com"),
+        )
+        .await
+        .unwrap();
         assert!(created && rec.factory);
         assert_eq!(rec.state, RunState::Running);
         seen_factory(&control, "F");
@@ -2580,7 +2572,7 @@ mod tests {
     }
 
             #[tokio::test]
-    async fn resume_skips_the_row_evidence_check_only_for_a_factory_run() {
+    async fn resume_does_not_look_at_evidence() {
         const DAY: i64 = 86_400_000;
         let now = crate::now_millis();
         let (_, bf, _, sw) = parts();
@@ -2597,7 +2589,7 @@ mod tests {
         seen_factory(&control, "F");
         let ac = ActionControl::new(control.clone(), "test".into(), String::new());
         ac.refresh().await.unwrap();
-        for (head, run_id, refused) in [("N", "run-0000000n", true), ("F", "run-0000000f", false)] {
+        for (head, run_id, factory) in [("N", "run-0000000n", false), ("F", "run-0000000f", true)] {
             let req = BackfillRunStartRequest {
                 levels: vec![LevelRow::High],
                 expected_control_version: Some(1),
@@ -2610,28 +2602,17 @@ mod tests {
                     "page",
                     &config("page", "sender", 10),
                     &ac,
-                    &ControlConfig::default(),
                     &sw,
                     now,
                 )
                 .await
                 .unwrap();
-            change(
-                &bf,
-                &ac,
-                &sw,
-                run_id,
-                Change::Pause,
-                1,
-                "page",
-                None,
-                now + 1,
-            )
-            .await
-            .unwrap();
+            assert_eq!(rec.factory, factory);
+            change(&bf, &sw, run_id, Change::Pause, 1, "page", None, now + 1)
+                .await
+                .unwrap();
             let resumed = change(
                 &bf,
-                &ac,
                 &sw,
                 run_id,
                 Change::Resume,
@@ -2641,16 +2622,7 @@ mod tests {
                 now + 2 * DAY,
             )
             .await;
-            if refused {
-                assert!(!rec.factory);
-                assert!(
-                    matches!(resumed, Err(RunError::Conflict("weak_evidence", ..))),
-                    "{resumed:?}"
-                );
-            } else {
-                assert!(rec.factory);
-                assert_eq!(resumed.unwrap().state, RunState::Running);
-            }
+            assert_eq!(resumed.unwrap().state, RunState::Running, "{head}");
         }
     }
 
@@ -2663,14 +2635,14 @@ mod tests {
             .unwrap();
         let id = rec.run_id.as_str();
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Pause, 1, "sender", None, NOW + 1).await,
+            change(&bf, &sw, id, Change::Pause, 1, "sender", None, NOW + 1).await,
             Err(RunError::Forbidden(..))
         ));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Pause, 7, "page", None, NOW + 1).await,
+            change(&bf, &sw, id, Change::Pause, 7, "page", None, NOW + 1).await,
             Err(RunError::Conflict("version_conflict", ..))
         ));
-        let p = change(&bf, &ac, &sw, id, Change::Pause, 1, "page", None, NOW + 1)
+        let p = change(&bf, &sw, id, Change::Pause, 1, "page", None, NOW + 1)
             .await
             .unwrap();
         assert_eq!(
@@ -2679,16 +2651,15 @@ mod tests {
         );
         assert_eq!(gate(&p, NOW + 2), Err(STATUS_RUN_PAUSED));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Done, 2, "sender", None, NOW + 2).await,
+            change(&bf, &sw, id, Change::Done, 2, "sender", None, NOW + 2).await,
             Err(RunError::Conflict("not_running", ..))
         ));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Resume, 2, "page", None, NOW + 2).await,
+            change(&bf, &sw, id, Change::Resume, 2, "page", None, NOW + 2).await,
             Err(RunError::Invalid("confirm_required", _))
         ));
         let r = change(
             &bf,
-            &ac,
             &sw,
             id,
             Change::Resume,
@@ -2700,7 +2671,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.state, RunState::Running);
-        let d = change(&bf, &ac, &sw, id, Change::Done, 3, "sender", None, NOW + 3)
+        let d = change(&bf, &sw, id, Change::Done, 3, "sender", None, NOW + 3)
             .await
             .unwrap();
         assert_eq!(d.state, RunState::Done);
@@ -2713,7 +2684,7 @@ mod tests {
         );
         assert_eq!(gate(&d, done_at + DONE_DRAIN_MS + 1), Err(STATUS_RUN_DONE));
         assert!(matches!(
-            change(&bf, &ac, &sw, id, Change::Stop, 4, "page", None, NOW + 4).await,
+            change(&bf, &sw, id, Change::Stop, 4, "page", None, NOW + 4).await,
             Err(RunError::Conflict("already_final", ..))
         ));
         assert_eq!(d.history.len(), 4);
@@ -2728,7 +2699,6 @@ mod tests {
             .unwrap();
         let s = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2743,7 +2713,6 @@ mod tests {
         for c in [Change::Pause, Change::Resume, Change::Stop, Change::Done] {
             let r = change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 c,
@@ -2800,7 +2769,6 @@ mod tests {
         bf.hold_for_off_switch(&rec, NOW + 1).await.unwrap();
         change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2827,7 +2795,6 @@ mod tests {
             .unwrap();
         change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Pause,
@@ -2842,13 +2809,12 @@ mod tests {
             &store,
             "run-other001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![LevelRow::Missing],
         );
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Resume,
@@ -2873,7 +2839,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 "run-unstart1",
                 Change::Resume,
@@ -2896,7 +2861,6 @@ mod tests {
             .unwrap();
         let stopped = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Stop,
@@ -2922,7 +2886,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Pause,
@@ -2956,7 +2919,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Done,
@@ -2970,7 +2932,6 @@ mod tests {
         ));
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3011,7 +2972,6 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3041,7 +3001,6 @@ mod tests {
             .unwrap();
         let p = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Pause,
@@ -3055,7 +3014,6 @@ mod tests {
         let late = p.paused_at_ms.unwrap() + MAX_PAUSE_MS + 1;
         match change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3075,7 +3033,6 @@ mod tests {
         let ok = p.paused_at_ms.unwrap() + MAX_PAUSE_MS;
         let r = change(
             &bf,
-            &ac,
             &sw,
             &rec.run_id,
             Change::Resume,
@@ -3091,7 +3048,6 @@ mod tests {
         assert!(matches!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Resume,
@@ -3106,7 +3062,6 @@ mod tests {
         assert!(
             change(
                 &bf,
-                &ac,
                 &sw,
                 &rec.run_id,
                 Change::Stop,
@@ -3168,7 +3123,7 @@ mod tests {
             &store,
             "run-00000001",
             "H",
-            vec![PageAction::Suspend {}],
+            vec![PageAction::SUSPEND],
             vec![LevelRow::Mid],
         )
     }
@@ -3186,8 +3141,8 @@ mod tests {
         let shr = PageAction::SpamHighRecall {
             lifetime: xai_abuse_enforcement_types::action_control::Lifetime::Days7,
         };
-        assert!(already_applied(&[PageAction::Suspend {}], &suspended));
-        assert!(!already_applied(&[PageAction::Suspend {}], &labelled));
+        assert!(already_applied(&[PageAction::SUSPEND], &suspended));
+        assert!(!already_applied(&[PageAction::SUSPEND], &labelled));
         assert!(already_applied(&[shr], &labelled));
         assert!(!already_applied(
             &[shr, PageAction::LivenessCheck {}],
@@ -3203,5 +3158,39 @@ mod tests {
         assert!(already_applied(&[phoenix], &phoenix_labelled));
         assert!(!already_applied(&[phoenix], &labelled));
         assert!(!already_applied(&[shr], &phoenix_labelled));
+    }
+
+    #[test]
+    fn already_applied_never_reads_a_permanent_or_policy_suspension_back() {
+        let suspended = GizmoduckFacts {
+            suspended: true,
+            ..Default::default()
+        };
+        let permanently = GizmoduckFacts {
+            suspended: true,
+            permanently_suspended: true,
+            ..Default::default()
+        };
+        assert!(already_applied(&[PageAction::SUSPEND_AUTHOR], &suspended));
+        assert!(!already_applied(
+            &[PageAction::SUSPEND_AUTHOR],
+            &GizmoduckFacts::default()
+        ));
+        for permanent in [false, true] {
+            for policy in SuspensionPolicy::ALL {
+                for action in [
+                    PageAction::Suspend { permanent, policy },
+                    PageAction::SuspendAuthor { permanent, policy },
+                ] {
+                    let plain = !permanent && policy == SuspensionPolicy::PlatformManipulation;
+                    assert_eq!(already_applied(&[action], &suspended), plain, "{action:?}");
+                    assert_eq!(
+                        already_applied(&[action], &permanently),
+                        plain,
+                        "{action:?}: gizmoduck doesn't name the policy"
+                    );
+                }
+            }
+        }
     }
 }

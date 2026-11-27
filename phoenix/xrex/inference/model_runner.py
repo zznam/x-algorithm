@@ -46,6 +46,7 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
+from xrex.data.recsys.ads_late_window import compose_late_engagement_log_probs
 from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
 from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
@@ -70,7 +71,11 @@ from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_model import (
+    RecsysAggregatedModelConfig,
+    cread_decode_from_request_enabled,
+    cread_request_decode_avals,
+)
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.models.topic_categories import (
     NUM_TOPIC_INT32S,
@@ -822,7 +827,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         init_params.pop("use_async_emb")
         init_params.pop("seqpack_candidate_packing")
         init_params.pop("overlap_step_host_work")
-        if isinstance(t.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)):
+        if isinstance(t.model_config, RecsysTwoTowerModelConfig):
+            init_params["model_config"]["user_tower_config"]["model_config"].pop("fp8_gemms")
+        elif isinstance(t.model_config, RecsysAggregatedModelConfig):
             init_params["model_config"]["model_config"].pop("fp8_gemms")
 
         init_params["inference_batch_size"] = inference_batch_size
@@ -4051,6 +4058,9 @@ class RankingModelRunner(
                     np.uint16,
                 )
 
+        if self.using_seqpack and cread_decode_from_request_enabled(self.model_config):
+            init_data.update(cread_request_decode_avals(init_data, self.model_config))
+
         return rng, init_data
 
     def _get_persistent_buffer(
@@ -4462,6 +4472,8 @@ class RankingModelRunner(
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
             outputs = model.forward(batch, recsys_embeddings, page_decode, run_decoder=run_decoder)
             log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.float32)
+            if self.model_config.serve_late_window_composed:
+                log_probs = compose_late_engagement_log_probs(log_probs)
             cont_preds = outputs[1].astype(jnp.float32)
             has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
             return log_probs, cont_preds, *outputs[2:], has_nan
@@ -4550,7 +4562,9 @@ class RetrievalModelRunner(
     enable_async_topk: bool = False
     cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
+    int8_score_pad_rows: int = -1
     enable_int8_post_table: bool = False
+    enable_shard_local_topk: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_cache: tuple | None = field(default=None, init=False)
     _mol_side_tables_fn: Any = field(default=None, init=False)

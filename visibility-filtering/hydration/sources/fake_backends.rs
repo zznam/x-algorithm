@@ -1,34 +1,44 @@
 use super::*;
-use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, Graph};
-use crate::clients::strato_answer::{found, no_row, Thrift};
+use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};
+use crate::clients::strato::answer::{found, no_row, Thrift};
 use crate::clients::{trusted_friends_client, user_devices_client, user_location_client};
-use crate::hydration::fetcher::FetcherId;
-use crate::hydration::inventory::Source;
+use crate::hydration::batch::Hydrated;
+use crate::hydration::community_source::CommunityPost;
+use crate::hydration::decode::viewer::DecodedViewer;
+use crate::hydration::fetcher::Owner;
+use crate::hydration::sources::safety_labels::LabelReply;
+use crate::hydration::sources::Source;
+use crate::hydration::tweet_source::TweetState;
+use crate::metrics::{Endpoint, Metrics, RequestLevel};
 use crate::models::NsfwFeature;
-use crate::safety_label_source::lookup::{
-    LookupError, LookupResults, ManhattanLookup, RemoteSource, TwemcacheLookup,
-};
-use crate::safety_label_source::types::{FailureKind, TwemcacheOutcome};
+use crate::models::{ArticleLifecycle, CommunityModeration, TweetFeatures};
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::time::Duration;
 use thrift::protocol::TType;
 use tonic::{Request, Response, Status};
 use tower::util::BoxCloneSyncService;
 use tower::ServiceExt;
+use wingman_client::Exists;
 use xai_core_entities::entities::{
-    ApiCounts, CashtagAttachments, ConversationControlArm, EditControl, EditControlEdit,
-    EditControlInitial, EscherbirdEntityAnnotation, ExclusiveTweetControl, GizmoduckAccount,
-    GizmoduckUserResult, MediaEntities, PCFLabel, PureCoreData, ReactionContext, Safety,
-    TakedownReason, TrustedFriendsControl, UrlEntities, UserResponseState,
+    ApiCounts, CashtagAttachments, ConversationControl, ConversationControlArm, EditControl,
+    EscherbirdEntityAnnotation, ExclusiveTweetControl, GizmoduckAccount, GizmoduckUser,
+    GizmoduckUserResult, MediaEntities, NoteTweet, PCFLabel, PureCoreData, QuotedTweet,
+    ReactionContext, Safety, TakedownReason, TrustedFriendsControl, UrlEntities, UserResponseState,
 };
 use xai_core_entities::gizmoduck_client::{
     GizmoduckClient, LookupContext, MockGizmoduckClient, UserFields, ViewerData,
 };
 use xai_core_entities::tweet_entity_service_client::{MockTESClient, TESClient};
+use xai_safety_label_source::testing::FakeLabels;
 use xai_strato::strato_proto::rpc_server::{Rpc, RpcServer};
 use xai_strato::strato_proto::{result, Call3, Issue3, ResultList};
 use xai_strato::StratoGrpc;
+use xai_visibility_filtering_proto as vf_pb;
+use xai_x_rpc::WithBudget;
 use xai_x_thrift::entities::ApiMediaEntity;
+use xai_x_thrift::tweet_safety_label::{PerspectivalUser, SafetyLabel, SafetyLabelType};
 use xai_x_thrift::tweets::ApiPerspective;
 
 const VIEWER: u64 = 50;
@@ -170,10 +180,6 @@ impl TESClient for Tes {
         unreachable!()
     }
 
-    async fn get_min_video_durations(&self, _: Vec<u64>) -> Answers<i64> {
-        unreachable!()
-    }
-
     async fn get_media_count(&self, _: Vec<u64>) -> Answers<i64> {
         unreachable!()
     }
@@ -236,6 +242,10 @@ impl TESClient for Tes {
         unreachable!()
     }
 
+    async fn get_note_tweets(&self, _: Vec<u64>) -> Answers<NoteTweet> {
+        unreachable!()
+    }
+
     async fn get_cashtag_attachments(&self, _: Vec<u64>) -> Answers<CashtagAttachments> {
         unreachable!()
     }
@@ -284,14 +294,14 @@ struct Fake;
 
 #[tonic::async_trait]
 impl WingmanClient for Fake {
-    async fn batch_exists_intersect(&self, _: u64, ids: &[u64]) -> Option<Vec<Exists>> {
-        let exists = ids.iter().map(|&id| match id {
+    async fn batch_exists_intersect(&self, _: u64, ids: &[u64]) -> HashMap<u64, Exists> {
+        let exists = |id| match id {
             MISSING => Exists::NotFound,
             FAILED => Exists::ItemError,
             ABSENT => Exists::Incomplete,
             _ => Exists::Found,
-        });
-        Some(exists.collect())
+        };
+        ids.iter().map(|&id| (id, exists(id))).collect()
     }
 }
 
@@ -317,35 +327,13 @@ impl SocialgraphClient for Fake {
     }
 }
 
-#[tonic::async_trait]
-impl TwemcacheLookup for Fake {
-    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
-        let outcome = |id| match id {
-            MISSING => TwemcacheOutcome::NotFound,
-            _ => TwemcacheOutcome::Miss,
-        };
-        ids.iter().map(|&id| (id, outcome(id))).collect()
-    }
-}
-
-#[tonic::async_trait]
-impl ManhattanLookup for Fake {
-    async fn get(&self, ids: &[u64]) -> LookupResults {
-        let result = |id| match id {
-            FAILED => Err(LookupError::new(FailureKind::ManhattanFetch, "fails")),
-            _ => Ok(labels()),
-        };
-        ids.iter().map(|&id| (id, result(id))).collect()
-    }
-}
-
 fn labels() -> vf_pb::SafetyLabelMap {
     let label = vf_pb::SafetyLabel {
         applicable_users: vec![LABELED.cast_signed()],
         ..Default::default()
     };
     vf_pb::SafetyLabelMap {
-        labels: [(1, label)].into(),
+        labels: [(i32::from(SafetyLabelType::SPAM), label)].into(),
     }
 }
 
@@ -381,13 +369,7 @@ fn tweet_features() -> TweetFeatures {
         community_id: NonZeroU64::new(COMMUNITY),
         exclusive_conversation_author_id: Some(EXCLUSIVE_AUTHOR),
         trusted_friends_list_id: Some(CIRCLE),
-        edit_control: Some(EditControl::Edit(EditControlEdit {
-            initial_tweet_id: INITIAL_TWEET,
-            edit_control_initial: Some(EditControlInitial {
-                edit_tweet_ids: vec![EDIT_TWEET],
-                ..Default::default()
-            }),
-        })),
+        latest_edit_tweet_id: Some(EDIT_TWEET),
         article_id: NonZeroU64::new(ARTICLE),
         narrowcast_place_id: Some(PLACE),
         ..Default::default()
@@ -417,6 +399,7 @@ impl Rpc for Strato {
     async fn issue3(&self, request: Request<Issue3>) -> Result<Response<ResultList>, Status> {
         use Thrift::{Bool, Set, Str, Struct, I32, I64};
         const SOFT_DELETED: i32 = 2;
+        const BOUNCE_DELETED: i32 = 15;
         fn asks(call: &Call3, id: u64) -> bool {
             let key = match call.path.as_str() {
                 "trusted-friends/visibility-filtering/isMember.TrustedFriendsList"
@@ -453,6 +436,7 @@ impl Rpc for Strato {
                 let value = match call.path.as_str() {
                     _ if asks(call, MISSING) => None,
                     "tweetypie/federated/tweetForVisibility.Tweet" => Some(tweet()),
+                    "tweetypie/federated/tweetState.Tweet" => Some(I32(BOUNCE_DELETED)),
                     "communities/moderationState.TweetCommunityRelationship"
                     | "communities/moderationState.UserCommunityRelationship" => {
                         Some(Struct(vec![(2, Struct(vec![]))]))
@@ -584,26 +568,31 @@ fn prod_sources() -> ProdSources {
         ..Default::default()
     };
     let fake = Arc::new(Fake);
+    let label = SafetyLabel {
+        applicable_users: Some(vec![PerspectivalUser {
+            user_id: LABELED.cast_signed(),
+        }]),
+        ..Default::default()
+    };
     ProdSources::new(Backends {
         tes: Arc::new(Tes(tes)),
         tweets: TweetSource {
             grpc_client: Arc::new(strato()),
         },
-        gizmoduck: GizmoduckLookup::new(Arc::new(Gizmoduck(gizmoduck))),
+        gizmoduck: Arc::new(Gizmoduck(gizmoduck)),
         socialgraph: Arc::clone(&fake) as _,
-        about_this_account: AboutThisAccountClient::new(strato()),
-        wingman: Arc::clone(&fake) as _,
-        articles: ArticleClient::new(strato()),
-        trusted_friends: TrustedFriendsClient::new(strato()),
-        user_location: UserLocationClient::new(strato()),
-        safety_labels: Arc::new(SafetyLabelSource::new(
-            Arc::new(RemoteSource::new(Arc::clone(&fake), fake)),
-            None,
-        )),
+        strato: strato(),
+        wingman: fake,
+        safety_labels: Arc::new(
+            FakeLabels::default()
+                .label(TWEET, SafetyLabelType::SPAM, label)
+                .not_found(MISSING)
+                .failing(FAILED)
+                .into_source(),
+        ),
         communities: CommunitySource {
             grpc_client: strato(),
         },
-        user_devices: UserDevicesClient::new(strato()),
     })
 }
 
@@ -624,6 +613,7 @@ fn held() -> InMemorySources {
             .tweet_features(TWEET, tweet_features())
             .control(TWEET, conversation_control())
             .quote(TWEET, SOURCE_TWEET, SOURCE_AUTHOR)
+            .tweet_state(TWEET, TweetState::BounceDeleted)
             .labels(TWEET, labels())
             .labels(MISSING, vf_pb::SafetyLabelMap::default())
             .viewer(VIEWER, viewer())
@@ -678,13 +668,16 @@ fn defaults() -> InMemorySources {
 
 fn shown<V: fmt::Debug>(
     unanswered: &mut Vec<u64>,
-    batch: &RawHydrationBatch<V>,
+    batches: &impl AsRef<[RawHydrationBatch<V>]>,
     keys: &[u64],
 ) -> String {
     let shown: Vec<String> = keys
         .iter()
         .map(|&key| {
-            let answer = batch.hydrated(&key);
+            let answer = batches
+                .as_ref()
+                .iter()
+                .find_map(|batch| batch.hydrated(&key));
             if matches!(answer, None | Some(Hydrated::Unanswered)) {
                 unanswered.push(key);
             }
@@ -697,45 +690,77 @@ fn shown<V: fmt::Debug>(
     shown.join(", ")
 }
 
-async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64>) -> String {
-    let owner = fetcher.owner;
+fn input(fetcher: FetcherId, keys: &[u64]) -> Input<'_> {
+    Input {
+        keys,
+        viewer_id: Some(VIEWER),
+        fields: &[],
+        queries: &[],
+        community_posts: &[],
+        fetcher,
+    }
+}
+
+async fn fetched_by<F: SourceFetch>(
+    sources: &(impl Fetches<F> + ?Sized),
+    input: Input<'_>,
+) -> F::Reply {
+    sources.fetch(&input).await.unwrap()
+}
+
+async fn fetch_shown(
+    sources: &dyn Sources,
+    fetcher: FetcherId,
+    unanswered: &mut Vec<u64>,
+) -> String {
     match fetcher.source {
         Source::TesPureCoreData => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.pure_cores(owner, &keys).await, &keys)
+            let cores = fetched_by::<source::TesPureCoreData>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &cores, &keys)
         }
-        Source::TesTweet => {
+        Source::TesTweetForVisibility => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.tweets(&keys).await, &keys)
+            let tweets =
+                fetched_by::<source::TesTweetForVisibility>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &tweets, &keys)
         }
         Source::TesConversationControl => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(
-                unanswered,
-                &sources.conversation_controls(&keys).await,
-                &keys,
-            )
+            let controls =
+                fetched_by::<source::TesConversationControl>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &controls, &keys)
         }
         Source::TesQuotedTweet => {
             let keys = [TWEET, MISSING, FAILED, ABSENT];
-            shown(unanswered, &sources.quoted_tweets(&keys).await, &keys)
+            let quoted = fetched_by::<source::TesQuotedTweet>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &quoted, &keys)
+        }
+        Source::TesTweetState => {
+            let keys = [TWEET, MISSING, FAILED, ABSENT];
+            let states = fetched_by::<source::TesTweetState>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &states, &keys)
         }
         Source::SafetyLabels => {
             let keys = [TWEET, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.safety_labels(owner, &keys).await,
-                &keys,
-            )
+            let labels = fetched_by::<source::SafetyLabels>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &labels, &keys)
         }
         Source::GizmoduckViewer => {
-            let asked = FIELDS
+            let inputs = FIELDS
                 .map(|fields| (VIEWER, fields))
                 .into_iter()
                 .chain([MISSING, FAILED].map(|viewer| (viewer, FIELDS[0])));
             let mut answers = vec![];
-            for (viewer_id, fields) in asked {
-                let viewer = sources.viewer(viewer_id, fields).await.map(|viewer| {
+            for (viewer_id, fields) in inputs {
+                let viewer_ids = [viewer_id];
+                let call_input = Input {
+                    viewer_id: Some(viewer_id),
+                    fields,
+                    ..input(fetcher, &viewer_ids)
+                };
+                let viewer = fetched_by::<source::GizmoduckViewer>(sources, call_input).await;
+                let viewer = viewer.map(|viewer| {
                     let DecodedViewer {
                         profile,
                         has_age_verified_18_label,
@@ -743,30 +768,34 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
                     } = viewer;
                     (profile, has_age_verified_18_label, state)
                 });
-                answers.push(shown(unanswered, &viewer, &[viewer_id]));
+                answers.push(shown(unanswered, &viewer, &viewer_ids));
             }
             answers.join(", ")
         }
         Source::GizmoduckAuthor | Source::GizmoduckActor => {
-            let asked: [&[u64]; 2] = [&[AUTHOR, MISSING, FAILED, ABSENT], &[SUSPENDED_AUTHOR]];
+            let users: [&[u64]; 2] = [&[AUTHOR, MISSING, FAILED, ABSENT], &[SUSPENDED_AUTHOR]];
             let mut answers = vec![];
-            for (users, fields) in asked.into_iter().zip(FIELDS) {
+            for (users, fields) in users.into_iter().zip(FIELDS) {
+                let call_input = || Input {
+                    fields,
+                    ..input(fetcher, users)
+                };
                 answers.push(if fetcher.source == Source::GizmoduckActor {
-                    shown(unanswered, &sources.actors(users, fields).await, users)
+                    let actors = fetched_by::<source::GizmoduckActor>(sources, call_input()).await;
+                    shown(unanswered, &actors, users)
                 } else {
-                    shown(
-                        unanswered,
-                        &sources.users(owner, users, fields).await,
-                        users,
-                    )
+                    let authors =
+                        fetched_by::<source::GizmoduckAuthor>(sources, call_input()).await;
+                    shown(unanswered, &authors, users)
                 });
             }
             answers.join(", ")
         }
         Source::ActorEmails => {
             let keys = [AUTHOR, MISSING];
-            let held = sources.confirmed_emails(&keys).await;
-            let failed = sources.confirmed_emails(&[FAILED]).await;
+            let held = fetched_by::<source::ActorEmails>(sources, input(fetcher, &keys)).await;
+            let failed =
+                fetched_by::<source::ActorEmails>(sources, input(fetcher, &[FAILED])).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &held, &keys),
@@ -775,8 +804,9 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
         }
         Source::ActorPhones => {
             let keys = [AUTHOR, MISSING];
-            let held = sources.verified_phones(&keys).await;
-            let failed = sources.verified_phones(&[FAILED]).await;
+            let held = fetched_by::<source::ActorPhones>(sources, input(fetcher, &keys)).await;
+            let failed =
+                fetched_by::<source::ActorPhones>(sources, input(fetcher, &[FAILED])).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &held, &keys),
@@ -784,41 +814,41 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
             )
         }
         Source::Flock => {
-            let query = |graph, direction, destination| EdgeQuery {
+            let viewer = |graph, direction, destination| EdgeQuery {
                 graph,
                 direction,
                 from: EdgeFrom::Viewer,
                 destination_ids: vec![destination],
             };
-            let held: Vec<EdgeQuery> = EDGES
-                .map(|(graph, direction, _)| query(graph, direction, FOLLOWER))
-                .into_iter()
-                .chain([query(Graph::Mutes, EdgeDirection::Forward, FOLLOWER)])
-                .collect();
-            let failed = vec![query(Graph::Follows, EdgeDirection::Forward, FAILED)];
-            let mut answers = vec![];
-            for queries in [held, failed] {
-                let batches = sources.select_edges(VIEWER, &queries).await.unwrap();
-                for (query, batch) in queries.iter().zip(&batches) {
-                    answers.push(shown(unanswered, batch, &query.destination_ids));
-                }
-            }
-            answers.join(", ")
-        }
-        Source::FlockUserPair => {
-            let query = |graph, destination| EdgeQuery {
+            let sourced = |graph, destination| EdgeQuery {
                 from: EdgeFrom::User(AUTHOR),
                 ..EdgeQuery::forward(graph, vec![destination])
             };
-            let held = vec![
-                query(Graph::Blocks, FOLLOWER),
-                query(Graph::Follows, FOLLOWER),
-                query(Graph::Mutes, FOLLOWER),
+            let mut held = vec![
+                sourced(Graph::Blocks, FOLLOWER),
+                sourced(Graph::Follows, FOLLOWER),
+                sourced(Graph::Mutes, FOLLOWER),
             ];
-            let failed = vec![query(Graph::Blocks, FAILED)];
+            let mut failed = vec![sourced(Graph::Blocks, FAILED)];
+            let viewer_id = match fetcher.owner {
+                Owner::Request => {
+                    held.extend(
+                        EDGES.map(|(graph, direction, _)| viewer(graph, direction, FOLLOWER)),
+                    );
+                    held.push(viewer(Graph::Mutes, EdgeDirection::Forward, FOLLOWER));
+                    failed.push(viewer(Graph::Follows, EdgeDirection::Forward, FAILED));
+                    Some(VIEWER)
+                }
+                Owner::Related(_) => None,
+            };
             let mut answers = vec![];
             for queries in [held, failed] {
-                let batches = sources.select_pair_edges(&queries).await.unwrap();
+                let select = Input {
+                    viewer_id,
+                    queries: &queries,
+                    ..input(fetcher, &[])
+                };
+                let batches = fetched_by::<source::Flock>(sources, select).await;
                 for (query, batch) in queries.iter().zip(&batches) {
                     answers.push(shown(unanswered, batch, &query.destination_ids));
                 }
@@ -828,75 +858,74 @@ async fn ask(sources: &dyn Sources, fetcher: FetcherId, unanswered: &mut Vec<u64
         Source::ViewerCountry => {
             let mut answers = vec![];
             for viewer in [VIEWER, MISSING, FAILED] {
-                answers.push(shown(
-                    unanswered,
-                    &sources.viewer_country(viewer).await,
-                    &[viewer],
-                ));
+                let viewers = [viewer];
+                let call_input = Input {
+                    viewer_id: Some(viewer),
+                    ..input(fetcher, &viewers)
+                };
+                let country = fetched_by::<source::ViewerCountry>(sources, call_input).await;
+                answers.push(shown(unanswered, &country, &viewers));
             }
             answers.join(", ")
         }
         Source::Wingman => {
             let keys = [ROOT, MISSING, FAILED, ABSENT];
-            shown(
-                unanswered,
-                &sources.second_degree(VIEWER, &keys).await,
-                &keys,
-            )
+            let paths = fetched_by::<source::Wingman>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &paths, &keys)
         }
         Source::CommunityModeration => {
             let posts = [TWEET, MISSING, FAILED].map(|tweet_id| CommunityPost { tweet_id, ..POST });
-            let batch = sources.community_moderations(&posts).await;
+            let call_input = Input {
+                community_posts: &posts,
+                ..input(fetcher, &[])
+            };
+            let batch = fetched_by::<source::CommunityModeration>(sources, call_input).await;
             shown(unanswered, &batch, &posts.map(|post| post.tweet_id))
         }
         Source::CommunityModerator => {
             let keys = [COMMUNITY, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.community_moderators(VIEWER, &keys).await,
-                &keys,
-            )
+            let moderators =
+                fetched_by::<source::CommunityModerator>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &moderators, &keys)
         }
         Source::CommunityViewerRemoved => {
             let keys = [COMMUNITY, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.community_viewer_removals(VIEWER, &keys).await,
-                &keys,
-            )
+            let removals =
+                fetched_by::<source::CommunityViewerRemoved>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &removals, &keys)
         }
         Source::ArticleMediaEntities => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.article_media_entities(Some(VIEWER), &keys).await,
-                &keys,
-            )
+            let rows =
+                fetched_by::<source::ArticleMediaEntities>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &rows, &keys)
         }
         Source::ArticleCoverMedia => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.article_cover_media(Some(VIEWER), &keys).await,
-                &keys,
-            )
+            let rows =
+                fetched_by::<source::ArticleCoverMedia>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &rows, &keys)
         }
         Source::ArticleLifecycle => {
             let keys = [ARTICLE, MISSING, FAILED];
-            shown(unanswered, &sources.article_lifecycles(&keys).await, &keys)
+            let lifecycles =
+                fetched_by::<source::ArticleLifecycle>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &lifecycles, &keys)
         }
         Source::TrustedFriends => {
             let keys = [CIRCLE, MISSING, FAILED];
-            shown(
-                unanswered,
-                &sources.trusted_friends(VIEWER, &keys).await,
-                &keys,
-            )
+            let memberships =
+                fetched_by::<source::TrustedFriends>(sources, input(fetcher, &keys)).await;
+            shown(unanswered, &memberships, &keys)
         }
         Source::UserLocation => {
             let keys = [PLACE, MISSING];
-            let located = sources.outside_places(VIEWER, &keys).await;
-            let failed = sources.outside_places(FAILED, &[FAILED]).await;
+            let located = fetched_by::<source::UserLocation>(sources, input(fetcher, &keys)).await;
+            let failed = Input {
+                viewer_id: Some(FAILED),
+                ..input(fetcher, &[FAILED])
+            };
+            let failed = fetched_by::<source::UserLocation>(sources, failed).await;
             format!(
                 "{}, {}",
                 shown(unanswered, &located, &keys),
@@ -912,9 +941,9 @@ async fn prod_sources_answer_what_their_backends_hold() {
     let mut wrong = vec![];
     for fetcher in FetcherId::all() {
         let mut unanswered = vec![];
-        let answer = ask(&prod, fetcher, &mut unanswered).await;
-        let expected = ask(&held, fetcher, &mut vec![]).await;
-        if answer != expected || answer == ask(&defaults, fetcher, &mut vec![]).await {
+        let answer = fetch_shown(&prod, fetcher, &mut unanswered).await;
+        let expected = fetch_shown(&held, fetcher, &mut vec![]).await;
+        if answer != expected || answer == fetch_shown(&defaults, fetcher, &mut vec![]).await {
             wrong.push(format!("{fetcher:?}\n  prod {answer}\n  held {expected}"));
         }
         unanswered.retain(|key| ![FAILED, ABSENT].contains(key));
@@ -923,4 +952,56 @@ async fn prod_sources_answer_what_their_backends_hold() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_safety_label_call_manhattan_has_not_answered_by_its_deadline_times_out() {
+    let prod = ProdSources::new(Backends {
+        safety_labels: Arc::new(FakeLabels::default().hanging(TWEET).into_source()),
+        ..prod_sources().backends
+    });
+    let call_input = input(FetcherId::from(Source::SafetyLabels), &[TWEET]);
+    let answer = Fetches::<source::SafetyLabels>::fetch(&prod, &call_input)
+        .with_budget(Duration::from_millis(100))
+        .await;
+    assert!(matches!(answer, Ok(Ok(reply)) if reply.ran_out()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_safety_label_answered_from_its_expired_entry_counts_as_its_lookups_failure() {
+    let stale = Arc::new(vf_pb::SafetyLabelMap {
+        labels: HashMap::from([(1, vf_pb::SafetyLabel::default())]),
+    });
+    let metrics = Metrics::none().request(Endpoint::FilterTweets, RequestLevel::Absent);
+    let context = CallContext {
+        metrics: &metrics,
+        label: ("safety_labels", "safety_labels"),
+        tweet_cache: None,
+        author_cache: None,
+        author_not_found: AuthorNotFound::Unresolves,
+    };
+    for (labels, ran_out) in [
+        (FakeLabels::default().failing(TWEET), false),
+        (FakeLabels::default().hanging(TWEET), true),
+    ] {
+        let labels = labels.expired(TWEET, (*stale).clone());
+        let prod = ProdSources::new(Backends {
+            safety_labels: Arc::new(labels.into_source()),
+            ..prod_sources().backends
+        });
+        let call_input = input(FetcherId::from(Source::SafetyLabels), &[TWEET]);
+        let reply = Fetches::<source::SafetyLabels>::fetch(&prod, &call_input)
+            .with_budget(Duration::from_millis(100))
+            .await
+            .expect("answered by the deadline")
+            .expect("answered");
+        assert_eq!(reply.ran_out(), ran_out);
+        let recorded = |reply: &LabelReply| {
+            let batch = reply.as_ref().first();
+            batch.and_then(|batch| batch.hydrated(&TWEET)).cloned()
+        };
+        assert_eq!(recorded(&reply), Some(Hydrated::Failed));
+        let landed = source::SafetyLabels::fall_back(&context, reply);
+        assert_eq!(recorded(&landed), Some(Hydrated::Found(Arc::clone(&stale))));
+    }
 }

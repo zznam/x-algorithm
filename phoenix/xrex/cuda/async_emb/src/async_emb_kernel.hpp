@@ -7,7 +7,7 @@
 
 namespace xai::kernels::async_emb {
 
-constexpr int kMaxShardWidth = 32;
+constexpr int kMaxShardWidth = 128;
 
 struct SliceLayout {
   int64_t tokens_per_rank;
@@ -23,6 +23,9 @@ struct AdagradParams {
   float weight_decay_factor;
   float accum_decay_rate;
   float weight_decay_rate;
+  float weight_decay_exempt_window;
+  int32_t stochastic_rounding;
+  int32_t col_offset;
 };
 
 struct UpdateScalars {
